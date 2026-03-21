@@ -287,8 +287,8 @@ const KeyboardHandler = {
   updateLayoutForKeyboard() {
     if (!window.visualViewport) return;
 
-    // Only adjust on mobile
-    if (!MobileDetection.isSmallScreen() && !MobileDetection.isMediumScreen()) {
+    // Only adjust on touch devices (mobile, tablet, iPad)
+    if (!MobileDetection.isTouchDevice()) {
       this.resetLayout();
       return;
     }

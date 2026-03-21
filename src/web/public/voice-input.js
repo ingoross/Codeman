@@ -88,8 +88,8 @@ const DeepgramProvider = {
 
     const params = new URLSearchParams({
       model: 'nova-3',
-      smart_format: 'false',
-      punctuate: 'false',
+      smart_format: 'true',
+      punctuate: 'true',
       interim_results: 'true',
       utterance_end_ms: '1500',
       vad_events: 'true',
@@ -207,7 +207,7 @@ const DeepgramProvider = {
     clearTimeout(this._silenceTimeout);
     this._silenceTimeout = setTimeout(() => {
       this.stop();
-    }, 3000);
+    }, 8000);
   },
 
   stop() {
@@ -366,13 +366,13 @@ const VoiceInput = {
       onResult: (text, isFinal) => {
         if (!this.isRecording) return;
         this._hasReceivedResult = true;
+        this._resetSilenceTimeout();
         if (isFinal) {
-          this._accumulatedFinal += text;
-          this._hidePreview();
-          this._insertText(this._accumulatedFinal);
-          this.stop();
+          // Accumulate final text and keep listening for more speech
+          this._accumulatedFinal += (this._accumulatedFinal ? ' ' : '') + text;
+          this._showPreview(this._accumulatedFinal, 'deepgram');
         } else {
-          const display = this._accumulatedFinal + text;
+          const display = this._accumulatedFinal + (this._accumulatedFinal ? ' ' : '') + text;
           this._showPreview(display, 'deepgram');
         }
       },
@@ -451,6 +451,12 @@ const VoiceInput = {
     this._stopLevelMeter();
     this._updateButtons('idle');
     this._hidePreview();
+
+    // Insert accumulated text before tearing down the provider
+    if (this._accumulatedFinal) {
+      this._insertText(this._accumulatedFinal);
+      this._accumulatedFinal = '';
+    }
 
     if (this._activeProvider === 'deepgram') {
       DeepgramProvider.stop();
@@ -683,7 +689,7 @@ const VoiceInput = {
         }
         this.stop();
       }
-    }, 3000);
+    }, 8000);
   },
 
   _iosStabilityCheck(transcript) {

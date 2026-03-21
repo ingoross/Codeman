@@ -57,6 +57,7 @@ const KeyboardAccessoryBar = {
           <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
         </svg>
       </button>
+      <button class="accessory-btn accessory-btn-enter" data-action="enter" title="Enter" style="margin-left:auto;min-width:80px;height:38px;min-height:38px;padding:0;background:#16a34a;border:2px solid rgba(34,197,94,0.6);color:#fff;font-size:1.4rem;font-weight:700;border-radius:10px;flex-shrink:0;box-shadow:0 2px 8px rgba(22,163,74,0.4)">⏎</button>
       <button class="accessory-btn accessory-btn-dismiss" data-action="dismiss" title="Dismiss keyboard">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
           <path d="M19 9l-7 7-7-7"/>
@@ -126,7 +127,7 @@ const KeyboardAccessoryBar = {
       this.handleAction(action, btn);
 
       // Refocus terminal so keyboard stays open (tap blurs terminal → keyboard dismisses → toolbar shifts)
-      const refocusActions = new Set(['scroll-up', 'scroll-down', 'arrow-left', 'arrow-right', 'tab', 'shift-tab', 'ctrl-o', 'opt-enter', 'esc', 'effort-max']);
+      const refocusActions = new Set(['scroll-up', 'scroll-down', 'arrow-left', 'arrow-right', 'tab', 'shift-tab', 'ctrl-o', 'opt-enter', 'esc', 'effort-max', 'enter']);
       if (refocusActions.has(action) ||
           (action === 'clear' && this._confirmAction)) {
         if (typeof app !== 'undefined' && app.terminal) {
@@ -139,6 +140,17 @@ const KeyboardAccessoryBar = {
     const toolbar = document.querySelector('.toolbar');
     if (toolbar && toolbar.parentNode) {
       toolbar.parentNode.insertBefore(this.element, toolbar);
+    }
+
+    // On touch devices: intercept taps on session tabs to open the picker instead
+    const tabsContainer = document.getElementById('sessionTabs');
+    if (tabsContainer) {
+      tabsContainer.addEventListener('click', (e) => {
+        if (!MobileDetection.isTouchDevice()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.showSessionPicker();
+      }, true); // capture phase to intercept before individual tab onclick
     }
   },
 
@@ -172,6 +184,9 @@ const KeyboardAccessoryBar = {
         break;
       case 'esc':
         this.sendKey('\x1b');
+        break;
+      case 'enter':
+        this.sendKey('\r');
         break;
       case 'opt-enter':
         this.sendKey('\x1b\r');
@@ -339,6 +354,72 @@ const KeyboardAccessoryBar = {
 
     document.body.appendChild(overlay);
     textarea.focus();
+  },
+
+  /** Show session picker bottom sheet */
+  showSessionPicker() {
+    if (typeof app === 'undefined') return;
+    // Remove existing picker
+    document.querySelector('.session-picker-overlay')?.remove();
+
+    const sessions = app.sessionOrder || [];
+    if (sessions.length === 0) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'session-picker-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:flex-end;justify-content:center';
+
+    let itemsHtml = '';
+    for (const id of sessions) {
+      const session = app.sessions?.get?.(id) || app.sessions?.[id];
+      const name = session?.name || id.slice(0, 8);
+      const isActive = id === app.activeSessionId;
+      const status = session?.status || 'unknown';
+      const mode = session?.mode || 'claude';
+      const workingDir = session?.workingDir || '';
+      const caseName = workingDir ? workingDir.split('/').pop() : '';
+      const statusDot = status === 'running' ? '🟢' : status === 'stopped' ? '🔴' : '⚪';
+      const modeLabel = mode === 'shell' ? 'Shell' : mode === 'opencode' ? 'OpenCode' : 'Claude';
+      const modeBadgeColor = mode === 'shell' ? '#6b7280' : mode === 'opencode' ? '#10b981' : '#3b82f6';
+      itemsHtml += `<button class="session-picker-item${isActive ? ' active' : ''}" data-session-id="${id}" style="display:flex;align-items:center;gap:12px;width:100%;padding:14px 16px;background:${isActive ? '#1e3a5f' : 'transparent'};border:none;border-bottom:1px solid rgba(255,255,255,0.08);color:#e5e5e5;font-size:1rem;text-align:left;cursor:pointer">
+        <span style="font-size:1.1rem;flex-shrink:0">${statusDot}</span>
+        <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+          <span style="display:flex;align-items:center;gap:8px">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:${isActive ? '600' : '400'}">${name}</span>
+            <span style="font-size:0.6rem;padding:2px 6px;border-radius:4px;background:${modeBadgeColor};color:#fff;flex-shrink:0;opacity:0.8">${modeLabel}</span>
+          </span>
+          ${caseName ? `<span style="font-size:0.75rem;color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">📁 ${caseName}</span>` : ''}
+        </span>
+        ${isActive ? '<span style="color:#93c5fd;font-size:0.75rem;flex-shrink:0">aktiv</span>' : ''}
+      </button>`;
+    }
+
+    overlay.innerHTML = `
+      <div style="background:#1a1a1a;border-radius:16px 16px 0 0;width:100%;max-width:500px;max-height:60vh;overflow-y:auto;padding-bottom:env(safe-area-inset-bottom,12px);animation:slideUp 0.2s ease-out">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.1)">
+          <span style="font-size:1rem;font-weight:600;color:#fff">Sessions</span>
+          <button class="session-picker-close" style="background:none;border:none;color:#9ca3af;font-size:1.5rem;padding:4px 8px;cursor:pointer">&times;</button>
+        </div>
+        <div class="session-picker-list">${itemsHtml}</div>
+      </div>
+    `;
+
+    // Click handlers
+    overlay.addEventListener('click', (e) => {
+      const item = e.target.closest('.session-picker-item');
+      if (item) {
+        const sessionId = item.dataset.sessionId;
+        overlay.remove();
+        app.selectSession(sessionId);
+        if (app.terminal) app.terminal.focus();
+        return;
+      }
+      if (e.target === overlay || e.target.closest('.session-picker-close')) {
+        overlay.remove();
+      }
+    });
+
+    document.body.appendChild(overlay);
   },
 
   /** Show the accessory bar */
