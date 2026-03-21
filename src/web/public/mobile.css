@@ -85,10 +85,9 @@ html.mobile-init .file-browser-panel {
     height: 18px;
   }
 
-  /* System stats - compact on tablet, visibility controlled by JS */
+  /* System stats - hidden on tablet */
   .header-system-stats {
-    font-size: 0.6rem;
-    gap: 0.25rem;
+    display: none !important;
   }
 
   .header-right {
@@ -296,10 +295,9 @@ html.mobile-init .file-browser-panel {
     min-width: 14px;
   }
 
-  /* System stats - very compact on phones, visibility controlled by JS */
+  /* System stats - hidden on phones */
   .header-system-stats {
-    font-size: 0.55rem;
-    gap: 0.15rem;
+    display: none !important;
   }
 
   /* Token count - compact on phones, visibility controlled by JS */
