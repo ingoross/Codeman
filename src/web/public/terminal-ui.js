@@ -48,9 +48,10 @@ Object.assign(CodemanApp.prototype, {
         brightWhite: '#ffffff',
       },
       fontFamily: '"Fira Code", "Cascadia Code", "JetBrains Mono", "SF Mono", Monaco, monospace',
-      // Use smaller font on mobile to fit more columns (prevents wrapping of Claude's status line)
-      fontSize: MobileDetection.getDeviceType() === 'mobile' ? 10 : 14,
-      lineHeight: 1.2,
+      // Use much smaller font on touch devices to fit more columns (prevents wrapping of Claude's status line).
+      // ~40% smaller than desktop: phone gets the smallest size, tablet sits between phone and desktop.
+      fontSize: MobileDetection.getDeviceType() === 'mobile' ? 6 : MobileDetection.getDeviceType() === 'tablet' ? 8 : 14,
+      lineHeight: 1.15,
       cursorBlink: false,
       cursorStyle: 'block',
       scrollback: scrollback,

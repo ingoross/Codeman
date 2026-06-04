@@ -880,6 +880,12 @@ html.mobile-init .file-browser-panel {
     font-weight: 500;
     cursor: pointer;
     transition: background 0.15s, border-color 0.15s;
+    /* Uniform sizing so every key in the bar lines up on one baseline */
+    box-sizing: border-box;
+    height: 32px;
+    min-height: 32px;
+    padding: 0 10px;
+    flex: 0 0 auto;
   }
 
   /* Confirm state — button turns amber and shows "Tap again" */
@@ -899,7 +905,7 @@ html.mobile-init .file-browser-panel {
   }
 
   .accessory-btn-arrow {
-    padding: 6px 10px;
+    padding: 0 9px;
     background: #1e3a5f;
     border-color: rgba(59, 130, 246, 0.3);
     color: #93c5fd;
@@ -910,7 +916,7 @@ html.mobile-init .file-browser-panel {
   }
 
   .accessory-btn-dismiss {
-    padding: 8px 14px;
+    padding: 0 12px;
     background: #2a2a2a;
     border: 1.5px solid rgba(255, 255, 255, 0.25);
     border-radius: 6px;
@@ -918,8 +924,8 @@ html.mobile-init .file-browser-panel {
   }
 
   .accessory-btn-dismiss svg {
-    width: 22px;
-    height: 22px;
+    width: 20px;
+    height: 20px;
     stroke-width: 3;
   }
 
@@ -2047,20 +2053,20 @@ html.mobile-init .file-browser-panel {
 
 .accessory-btn.accessory-btn-enter {
   margin-left: auto !important;
-  padding: 0 !important;
-  min-width: 100px !important;
-  width: 100px !important;
-  height: 38px !important;
-  min-height: 38px !important;
+  padding: 0 16px !important;
+  min-width: 64px !important;
+  width: auto !important;
+  height: 32px !important;
+  min-height: 32px !important;
   background: #16a34a !important;
-  border: 2px solid rgba(34, 197, 94, 0.6) !important;
+  border: 1.5px solid rgba(34, 197, 94, 0.6) !important;
   color: #fff !important;
-  font-size: 1.5rem !important;
+  font-size: 1.15rem !important;
   font-weight: 700 !important;
-  border-radius: 10px !important;
+  border-radius: 8px !important;
   line-height: 1 !important;
   flex-shrink: 0 !important;
-  box-shadow: 0 2px 8px rgba(22, 163, 74, 0.4);
+  box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35);
 }
 
 .accessory-btn.accessory-btn-enter:active {
