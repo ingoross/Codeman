@@ -51,8 +51,7 @@ const KeyboardAccessoryBar = {
       </button>
       <button class="accessory-btn" data-action="esc" title="Escape">Esc</button>
       <button class="accessory-btn" data-action="shift-tab" title="Shift+Tab">⇧⇥</button>
-      <button class="accessory-btn" data-action="init" title="/init">/init</button>
-      <button class="accessory-btn" data-action="clear" title="/clear">/clear</button>
+      <button class="accessory-btn" data-action="ctrl-c" title="Ctrl+C">⌃C</button>
       <button class="accessory-btn" data-action="paste" title="Paste from clipboard">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
@@ -129,7 +128,7 @@ const KeyboardAccessoryBar = {
       this.handleAction(action, btn);
 
       // Refocus terminal so keyboard stays open (tap blurs terminal → keyboard dismisses → toolbar shifts)
-      const refocusActions = new Set(['scroll-up', 'scroll-down', 'arrow-left', 'arrow-right', 'tab', 'shift-tab', 'ctrl-o', 'opt-enter', 'esc', 'effort-max', 'enter']);
+      const refocusActions = new Set(['scroll-up', 'scroll-down', 'arrow-left', 'arrow-right', 'tab', 'shift-tab', 'ctrl-c', 'ctrl-o', 'opt-enter', 'esc', 'effort-max', 'enter']);
       if (refocusActions.has(action) ||
           (action === 'clear' && this._confirmAction)) {
         if (typeof app !== 'undefined' && app.terminal) {
@@ -198,6 +197,9 @@ const KeyboardAccessoryBar = {
         break;
       case 'shift-tab':
         this.sendKey('\x1b[Z');
+        break;
+      case 'ctrl-c':
+        this.sendKey('\x03');
         break;
       case 'ctrl-o':
         this.sendKey('\x0f');
