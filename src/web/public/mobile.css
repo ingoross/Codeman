@@ -39,9 +39,9 @@ html.mobile-init .file-browser-panel {
 }
 
 /* ============================================================================
-   Tablet Breakpoint (430px - 768px)
+   Tablet Breakpoint (480px - 768px)
    ============================================================================ */
-@media (max-width: 768px) and (min-width: 430px) {
+@media (max-width: 768px) and (min-width: 480px) {
   /* Compact header for tablet - fixed at top, includes safe area padding */
   .header {
     position: fixed;
@@ -265,9 +265,9 @@ html.mobile-init .file-browser-panel {
 }
 
 /* ============================================================================
-   Phone Breakpoint (<430px)
+   Phone Breakpoint (<480px) — includes large phones (iPhone Pro Max ≈ 440px)
    ============================================================================ */
-@media (max-width: 430px) {
+@media (max-width: 480px) {
   /* Compact header brand on phones — acts as home button */
   .header-brand {
     padding-right: 0.25rem;
@@ -641,23 +641,28 @@ html.mobile-init .file-browser-panel {
     flex: 0 0 auto;
   }
 
+  /* Run is icon-only on mobile — hide the "Run" label, show just the play glyph */
+  #runBtnLabel {
+    display: none;
+  }
+
   .btn-toolbar.btn-run {
     flex: 0 0 auto;
-    padding: 0 0.6rem !important;
+    padding: 0 0.5rem !important;
     font-weight: 500;
     border-radius: 4px 0 0 4px !important;
     border-right: none !important;
   }
 
   .btn-toolbar.btn-run svg {
-    width: 10px;
-    height: 10px;
-    margin-right: 3px;
+    width: 13px;
+    height: 13px;
+    margin-right: 0;
   }
 
   .btn-toolbar.btn-run-gear {
     flex: 0 0 auto;
-    padding: 0 0.35rem !important;
+    padding: 0 0.3rem !important;
     min-width: unset !important;
     border-radius: 0 4px 4px 0 !important;
     border-left: 1px solid rgba(255,255,255,0.15) !important;
@@ -666,6 +671,22 @@ html.mobile-init .file-browser-panel {
   .btn-toolbar.btn-run-gear svg {
     width: 10px;
     height: 10px;
+  }
+
+  /* Run Shell is icon-only on mobile — hide the text, show the terminal glyph */
+  .btn-shell-label {
+    display: none;
+  }
+
+  .btn-shell-icon {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+  }
+
+  .btn-toolbar.btn-shell {
+    flex: 0 0 auto;
+    padding: 0 0.55rem !important;
   }
 
   /* Claude mode colors on mobile */
@@ -765,11 +786,15 @@ html.mobile-init .file-browser-panel {
     padding: 0 10px !important;
   }
 
-  /* Mobile case button - visible on mobile */
+  /* Mobile case button - visible on mobile.
+     Sized to content (not flex-grow) so it doesn't balloon and the toolbar
+     keeps even spacing; capped so a long case name truncates instead of
+     crowding out the action buttons. */
   .btn-toolbar.btn-case-mobile {
     display: flex !important;
-    flex: 1 1 0 !important;
+    flex: 0 1 auto !important;
     min-width: 0;
+    max-width: 32vw;
     padding: 0 8px !important;
     order: 2; /* Between Run and Run Shell */
     overflow: hidden;
@@ -778,7 +803,7 @@ html.mobile-init .file-browser-panel {
   }
 
   .btn-toolbar.btn-case-mobile #mobileCaseName {
-    max-width: none;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1989,7 +2014,7 @@ html.mobile-init .file-browser-panel {
 /* ============================================================================
    Keyboard Accessory Bar — all mobile/tablet sizes
    Visual styles extracted from phone breakpoint so they apply on iPad too.
-   Phone-specific positioning (position: fixed) remains in @media (max-width: 430px).
+   Phone-specific positioning (position: fixed) remains in @media (max-width: 480px).
    ============================================================================ */
 .keyboard-accessory-bar {
   display: none;

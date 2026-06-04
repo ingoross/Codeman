@@ -56,20 +56,22 @@ const MobileDetection = {
     return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
   },
 
-  /** Check if screen is small (phone-sized, <430px) */
+  /** Check if screen is small (phone-sized, <480px — covers large phones like iPhone Pro Max ~440px) */
   isSmallScreen() {
-    return window.innerWidth < 430;
+    return window.innerWidth < 480;
   },
 
-  /** Check if screen is medium (tablet-sized, 430-768px) */
+  /** Check if screen is medium (tablet-sized, 480-768px) */
   isMediumScreen() {
-    return window.innerWidth >= 430 && window.innerWidth < 768;
+    return window.innerWidth >= 480 && window.innerWidth < 768;
   },
 
-  /** Get device type based on screen width */
+  /** Get device type based on screen width.
+   *  Phone threshold is 480px so large phones (iPhone 16/17 Pro Max ≈ 440px logical)
+   *  get the compact phone layout instead of falling into the tablet bucket. */
   getDeviceType() {
     const width = window.innerWidth;
-    if (width < 430) return 'mobile';
+    if (width < 480) return 'mobile';
     if (width < 768) return 'tablet';
     return 'desktop';
   },

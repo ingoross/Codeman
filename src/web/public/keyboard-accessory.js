@@ -49,6 +49,8 @@ const KeyboardAccessoryBar = {
           <path d="M19 9l-7 7-7-7"/>
         </svg>
       </button>
+      <button class="accessory-btn" data-action="esc" title="Escape">Esc</button>
+      <button class="accessory-btn" data-action="shift-tab" title="Shift+Tab">⇧⇥</button>
       <button class="accessory-btn" data-action="init" title="/init">/init</button>
       <button class="accessory-btn" data-action="clear" title="/clear">/clear</button>
       <button class="accessory-btn" data-action="paste" title="Paste from clipboard">
@@ -57,7 +59,7 @@ const KeyboardAccessoryBar = {
           <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
         </svg>
       </button>
-      <button class="accessory-btn accessory-btn-enter" data-action="enter" title="Enter" style="margin-left:auto;min-width:80px;height:38px;min-height:38px;padding:0;background:#16a34a;border:2px solid rgba(34,197,94,0.6);color:#fff;font-size:1.4rem;font-weight:700;border-radius:10px;flex-shrink:0;box-shadow:0 2px 8px rgba(22,163,74,0.4)">⏎</button>
+      <button class="accessory-btn accessory-btn-enter" data-action="enter" title="Enter">⏎</button>
       <button class="accessory-btn accessory-btn-dismiss" data-action="dismiss" title="Dismiss keyboard">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
           <path d="M19 9l-7 7-7-7"/>
