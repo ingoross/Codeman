@@ -143,11 +143,12 @@ const KeyboardAccessoryBar = {
       toolbar.parentNode.insertBefore(this.element, toolbar);
     }
 
-    // On touch devices: intercept taps on session tabs to open the picker instead
+    // On phones only: intercept taps on session tabs to open the picker instead.
+    // iPad/desktop have room for the normal tab strip, so they keep direct tab clicks.
     const tabsContainer = document.getElementById('sessionTabs');
     if (tabsContainer) {
       tabsContainer.addEventListener('click', (e) => {
-        if (!MobileDetection.isTouchDevice()) return;
+        if (!MobileDetection.isSmallScreen()) return;
         e.preventDefault();
         e.stopPropagation();
         this.showSessionPicker();
