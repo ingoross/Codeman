@@ -425,15 +425,47 @@ Object.assign(CodemanApp.prototype, {
       };
       const tgt = (e) => String((e.target && (e.target.className || e.target.tagName)) || '').slice(0, 20);
       document.body.appendChild(hud);
-      render();
+
+      // Layout report — pinpoints page-level overflow (the "whole page scrolls"
+      // symptom). Compares document/app height vs the visible viewport.
+      const num = (n) => Math.round(n);
+      const layout = () => {
+        const de = document.documentElement;
+        const vv = window.visualViewport;
+        const appEl = document.querySelector('.app');
+        const mainEl = document.querySelector('.main');
+        const appCss = getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim();
+        const dt = (window.MobileDetection && MobileDetection.getDeviceType) ? MobileDetection.getDeviceType() : '?';
+        const mobileCss = [...document.styleSheets].some(s => (s.href || '').includes('mobile.css') && (!s.media || !s.media.mediaText || matchMedia(s.media.mediaText).matches));
+        const overflow = de.scrollHeight - de.clientHeight;
+        const rectH = (el) => el ? num(el.getBoundingClientRect().height) : '-';
+        return [
+          `win=${window.innerWidth}x${window.innerHeight} vv=${vv ? num(vv.width)+'x'+num(vv.height) : '-'} dpr=${window.devicePixelRatio}`,
+          `device=${dt} mobileCss=${mobileCss} --app-height=${appCss || '(unset)'}`,
+          `doc.scrollH=${de.scrollHeight} doc.clientH=${de.clientHeight} OVERFLOW=${overflow}px`,
+          `body.scrollH=${num(document.body.scrollHeight)} app.h=${rectH(appEl)} main.h=${rectH(mainEl)}`,
+          `term rows=${this.terminal.rows} cols=${this.terminal.cols} buf=${this.terminal.buffer.active.type} base=${this.terminal.buffer.active.baseY}`,
+        ].join('\n');
+      };
+      const render2 = () => { hud.textContent = BUILD + ' | LAYOUT\n' + layout() + '\n--- events ---\n' + lines.join('\n'); };
+      // override render to include layout
+      const origLog = log;
+      const log2 = (m) => { lines.unshift(m); if (lines.length > 8) lines.pop(); render2(); };
+      render2();
+      window.addEventListener('resize', render2);
+      if (window.visualViewport) window.visualViewport.addEventListener('resize', render2);
+
       // Everything the page sends to the PTY — arrows from scroll would appear here
-      this.terminal.onData((d) => log('→PTY ' + JSON.stringify(d)));
+      this.terminal.onData((d) => log2('→PTY ' + JSON.stringify(d)));
       document.addEventListener('wheel', (e) =>
-        log(`wheel dY=${Math.round(e.deltaY)} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
+        log2(`wheel dY=${Math.round(e.deltaY)} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
       document.addEventListener('touchstart', (e) =>
-        log(`tstart n=${e.touches.length} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
+        log2(`tstart n=${e.touches.length} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
       document.addEventListener('touchmove', (e) =>
-        log(`tmove n=${e.touches.length} tgt=${tgt(e)}`), { capture: true, passive: true });
+        log2(`tmove n=${e.touches.length} tgt=${tgt(e)}`), { capture: true, passive: true });
+      // also report the page's own scroll position (the "whole page scrolls" bug)
+      window.addEventListener('scroll', () =>
+        log2(`PAGE SCROLLED y=${num(window.scrollY)} de.scrollTop=${num(document.documentElement.scrollTop)}`), { passive: true });
     }
 
     // Welcome message
