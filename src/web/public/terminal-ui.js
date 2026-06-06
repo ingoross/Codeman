@@ -259,16 +259,25 @@ Object.assign(CodemanApp.prototype, {
     // Register link provider for clickable file paths in Bash tool output
     this.registerFilePathLinkProvider();
 
-    // Always use mouse wheel for terminal scrollback, never forward to application.
-    // Prevents Claude's Ink UI (plan mode selector) from capturing scroll as option navigation.
-    container.addEventListener(
+    // Always use mouse wheel / trackpad for terminal scrollback, never forward to
+    // the application. xterm's own wheel handler, in the alternate buffer /
+    // application-cursor-keys mode (Claude's Ink UI), converts a scroll into ↑/↓
+    // arrow sequences sent to the PTY — so a trackpad two-finger scroll on iPad
+    // navigated menus / moved the cursor instead of scrolling. xterm registers
+    // that handler on `document`, so a container-level bubble listener loses the
+    // race. Intercept on `document` in the CAPTURE phase and stopPropagation so
+    // xterm never sees the wheel event; gate to gestures over the terminal so
+    // other scrollable panels keep working.
+    document.addEventListener(
       'wheel',
       (ev) => {
+        if (!container.contains(ev.target)) return;
         ev.preventDefault();
+        ev.stopPropagation();
         const lines = Math.round(ev.deltaY / 25) || (ev.deltaY > 0 ? 1 : -1);
         this.terminal.scrollLines(lines);
       },
-      { passive: false }
+      { capture: true, passive: false }
     );
 
     // Touch scrolling — use terminal.scrollLines() for all devices.
@@ -392,6 +401,39 @@ Object.assign(CodemanApp.prototype, {
         },
         { capture: true, passive: true }
       );
+    }
+
+    // --- TEMP scroll diagnostics — enable by opening the app with ?scrolldebug=1 ---
+    // Shows a live green overlay reporting which event fires on scroll (touch vs
+    // wheel/trackpad), the cursor-key/buffer mode, and exactly what bytes reach
+    // the PTY (arrow sequences show up as "OA"/"[A"). Remove later.
+    if (new URLSearchParams(location.search).has('scrolldebug')) {
+      const hud = document.createElement('div');
+      hud.id = 'scrollDebugHud';
+      hud.style.cssText =
+        'position:fixed;top:0;left:0;right:0;z-index:99999;background:rgba(0,0,0,0.88);' +
+        'color:#0f0;font:11px/1.35 monospace;padding:6px;white-space:pre-wrap;' +
+        'pointer-events:none;max-height:45vh;overflow:hidden';
+      const BUILD = 'scrolldbg-2';
+      const lines = [];
+      const render = () => { hud.textContent = BUILD + '\n' + lines.join('\n'); };
+      const log = (m) => { lines.unshift(m); if (lines.length > 14) lines.pop(); render(); };
+      const mode = () => {
+        const m = this.terminal.modes || {};
+        const buf = this.terminal.buffer && this.terminal.buffer.active && this.terminal.buffer.active.type;
+        return `appcur=${m.applicationCursorKeysMode ? 1 : 0} buf=${buf}`;
+      };
+      const tgt = (e) => String((e.target && (e.target.className || e.target.tagName)) || '').slice(0, 20);
+      document.body.appendChild(hud);
+      render();
+      // Everything the page sends to the PTY — arrows from scroll would appear here
+      this.terminal.onData((d) => log('→PTY ' + JSON.stringify(d)));
+      document.addEventListener('wheel', (e) =>
+        log(`wheel dY=${Math.round(e.deltaY)} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
+      document.addEventListener('touchstart', (e) =>
+        log(`tstart n=${e.touches.length} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
+      document.addEventListener('touchmove', (e) =>
+        log(`tmove n=${e.touches.length} tgt=${tgt(e)}`), { capture: true, passive: true });
     }
 
     // Welcome message
