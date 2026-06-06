@@ -2483,6 +2483,17 @@ body {
   transform: translateX(-50%);
 }
 
+/* On touch devices (iPad etc.) never pin the voice button to the bottom centre:
+   that is the home-indicator gesture zone, so a tap there minimises the app /
+   opens the app-switcher instead of recording. Pin it to the right edge, clear
+   of that zone. Lives in styles.css (always loaded) so it also covers iPad
+   landscape (>1023px) where mobile.css is not loaded. */
+body.touch-device .toolbar-center {
+  left: auto;
+  right: calc(0.75rem + var(--safe-area-right, 0px));
+  transform: none;
+}
+
 .version-display {
   font-family: 'SF Mono', Monaco, monospace;
   font-size: 0.6rem;
