@@ -403,48 +403,6 @@ Object.assign(CodemanApp.prototype, {
       );
     }
 
-    // --- TEMP scroll diagnostics — enable by opening the app with ?scrolldebug=1 ---
-    // Shows a live green overlay reporting which event fires on scroll (touch vs
-    // wheel/trackpad), the cursor-key/buffer mode, and exactly what bytes reach
-    // the PTY (arrow sequences show up as "OA"/"[A"). Remove later.
-    if (new URLSearchParams(location.search).has('scrolldebug')) {
-      const hud = document.createElement('div');
-      hud.id = 'scrollDebugHud';
-      hud.style.cssText =
-        'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;' +
-        'color:#0f0;font:bold 16px/1.7 monospace;padding:10px;white-space:pre-wrap;' +
-        'pointer-events:none;border-bottom:2px solid #0f0';
-      document.body.appendChild(hud);
-      const num = (n) => Math.round(n);
-      const update = () => {
-        const de = document.documentElement;
-        const vv = window.visualViewport;
-        const appEl = document.querySelector('.app');
-        const mainEl = document.querySelector('.main');
-        const appCss = getComputedStyle(de).getPropertyValue('--app-height').trim() || '(unset)';
-        const dt = (window.MobileDetection && MobileDetection.getDeviceType) ? MobileDetection.getDeviceType() : '?';
-        const overflow = de.scrollHeight - de.clientHeight;
-        const rectH = (el) => el ? num(el.getBoundingClientRect().height) : '-';
-        hud.textContent =
-          'SCROLLDBG-3\n' +
-          'A win  ' + window.innerWidth + ' x ' + window.innerHeight + '\n' +
-          'B vis  ' + (vv ? num(vv.width) + ' x ' + num(vv.height) : '-') + '\n' +
-          'C OVERFLOW ' + overflow + ' px\n' +
-          'D device ' + dt + '\n' +
-          'E appH ' + appCss + '\n' +
-          'F app ' + rectH(appEl) + '  main ' + rectH(mainEl) + '\n' +
-          'G scrollY ' + num(window.scrollY);
-      };
-      update();
-      window.addEventListener('resize', update);
-      window.addEventListener('scroll', update, { passive: true });
-      if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', update);
-        window.visualViewport.addEventListener('scroll', update);
-      }
-      setInterval(update, 400); // keep C/G live while you scroll
-    }
-
     // Welcome message
     this.showWelcome();
 
