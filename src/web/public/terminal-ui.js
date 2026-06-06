@@ -306,10 +306,24 @@ Object.assign(CodemanApp.prototype, {
       let pixelAccum = 0;
 
       let didScroll = false; // track whether touchmove fired (tap vs scroll)
-      container.addEventListener(
+
+      // IMPORTANT: xterm.js v6 attaches its own touchstart/touchmove listeners to
+      // `document` (not to its element), and onTouchMove synthesises a wheel event
+      // that — in application-cursor-keys mode (Claude's Ink UI) — gets translated
+      // into ↑/↓ arrow sequences sent to the PTY instead of scrolling. On iPad a
+      // swipe therefore navigated menus / moved the cursor rather than scrolling.
+      //
+      // To reliably beat xterm we register on `document` in the CAPTURE phase:
+      // capture-phase document listeners run before xterm's (bubble-phase) document
+      // listeners, so stopPropagation() here means xterm never sees the gesture.
+      // We gate on whether the gesture started inside the terminal container so we
+      // don't interfere with scrolling panels, modals, or the session list.
+      const startedInTerminal = (target) => !!(target && container.contains(target));
+
+      document.addEventListener(
         'touchstart',
         (ev) => {
-          if (ev.touches.length === 1) {
+          if (ev.touches.length === 1 && startedInTerminal(ev.target)) {
             touchLastY = ev.touches[0].clientY;
             velocity = 0;
             pixelAccum = 0;
@@ -320,19 +334,14 @@ Object.assign(CodemanApp.prototype, {
               cancelAnimationFrame(scrollFrame);
               scrollFrame = null;
             }
+          } else {
+            isTouching = false; // gesture began outside the terminal — leave it alone
           }
         },
-        { passive: true }
+        { capture: true, passive: true }
       );
 
-      // Capture phase + stopPropagation: intercept the touch-drag BEFORE xterm's
-      // own viewport handler sees it. In application-cursor-keys mode (Claude's
-      // Ink UI) xterm otherwise translates a scroll gesture into ↑/↓ arrow key
-      // sequences sent to the PTY instead of scrolling — so a swipe navigated
-      // menus / moved the cursor rather than scrolling the output. By consuming
-      // the event here we guarantee a swipe always drives scrollback via
-      // scrollLines() and never reaches the app as arrow keys.
-      container.addEventListener(
+      document.addEventListener(
         'touchmove',
         (ev) => {
           if (ev.touches.length === 1 && isTouching) {
@@ -356,9 +365,10 @@ Object.assign(CodemanApp.prototype, {
         { capture: true, passive: false }
       );
 
-      container.addEventListener(
+      document.addEventListener(
         'touchend',
         () => {
+          if (!isTouching) return;
           isTouching = false;
           if (!scrollFrame && Math.abs(velocity) > 0.3) {
             scrollFrame = requestAnimationFrame(scrollLoop);
@@ -370,17 +380,17 @@ Object.assign(CodemanApp.prototype, {
             this.terminal.focus();
           }
         },
-        { passive: true }
+        { capture: true, passive: true }
       );
 
-      container.addEventListener(
+      document.addEventListener(
         'touchcancel',
         () => {
           isTouching = false;
           velocity = 0;
           pixelAccum = 0;
         },
-        { passive: true }
+        { capture: true, passive: true }
       );
     }
 
