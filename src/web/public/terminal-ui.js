@@ -411,61 +411,38 @@ Object.assign(CodemanApp.prototype, {
       const hud = document.createElement('div');
       hud.id = 'scrollDebugHud';
       hud.style.cssText =
-        'position:fixed;top:0;left:0;right:0;z-index:99999;background:rgba(0,0,0,0.88);' +
-        'color:#0f0;font:11px/1.35 monospace;padding:6px;white-space:pre-wrap;' +
-        'pointer-events:none;max-height:45vh;overflow:hidden';
-      const BUILD = 'scrolldbg-2';
-      const lines = [];
-      const render = () => { hud.textContent = BUILD + '\n' + lines.join('\n'); };
-      const log = (m) => { lines.unshift(m); if (lines.length > 14) lines.pop(); render(); };
-      const mode = () => {
-        const m = this.terminal.modes || {};
-        const buf = this.terminal.buffer && this.terminal.buffer.active && this.terminal.buffer.active.type;
-        return `appcur=${m.applicationCursorKeysMode ? 1 : 0} buf=${buf}`;
-      };
-      const tgt = (e) => String((e.target && (e.target.className || e.target.tagName)) || '').slice(0, 20);
+        'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;' +
+        'color:#0f0;font:bold 16px/1.7 monospace;padding:10px;white-space:pre-wrap;' +
+        'pointer-events:none;border-bottom:2px solid #0f0';
       document.body.appendChild(hud);
-
-      // Layout report — pinpoints page-level overflow (the "whole page scrolls"
-      // symptom). Compares document/app height vs the visible viewport.
       const num = (n) => Math.round(n);
-      const layout = () => {
+      const update = () => {
         const de = document.documentElement;
         const vv = window.visualViewport;
         const appEl = document.querySelector('.app');
         const mainEl = document.querySelector('.main');
-        const appCss = getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim();
+        const appCss = getComputedStyle(de).getPropertyValue('--app-height').trim() || '(unset)';
         const dt = (window.MobileDetection && MobileDetection.getDeviceType) ? MobileDetection.getDeviceType() : '?';
-        const mobileCss = [...document.styleSheets].some(s => (s.href || '').includes('mobile.css') && (!s.media || !s.media.mediaText || matchMedia(s.media.mediaText).matches));
         const overflow = de.scrollHeight - de.clientHeight;
         const rectH = (el) => el ? num(el.getBoundingClientRect().height) : '-';
-        return [
-          `win=${window.innerWidth}x${window.innerHeight} vv=${vv ? num(vv.width)+'x'+num(vv.height) : '-'} dpr=${window.devicePixelRatio}`,
-          `device=${dt} mobileCss=${mobileCss} --app-height=${appCss || '(unset)'}`,
-          `doc.scrollH=${de.scrollHeight} doc.clientH=${de.clientHeight} OVERFLOW=${overflow}px`,
-          `body.scrollH=${num(document.body.scrollHeight)} app.h=${rectH(appEl)} main.h=${rectH(mainEl)}`,
-          `term rows=${this.terminal.rows} cols=${this.terminal.cols} buf=${this.terminal.buffer.active.type} base=${this.terminal.buffer.active.baseY}`,
-        ].join('\n');
+        hud.textContent =
+          'SCROLLDBG-3\n' +
+          'A win  ' + window.innerWidth + ' x ' + window.innerHeight + '\n' +
+          'B vis  ' + (vv ? num(vv.width) + ' x ' + num(vv.height) : '-') + '\n' +
+          'C OVERFLOW ' + overflow + ' px\n' +
+          'D device ' + dt + '\n' +
+          'E appH ' + appCss + '\n' +
+          'F app ' + rectH(appEl) + '  main ' + rectH(mainEl) + '\n' +
+          'G scrollY ' + num(window.scrollY);
       };
-      const render2 = () => { hud.textContent = BUILD + ' | LAYOUT\n' + layout() + '\n--- events ---\n' + lines.join('\n'); };
-      // override render to include layout
-      const origLog = log;
-      const log2 = (m) => { lines.unshift(m); if (lines.length > 8) lines.pop(); render2(); };
-      render2();
-      window.addEventListener('resize', render2);
-      if (window.visualViewport) window.visualViewport.addEventListener('resize', render2);
-
-      // Everything the page sends to the PTY — arrows from scroll would appear here
-      this.terminal.onData((d) => log2('→PTY ' + JSON.stringify(d)));
-      document.addEventListener('wheel', (e) =>
-        log2(`wheel dY=${Math.round(e.deltaY)} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
-      document.addEventListener('touchstart', (e) =>
-        log2(`tstart n=${e.touches.length} tgt=${tgt(e)} ${mode()}`), { capture: true, passive: true });
-      document.addEventListener('touchmove', (e) =>
-        log2(`tmove n=${e.touches.length} tgt=${tgt(e)}`), { capture: true, passive: true });
-      // also report the page's own scroll position (the "whole page scrolls" bug)
-      window.addEventListener('scroll', () =>
-        log2(`PAGE SCROLLED y=${num(window.scrollY)} de.scrollTop=${num(document.documentElement.scrollTop)}`), { passive: true });
+      update();
+      window.addEventListener('resize', update);
+      window.addEventListener('scroll', update, { passive: true });
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', update);
+        window.visualViewport.addEventListener('scroll', update);
+      }
+      setInterval(update, 400); // keep C/G live while you scroll
     }
 
     // Welcome message
