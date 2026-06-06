@@ -240,6 +240,17 @@ html.mobile-init .file-browser-panel {
     display: flex !important;
   }
 
+  /* Don't centre the voice button on tablet/iPad. A button pinned to the bottom
+     centre sits in the iPad home-indicator gesture zone, so tapping it triggers
+     the app-switcher / minimise instead of recording. Pin it to the right edge,
+     clear of that zone. */
+  .toolbar-center {
+    position: absolute;
+    left: auto;
+    right: calc(0.5rem + var(--safe-area-right));
+    transform: none;
+  }
+
   /* Toolbar — use desktop-style sizing on tablet (plenty of room at 430-768px) */
   .toolbar {
     padding: 0 0.5rem;
