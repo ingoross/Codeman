@@ -2483,15 +2483,51 @@ body {
   transform: translateX(-50%);
 }
 
-/* On touch devices (iPad etc.) never pin the voice button to the bottom centre:
-   that is the home-indicator gesture zone, so a tap there minimises the app /
-   opens the app-switcher instead of recording. Pin it to the right edge, clear
-   of that zone. Lives in styles.css (always loaded) so it also covers iPad
-   landscape (>1023px) where mobile.css is not loaded. */
-body.touch-device .toolbar-center {
-  left: auto;
-  right: calc(0.75rem + var(--safe-area-right, 0px));
-  transform: none;
+/* On touch tablets/iPads (≥481px) the centre-pinned voice button lands in the
+   bottom-edge gesture zone — a tap there minimises the app / opens the
+   app-switcher (and the corners are no better). So we hide the absolutely-
+   positioned centre mic and use the inline .btn-voice-mobile, placed right after
+   Run Shell in the normal button row where the other buttons already work.
+   Lives in styles.css (always loaded) so it also covers iPad landscape (>1023px)
+   where mobile.css is not loaded. Phones (<481px) keep their existing layout
+   from mobile.css and are intentionally excluded. */
+@media (min-width: 481px) {
+  body.touch-device .toolbar-center .btn-toolbar.btn-voice {
+    display: none !important;
+  }
+
+  body.touch-device .btn-voice-mobile {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    background: #1a2a3f;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    border-radius: 6px;
+    color: #93c5fd;
+    cursor: pointer;
+    flex-shrink: 0;
+    order: 1; /* right after Run Shell (order 0) … */
+  }
+
+  /* … and before the case selector + instance-count steppers (pushed after) */
+  body.touch-device .toolbar-left .case-select-group,
+  body.touch-device .toolbar-left .btn-case-mobile,
+  body.touch-device .toolbar-left .tab-count-group {
+    order: 2;
+  }
+
+  body.touch-device .btn-voice-mobile svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  body.touch-device .btn-voice-mobile.recording {
+    background: rgba(239, 68, 68, 0.25);
+    border-color: rgba(239, 68, 68, 0.6);
+    color: #ef4444;
+  }
 }
 
 .version-display {
