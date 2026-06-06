@@ -325,10 +325,19 @@ Object.assign(CodemanApp.prototype, {
         { passive: true }
       );
 
+      // Capture phase + stopPropagation: intercept the touch-drag BEFORE xterm's
+      // own viewport handler sees it. In application-cursor-keys mode (Claude's
+      // Ink UI) xterm otherwise translates a scroll gesture into ↑/↓ arrow key
+      // sequences sent to the PTY instead of scrolling — so a swipe navigated
+      // menus / moved the cursor rather than scrolling the output. By consuming
+      // the event here we guarantee a swipe always drives scrollback via
+      // scrollLines() and never reaches the app as arrow keys.
       container.addEventListener(
         'touchmove',
         (ev) => {
           if (ev.touches.length === 1 && isTouching) {
+            ev.preventDefault();
+            ev.stopPropagation();
             didScroll = true;
             const touchY = ev.touches[0].clientY;
             const delta = touchLastY - touchY; // positive = scroll down
@@ -344,7 +353,7 @@ Object.assign(CodemanApp.prototype, {
             }
           }
         },
-        { passive: true }
+        { capture: true, passive: false }
       );
 
       container.addEventListener(
