@@ -46,11 +46,38 @@ const SCREENSHOTS_DIR = join(homedir(), '.codeman', 'screenshots');
 /** Cached CPU count — doesn't change at runtime */
 const CPU_COUNT = cpus().length;
 
-/** Get system CPU and memory usage */
+/** Get system CPU, memory, and disk usage */
 function getSystemStats(): {
   cpu: number;
   memory: { usedMB: number; totalMB: number; percent: number };
+  disk: { usedGB: number; totalGB: number; freeGB: number; percent: number };
 } {
+  // Root filesystem usage via df. `-P` (POSIX) guarantees a single data line
+  // even when the device name is long, so column indices stay stable.
+  // Optional — failure here must not break cpu/memory stats.
+  let disk = { usedGB: 0, totalGB: 0, freeGB: 0, percent: 0 };
+  try {
+    const out = execSync('df -Pk /', { encoding: 'utf-8', timeout: 2000 });
+    const cols = (out.trim().split('\n').pop() ?? '').split(/\s+/);
+    const totalKB = parseInt(cols[1], 10);
+    const availKB = parseInt(cols[3], 10);
+    // On APFS (Apple Silicon) df's "Used" column (cols[2]) only covers the
+    // queried volume — for `/` that's the ~12 GB read-only system volume, not
+    // the whole container. Derive real usage from total − available so the
+    // percentage reflects the actual disk, not a misleading 5%.
+    const usedKB = totalKB - availKB;
+    if (totalKB > 0) {
+      disk = {
+        totalGB: Math.round(totalKB / 1024 / 1024),
+        usedGB: Math.round(usedKB / 1024 / 1024),
+        freeGB: Math.round(availKB / 1024 / 1024),
+        percent: Math.round((usedKB / totalKB) * 100),
+      };
+    }
+  } catch {
+    /* disk stats are best-effort */
+  }
+
   try {
     const totalMem = totalmem();
 
@@ -83,11 +110,13 @@ function getSystemStats(): {
         totalMB: Math.round(totalMem / (1024 * 1024)),
         percent: Math.round((usedMem / totalMem) * 100),
       },
+      disk,
     };
   } catch {
     return {
       cpu: 0,
       memory: { usedMB: 0, totalMB: 0, percent: 0 },
+      disk,
     };
   }
 }

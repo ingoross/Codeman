@@ -814,6 +814,27 @@ body {
   background: linear-gradient(90deg, var(--yellow) 0%, var(--red) 100%);
 }
 
+.stat-bar-disk {
+  background: linear-gradient(90deg, #14b8a6 0%, #0d9488 100%);
+}
+
+.stat-bar-disk.medium {
+  background: linear-gradient(90deg, #14b8a6 0%, var(--yellow) 100%);
+}
+
+.stat-bar-disk.high {
+  background: linear-gradient(90deg, var(--yellow) 0%, var(--red) 100%);
+}
+
+/* DISK stat is desktop-only. The whole stats bar is already hidden on mobile
+   (see mobile.css), but this guarantees the disk item never shows on narrow
+   viewports even if the bar is otherwise visible (e.g. small tablet widths). */
+@media (max-width: 768px) {
+  .stat-item-disk {
+    display: none !important;
+  }
+}
+
 .stat-value {
   min-width: 32px;
   text-align: right;

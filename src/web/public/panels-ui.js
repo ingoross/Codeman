@@ -3245,6 +3245,29 @@ Object.assign(CodemanApp.prototype, {
         memBar.classList.add('medium');
       }
     }
+
+    const diskEl = this.$('statDisk');
+    const diskBar = this.$('statDiskBar');
+    if (diskEl && diskBar && stats.disk) {
+      diskEl.textContent = `${stats.disk.percent}%`;
+      diskBar.style.width = `${Math.min(100, stats.disk.percent)}%`;
+
+      // Tooltip surfaces the number that actually matters for a disk: free space
+      const diskItem = this.$('statDiskItem');
+      if (diskItem) {
+        diskItem.title = `${stats.disk.freeGB} GB frei von ${stats.disk.totalGB} GB`;
+      }
+
+      // Disk normally runs fuller than CPU/mem, so use higher thresholds
+      diskBar.classList.remove('medium', 'high');
+      diskEl.classList.remove('high');
+      if (stats.disk.percent > 90) {
+        diskBar.classList.add('high');
+        diskEl.classList.add('high');
+      } else if (stats.disk.percent > 75) {
+        diskBar.classList.add('medium');
+      }
+    }
   },
 
   // ─── Clipboard ──────────────────────────────────────────────────────────────
