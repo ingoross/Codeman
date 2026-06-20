@@ -220,4 +220,14 @@ export interface TerminalMultiplexer extends EventEmitter {
 
   /** Capture the active pane's current tmux buffer with ANSI escape codes preserved. */
   captureActivePaneBuffer?(muxName: string): string | null;
+
+  /**
+   * Capture the active pane's FULL scrollback history (all lines + current screen)
+   * as a plain stream of rendered lines with SGR colors (capture-pane -p -e -S -).
+   * For main-buffer modes (claude/shell, alternate-screen OFF) tmux holds the whole
+   * conversation here, and the capture contains only SGR + newlines (no cursor/scroll
+   * sequences), so it replays cleanly as xterm scrollback — restoring scrollback
+   * after a server restart when the in-memory byte buffer is empty.
+   */
+  captureActivePaneHistory?(muxName: string): string | null;
 }
