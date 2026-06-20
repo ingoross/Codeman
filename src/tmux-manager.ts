@@ -1121,24 +1121,6 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             })
             .catch(() => {
               /* Non-critical — colors limited to 256 */
-            }),
-          // Make full-screen TUI output scrollable. With alternate-screen OFF,
-          // apps like Claude Code's Ink UI render into the main buffer, so their
-          // output accumulates in tmux scrollback (history-limit) instead of a
-          // non-scrollable alternate screen — letting the web terminal scroll back
-          // through the conversation. stripInkRedrawBloat() cleans the redraw
-          // debris this produces. Set as GLOBAL defaults so every new session's
-          // pane inherits them at creation (per-session set-option runs too late
-          // to size an already-created scrollback buffer).
-          execAsync(`${this.tmux()} set-window-option -g alternate-screen off`, { timeout: EXEC_TIMEOUT_MS })
-            .then(() => {})
-            .catch(() => {
-              /* Non-critical — falls back to alternate-screen on (not scrollable) */
-            }),
-          execAsync(`${this.tmux()} set-option -g history-limit 50000`, { timeout: EXEC_TIMEOUT_MS })
-            .then(() => {})
-            .catch(() => {
-              /* Non-critical — falls back to tmux 2000-line default */
             })
         );
       }
