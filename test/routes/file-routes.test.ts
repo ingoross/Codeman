@@ -215,6 +215,50 @@ describe('file-routes', () => {
       expect(body.data.url).toContain('file-raw');
     });
 
+    it('returns audio metadata for audio files', async () => {
+      mockedStat.mockResolvedValue({ size: 2048 } as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/file-content?path=clip.mp3`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.type).toBe('audio');
+      expect(body.data.url).toContain('file-raw');
+    });
+
+    it('flags known-binary extensions (e.g. xlsx) instead of dumping mojibake', async () => {
+      mockedStat.mockResolvedValue({ size: 4096 } as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/file-content?path=sheet.xlsx`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.type).toBe('binary');
+      expect(body.data.content).toBeUndefined();
+    });
+
+    it('sniffs NUL bytes and flags binary content for unknown extensions', async () => {
+      const binary = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x01, 0x02]);
+      mockedReadFile.mockResolvedValue(binary as never);
+      mockedStat.mockResolvedValue({ size: binary.length } as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/file-content?path=mystery.dat`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.type).toBe('binary');
+      expect(body.data.content).toBeUndefined();
+    });
+
     it('rejects path traversal attempts', async () => {
       // realpathSync resolves the symlink to a path outside workingDir
       mockedRealpathSync.mockReturnValue('/etc/passwd' as never);
@@ -305,6 +349,22 @@ describe('file-routes', () => {
       expect(res.headers['content-type']).toBe('image/png');
     });
 
+    it('serves workspace SVG as an untrusted attachment instead of inline image/svg+xml', async () => {
+      const content = Buffer.from('<svg><script>alert("xss")</script></svg>');
+      mockedReadFile.mockResolvedValue(content as never);
+      mockedStat.mockResolvedValue({ size: content.length } as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/file-raw?path=malicious.svg`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['content-type']).toBe('application/octet-stream');
+      expect(res.headers['content-disposition']).toContain('attachment; filename="malicious.svg"');
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+    });
+
     it('rejects path traversal in raw file serving', async () => {
       mockedRealpathSync.mockReturnValue('/etc/shadow' as never);
 
@@ -347,11 +407,11 @@ describe('file-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      expect(body.closed).toBe(true);
       expect(mockedFileStreamManager.closeStream).toHaveBeenCalledWith('stream-1');
     });
 
-    it('returns false for unknown stream', async () => {
+    it('returns closed: false for unknown stream', async () => {
       mockedFileStreamManager.closeStream.mockReturnValue(false);
 
       const res = await harness.app.inject({
@@ -360,7 +420,66 @@ describe('file-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(false);
+      expect(body.closed).toBe(false);
+    });
+  });
+
+  // ========== GET /api/download ==========
+
+  describe('GET /api/download', () => {
+    it('requires a sessionId to scope downloads', async () => {
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/download?path=${encodeURIComponent('/tmp/test-workdir/report.txt')}`,
+      });
+
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('downloads files scoped to the session working directory', async () => {
+      const content = Buffer.from('download content');
+      mockedReadFile.mockResolvedValue(content as never);
+      mockedStat.mockResolvedValue({ size: content.length, isFile: () => true } as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/download?sessionId=${harness.ctx._sessionId}&path=report.txt`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['content-disposition']).toContain('filename="report.txt"');
+      expect(res.body).toBe('download content');
+    });
+
+    it('rejects absolute paths outside the session working directory', async () => {
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/download?sessionId=${harness.ctx._sessionId}&path=${encodeURIComponent('/var/log/app.log')}`,
+      });
+
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('rejects symlink targets that escape the session working directory', async () => {
+      mockedRealpathSync.mockReturnValue('/tmp/outside-workdir/link.log' as never);
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/download?sessionId=${harness.ctx._sessionId}&path=${encodeURIComponent(
+          '/tmp/test-workdir/link.log'
+        )}`,
+      });
+
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('blocks sensitive files even when they are inside the session working directory', async () => {
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/download?sessionId=${harness.ctx._sessionId}&path=.env`,
+      });
+
+      expect(res.statusCode).toBe(403);
     });
   });
 });

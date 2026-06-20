@@ -21,15 +21,19 @@
  *     {"t":"o","d":"..."} — terminal output
  *     {"t":"c"}           — clear terminal
  *     {"t":"r"}           — needs refresh (reload buffer)
+ *     {"t":"ia","seq":N}  — input ACK (echoes the seq of an applied/deduped input frame)
  *   Client -> Server:
- *     {"t":"i","d":"..."} — input (keystroke or paste)
- *     {"t":"z","c":N,"r":N} — resize terminal
+ *     {"t":"i","d":"...","seq":N,"cid":"..."} — input (keystroke or paste). seq+cid are
+ *                          optional reliable-delivery tags: the server applies each
+ *                          (cid,seq) at-most-once and ACKs with {"t":"ia","seq":N}.
+ *     {"t":"z","c":N,"r":N,"f":bool} — resize terminal (f=true forces SIGWINCH even if dims unchanged)
  */
 
 import { FastifyInstance } from 'fastify';
 import type { WebSocket } from 'ws';
 import type { SessionPort } from '../ports/session-port.js';
 import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
+import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 
 /** Micro-batch interval for terminal output (ms). Short enough for low latency,
  *  long enough to group Ink's rapid cursor-up redraw sequences into single frames. */
@@ -58,8 +62,19 @@ const MAX_WS_PER_SESSION = 5;
 /** Track active WS connections per session for connection limiting. */
 const sessionWsCount = new Map<string, number>();
 
-export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
+export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHostPolicy: () => HostPolicy): void {
   app.get<{ Params: { id: string } }>('/ws/sessions/:id/terminal', { websocket: true }, (socket: WebSocket, req) => {
+    // Reject cross-site WebSocket hijacking (CSWSH) and DNS-rebinding before doing
+    // anything: the upgrade must come from an allowed Host and (when the browser
+    // sends one — it always does for WS) a same-site Origin. Writing to this socket
+    // injects keystrokes into a --dangerously-skip-permissions agent, so this gate
+    // matters even on the default no-password install. See security review H5.
+    const policy = getHostPolicy();
+    if (!isAllowedRequestHost(req.headers.host, policy) || !isAllowedRequestOrigin(req.headers.origin, policy)) {
+      socket.close(4003, 'Forbidden');
+      return;
+    }
+
     const { id } = req.params;
     const session = ctx.sessions.get(id);
 
@@ -97,6 +112,13 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
       socket.send(`{"t":"o","d":${JSON.stringify(DEC_2026_START + data + DEC_2026_END)}}`);
     };
 
+    // Per-connection desktop sizing claim — registered on the first
+    // desktop-typed resize and released on socket close, so Session.resize()
+    // can ignore small-viewport resizes only while a desktop is actually
+    // connected (see Session._desktopSizeClaims).
+    const sizingToken = Symbol('ws-desktop-sizing');
+    let holdsDesktopClaim = false;
+
     // Attach message handler synchronously BEFORE any async work
     // (@fastify/websocket requirement to avoid dropped messages).
     socket.on('message', (raw) => {
@@ -104,7 +126,22 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
         const msg = JSON.parse(String(raw));
         if (msg.t === 'i' && typeof msg.d === 'string') {
           if (msg.d.length > MAX_INPUT_LENGTH) return;
-          session.write(msg.d);
+          // Reliable delivery: when the frame carries a clientId + seq, apply it
+          // exactly once (skip a duplicate redelivery) but ACK it regardless so
+          // the client can drop it from its durable queue. Frames without seq
+          // (legacy/other tools) are applied as-is — no behavior change.
+          const cid = typeof msg.cid === 'string' ? msg.cid : null;
+          const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+          const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
+          if (apply) {
+            // Typed input from a claim-holding desktop keeps the claim "hot"
+            // and re-asserts the desktop layout after a mobile override.
+            if (holdsDesktopClaim) session.noteDesktopActivity();
+            session.write(msg.d);
+          }
+          if (seq !== null && socket.readyState === 1) {
+            socket.send(`{"t":"ia","seq":${seq}}`);
+          }
         } else if (
           msg.t === 'z' &&
           Number.isInteger(msg.c) &&
@@ -114,7 +151,18 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
           msg.r >= 1 &&
           msg.r <= 200
         ) {
-          session.resize(msg.c, msg.r);
+          const viewportType = msg.v === 'mobile' || msg.v === 'tablet' || msg.v === 'desktop' ? msg.v : undefined;
+          if (viewportType === 'desktop') {
+            session.claimDesktopSizing(sizingToken);
+            holdsDesktopClaim = true;
+          } else if (viewportType) {
+            // The connection's viewport can change (e.g. browser window
+            // narrowed past the tablet breakpoint) — drop a stale claim.
+            session.releaseDesktopSizing(sizingToken);
+            holdsDesktopClaim = false;
+          }
+          const force = msg.f === true;
+          session.resize(msg.c, msg.r, { viewportType, force });
         }
       } catch {
         // Ignore malformed messages
@@ -193,6 +241,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
       session.off('clearTerminal', onClearTerminal);
       session.off('needsRefresh', onNeedsRefresh);
       session.off('exit', onSessionExit);
+      session.releaseDesktopSizing(sizingToken);
 
       // Decrement per-session connection count
       const count = sessionWsCount.get(id) ?? 1;

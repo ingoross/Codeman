@@ -8,8 +8,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { TmuxManager, parsePaneList } from '../src/tmux-manager.js';
-import { execSync } from 'node:child_process';
+import { TmuxManager, formatPaneSnapshot, parsePaneList, resolveActivePaneTarget } from '../src/tmux-manager.js';
+import { execSync, exec } from 'node:child_process';
 
 // ============================================================================
 // Unit Tests (mocked)
@@ -20,6 +20,17 @@ vi.mock('node:child_process', async () => {
   const actual = await vi.importActual('node:child_process');
   return {
     ...actual,
+    exec: vi.fn((_cmd: string, optionsOrCallback?: unknown, maybeCallback?: unknown) => {
+      const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+      if (typeof callback === 'function') {
+        setImmediate(() => callback(null, '', ''));
+      }
+      return {
+        on: vi.fn(),
+        kill: vi.fn(),
+        pid: 12345,
+      };
+    }),
     execSync: vi.fn(),
     spawn: vi.fn(() => ({
       unref: vi.fn(),
@@ -41,9 +52,19 @@ vi.mock('node:fs', async () => {
   };
 });
 
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual('node:fs/promises');
+  return {
+    ...actual,
+    writeFile: vi.fn(() => Promise.resolve()),
+    rename: vi.fn(() => Promise.resolve()),
+  };
+});
+
 describe('TmuxManager (unit)', () => {
   let manager: TmuxManager;
   const mockedExecSync = vi.mocked(execSync);
+  const mockedExec = vi.mocked(exec);
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -95,6 +116,123 @@ describe('TmuxManager (unit)', () => {
 
       const args = manager.getAttachArgs('codeman-abc12345');
       expect(args).toEqual(['-L', 'codeman', 'attach-session', '-t', 'codeman-abc12345']);
+    });
+  });
+
+  describe('window sizing', () => {
+    it('pins a tmux window to manual sizing before browser attach', () => {
+      expect(manager.setManualWindowSize('codeman-abc12345')).toBe(true);
+
+      expect(mockedExecSync).toHaveBeenCalledWith(
+        "tmux -L 'codeman' set-window-option -t 'codeman-abc12345' window-size manual",
+        expect.objectContaining({ stdio: 'ignore' })
+      );
+    });
+
+    it('resizes the tmux window when Codeman accepts a desktop resize', () => {
+      expect(manager.resizeWindow('codeman-abc12345', 140, 42)).toBe(true);
+
+      // Non-blocking exec (not execSync) on the interactive resize hot path.
+      expect(mockedExec).toHaveBeenCalledWith(
+        "tmux -L 'codeman' resize-window -t 'codeman-abc12345' -x 140 -y 42",
+        expect.objectContaining({ timeout: expect.any(Number) }),
+        expect.any(Function)
+      );
+    });
+  });
+
+  describe('environment exports', () => {
+    it('keeps COLORTERM unset for OpenCode sessions', () => {
+      const exports = (
+        manager as unknown as {
+          buildEnvExports(sessionId: string, muxName: string, mode: string): string[];
+        }
+      ).buildEnvExports('session-1', 'codeman-abc12345', 'opencode');
+
+      expect(exports).toContain('unset COLORTERM');
+    });
+  });
+
+  describe('formatPaneSnapshot', () => {
+    it('paints captured rows with absolute cursor positions to avoid newline autowrap scroll', () => {
+      const fullWidthLine = 'x'.repeat(10);
+
+      const snapshot = formatPaneSnapshot([fullWidthLine, 'next line'], {
+        cols: 10,
+        rows: 4,
+        cursorX: 2,
+        cursorY: 1,
+      });
+
+      // Full pane width is painted (10 cols); autowrap is avoided by the
+      // absolute cursor positioning, not by dropping the last column.
+      expect(snapshot).toBe(`\x1b[1;1H${'x'.repeat(10)}\x1b[2;1Hnext line\x1b[2;3H`);
+      expect(snapshot).not.toContain('\n');
+    });
+
+    it('preserves the rightmost column of each captured row', () => {
+      const snapshot = formatPaneSnapshot(['abcd'], {
+        cols: 4,
+        rows: 1,
+        cursorX: 0,
+        cursorY: 0,
+      });
+
+      // Previously truncated to cols - 1 ('abc'); the full width is now kept.
+      expect(snapshot).toBe('\x1b[1;1Habcd\x1b[1;1H');
+    });
+
+    it('preserves SGR color while stripping non-style pane controls', () => {
+      const snapshot = formatPaneSnapshot(['\x1b[32mgreen\x1b[0m\x1b[2K\x1b[10;20Htail'], {
+        cols: 40,
+        rows: 2,
+        cursorX: 0,
+        cursorY: 0,
+      });
+
+      expect(snapshot).toContain('\x1b[32mgreen\x1b[0m');
+      expect(snapshot).toContain('tail');
+      expect(snapshot).not.toContain('\x1b[2K');
+      expect(snapshot).not.toContain('\x1b[10;20H');
+    });
+
+    it('truncates styled rows by visible columns without cutting SGR escapes', () => {
+      const snapshot = formatPaneSnapshot(['\x1b[31mabcdef\x1b[0m'], {
+        cols: 4,
+        rows: 1,
+        cursorX: 0,
+        cursorY: 0,
+      });
+
+      expect(snapshot).toBe('\x1b[1;1H\x1b[31mabcd\x1b[0m\x1b[1;1H');
+    });
+
+    it('does not let full-width glyphs cross the paint boundary', () => {
+      // cols 5 = 'abc' (3) + full-width \u754c (2) fits exactly; with cols 4 the
+      // wide glyph would straddle the boundary and is dropped.
+      expect(formatPaneSnapshot(['abc\u754cdef'], { cols: 5, rows: 1, cursorX: 0, cursorY: 0 })).toBe(
+        '\x1b[1;1Habc\u754c\x1b[1;1H'
+      );
+      expect(formatPaneSnapshot(['abc\u754cdef'], { cols: 4, rows: 1, cursorX: 0, cursorY: 0 })).toBe(
+        '\x1b[1;1Habc\x1b[1;1H'
+      );
+    });
+
+    it('keeps combining marks attached without consuming a terminal column', () => {
+      const snapshot = formatPaneSnapshot(['a\u0301bc'], {
+        cols: 4,
+        rows: 1,
+        cursorX: 0,
+        cursorY: 0,
+      });
+
+      expect(snapshot).toBe('\x1b[1;1Ha\u0301bc\x1b[1;1H');
+    });
+  });
+
+  describe('resolveActivePaneTarget', () => {
+    it('selects the active pane instead of assuming pane zero', () => {
+      expect(resolveActivePaneTarget('%1:0\n%18:1\n')).toBe('%18');
     });
   });
 
@@ -367,6 +505,95 @@ describe('TmuxManager (unit)', () => {
       // No error thrown
       manager.stopStatsCollection();
       // No error thrown
+    });
+  });
+
+  describe('tmux launch cwd hardening', () => {
+    async function importWithTmuxCommandsEnabled(): Promise<typeof TmuxManager> {
+      const originalVitest = process.env.VITEST;
+      vi.resetModules();
+      delete process.env.VITEST;
+      const module = await import('../src/tmux-manager.js');
+      if (originalVitest === undefined) {
+        delete process.env.VITEST;
+      } else {
+        process.env.VITEST = originalVitest;
+      }
+      return module.TmuxManager;
+    }
+
+    beforeEach(() => {
+      mockedExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === 'string' && cmd.includes('which tmux')) {
+          return '/usr/bin/tmux\n';
+        }
+        if (typeof cmd === 'string' && cmd.includes('display-message') && cmd.includes('#{pane_pid}')) {
+          return '4242\n';
+        }
+        return '';
+      });
+    });
+
+    it('starts new tmux sessions from /tmp and cd-bounces into the requested workspace', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+
+      try {
+        const session = await nonTestManager.createSession({
+          sessionId: 'abc12345-1234-5678-90ab-cdef12345678',
+          workingDir: '/mnt/gdrive/project with spaces',
+          mode: 'shell',
+        });
+
+        expect(session.workingDir).toBe('/mnt/gdrive/project with spaces');
+        expect(session.pid).toBe(4242);
+
+        const newSessionCall = mockedExecSync.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' new-session ')
+        );
+        expect(newSessionCall?.[0]).toBe(`tmux -L 'codeman' new-session -ds "codeman-abc12345" -c /tmp`);
+        expect(newSessionCall?.[1]).toEqual(expect.objectContaining({ cwd: '/tmp' }));
+
+        const respawnCall = mockedExecSync.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane ')
+        );
+        expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abc12345"`);
+        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project with spaces\\" &&');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('respawns existing panes from /tmp and cd-bounces into the requested workspace', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      nonTestManager.registerSession({
+        sessionId: 'respawn1234',
+        muxName: 'codeman-abcd1234',
+        pid: 1000,
+        createdAt: Date.now(),
+        workingDir: '/tmp',
+        mode: 'shell',
+        attached: false,
+      });
+
+      try {
+        const pid = await nonTestManager.respawnPane({
+          sessionId: 'respawn1234',
+          workingDir: '/mnt/gdrive/project',
+          mode: 'shell',
+        });
+
+        expect(pid).toBe(4242);
+        const { exec: currentExec } = await import('node:child_process');
+        const respawnCall = vi
+          .mocked(currentExec)
+          .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
+        expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abcd1234"`);
+        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project\\" &&');
+      } finally {
+        nonTestManager.destroy();
+      }
     });
   });
 });

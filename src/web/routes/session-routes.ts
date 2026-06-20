@@ -16,10 +16,9 @@ import {
   createErrorResponse,
   getErrorMessage,
   type ApiResponse,
-  type QuickStartResponse,
   type SessionColor,
 } from '../../types.js';
-import { Session } from '../../session.js';
+import { Session, isAltScreenStripMode } from '../../session.js';
 import { SseEvent } from '../sse-events.js';
 import {
   CreateSessionSchema,
@@ -30,6 +29,7 @@ import {
   ResizeSchema,
   AutoClearSchema,
   AutoCompactSchema,
+  AutoResumeSchema,
   ImageWatcherSchema,
   FlickerFilterSchema,
   QuickRunSchema,
@@ -45,7 +45,13 @@ import {
   validatePathWithinBase,
 } from '../route-helpers.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
-import { writeHooksConfig, updateCaseModel, stripCaseEnvKeys } from '../../hooks-config.js';
+import {
+  writeHooksConfig,
+  updateCaseModel,
+  stripCaseEnvKeys,
+  applyStatusLineConfig,
+  refreshStaleHookSecret,
+} from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
@@ -54,9 +60,10 @@ import { MAX_CONCURRENT_SESSIONS } from '../../config/map-limits.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
+import { dataPath } from '../../config/instance.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
-const LINKED_CASES_FILE = join(homedir(), '.codeman', 'linked-cases.json');
+const LINKED_CASES_FILE = dataPath('linked-cases.json');
 
 // Pre-compiled regex for terminal buffer cleaning (avoids per-request compilation)
 // eslint-disable-next-line no-control-regex
@@ -64,6 +71,32 @@ const CLAUDE_BANNER_PATTERN = /\x1b\[1mClaud/;
 // eslint-disable-next-line no-control-regex
 const CTRL_L_PATTERN = /\x0c/g;
 const LEADING_WHITESPACE_PATTERN = /^[\s\r\n]+/;
+
+/**
+ * Match xterm alternate-screen mode toggles + the standalone scrollback-erase.
+ *
+ * - DECSET/DECRST 47, 1047, 1049 = enter/exit alternate screen buffer
+ *   (1049 also saves cursor and clears the alt buffer).
+ * - CSI 3 J = erase saved lines (scrollback).
+ *
+ * Codex AND Claude Code emit `\x1b[?1049h` and clear-scrollback sequences (the
+ * latter intermittently, e.g. full-screen pickers/dialogs). xterm.js obeys them
+ * by switching to the alt buffer (no native scrollback) and wiping saved lines,
+ * so the user's conversation history disappears on every tab switch / pane
+ * refresh (and scroll-up breaks live). Stripping these from the replayed byte
+ * stream keeps everything in the main buffer with scrollback intact. Mirrors the
+ * live-stream strip in Session._handleTerminalOutput (isAltScreenStripMode).
+ */
+// eslint-disable-next-line no-control-regex
+const ALT_SCREEN_TOGGLE_PATTERN = /\x1b\[\?(?:47|1047|1049)[hl]/g;
+// eslint-disable-next-line no-control-regex
+const ERASE_SCROLLBACK_PATTERN = /\x1b\[3J/g;
+// Mouse-tracking enables (X10/button/any-event/UTF-8/SGR/alt-scroll) — once on,
+// xterm.js forwards wheel events to the app instead of scrolling the viewport.
+// Live streams are stripped at the source, but buffers persisted BEFORE that
+// strip existed can still carry them; strip on replay for parity.
+// eslint-disable-next-line no-control-regex
+const MOUSE_TRACKING_PATTERN = /\x1b\[\?(?:1000|1001|1002|1003|1005|1006|1007)[hl]/g;
 
 /**
  * Strip redundant Ink spinner/status-bar redraw frames from the terminal buffer.
@@ -210,7 +243,7 @@ export function registerSessionRoutes(
       ctx.authSessions?.delete(sessionToken);
     }
     reply.clearCookie(AUTH_COOKIE_NAME, { path: '/' });
-    return { success: true };
+    return {};
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -271,6 +304,28 @@ export function registerSessionRoutes(
       await updateCaseModel(workingDir, body.modelOverride || null);
     }
 
+    // Plan-usage statusLine exporter (App Settings → Display → "Plan Usage
+    // Limits"). Claude-only; runs for ANY working dir (linked cases / real repos,
+    // where most sessions live), mirroring updateCaseModel above.
+    //
+    // ADD-ONLY: we never remove on create. Sessions in a repo share one
+    // settings.local.json, so a single create-with-false (e.g. a client whose
+    // synced setting hadn't loaded yet) must NOT yank the statusLine out from
+    // under other live sessions in that repo — that breaks their footer + the
+    // chip's data feed for everyone. The exporter is benign when the chip is off
+    // (the footer just shows session status). isOurs-guarded so a user's own
+    // statusLine is never touched.
+    if ((body.mode ?? 'claude') === 'claude' && body.statusLineTelemetry === true) {
+      await applyStatusLineConfig(workingDir, true);
+    }
+
+    // COD-91 self-heal: refresh a pre-secret hooks block in an existing case so the now
+    // unconditional hook-secret gate keeps accepting its hook events. No-op for fresh
+    // cases (writeHooksConfig already wrote the secret) and for non-Codeman/absent hooks.
+    if ((body.mode ?? 'claude') === 'claude') {
+      await refreshStaleHookSecret(workingDir).catch(() => {});
+    }
+
     // Check OpenCode availability if requested
     if (body.mode === 'opencode') {
       const { isOpenCodeAvailable } = await import('../../utils/opencode-cli-resolver.js');
@@ -278,6 +333,17 @@ export function registerSessionRoutes(
         return createErrorResponse(
           ApiErrorCode.OPERATION_FAILED,
           'OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash'
+        );
+      }
+    }
+
+    // Check Codex availability if requested
+    if (body.mode === 'codex') {
+      const { isCodexAvailable } = await import('../../utils/codex-cli-resolver.js');
+      if (!isCodexAvailable()) {
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          'Codex CLI not found. Install with: npm install -g @openai/codex'
         );
       }
     }
@@ -318,9 +384,11 @@ export function registerSessionRoutes(
     const model =
       mode === 'opencode'
         ? body.openCodeConfig?.model
-        : mode !== 'shell'
-          ? modelConfig?.defaultModel || undefined
-          : undefined;
+        : mode === 'codex'
+          ? body.codexConfig?.model
+          : mode !== 'shell'
+            ? modelConfig?.defaultModel || undefined
+            : undefined;
     const claudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir,
@@ -333,8 +401,10 @@ export function registerSessionRoutes(
       claudeMode: claudeModeConfig.claudeMode,
       allowedTools: claudeModeConfig.allowedTools,
       openCodeConfig: mode === 'opencode' ? body.openCodeConfig : undefined,
+      codexConfig: mode === 'codex' ? body.codexConfig : undefined,
       resumeSessionId: validatedResumeId,
       envOverrides: body.envOverrides,
+      effort: body.effort,
     });
 
     ctx.addSession(session);
@@ -347,7 +417,7 @@ export function registerSessionRoutes(
     // Avoids serializing 2-3MB of terminal+text buffers per session creation.
     const lightState = ctx.getSessionStateWithRespawn(session);
     ctx.broadcast(SseEvent.SessionCreated, lightState);
-    return { success: true, session: lightState };
+    return { session: lightState };
   });
 
   // ========== Rename Session ==========
@@ -362,7 +432,7 @@ export function registerSessionRoutes(
     // Also update the mux session name if applicable
     ctx.mux.updateSessionName(id, session.name);
     persistAndBroadcastSession(ctx, session);
-    return { success: true, name: session.name };
+    return { name: session.name };
   });
 
   // ========== Set Session Color ==========
@@ -379,12 +449,12 @@ export function registerSessionRoutes(
 
     session.setColor(body.color as SessionColor);
     persistAndBroadcastSession(ctx, session);
-    return { success: true, color: session.color };
+    return { color: session.color };
   });
 
   // ========== Delete Session ==========
 
-  app.delete('/api/sessions/:id', async (req): Promise<ApiResponse> => {
+  app.delete('/api/sessions/:id', async (req) => {
     const { id } = req.params as { id: string };
     const query = req.query as { killMux?: string };
     const killMux = query.killMux !== 'false'; // Default to true
@@ -394,7 +464,7 @@ export function registerSessionRoutes(
     }
 
     await ctx.cleanupSession(id, killMux, 'user_delete');
-    return { success: true };
+    return {};
   });
 
   // ========== Delete All Sessions ==========
@@ -471,13 +541,13 @@ export function registerSessionRoutes(
       // Create a fresh tracker if one doesn't exist (shouldn't happen normally)
       const newTracker = new RunSummaryTracker(id, session.name);
       ctx.runSummaryTrackers.set(id, newTracker);
-      return { success: true, summary: newTracker.getSummary() };
+      return { summary: newTracker.getSummary() };
     }
 
     // Update session name in case it changed
     tracker.setSessionName(session.name);
 
-    return { success: true, summary: tracker.getSummary() };
+    return { summary: tracker.getSummary() };
   });
 
   // ========== Get Active Tools ==========
@@ -500,7 +570,7 @@ export function registerSessionRoutes(
 
   // ========== Run Prompt ==========
 
-  app.post('/api/sessions/:id/run', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/run', async (req) => {
     const { id } = req.params as { id: string };
     const { prompt } = parseBody(RunPromptSchema, req.body);
     const session = findSessionOrFail(ctx, id);
@@ -515,12 +585,12 @@ export function registerSessionRoutes(
     });
 
     ctx.broadcast(SseEvent.SessionRunning, { id, prompt });
-    return { success: true };
+    return {};
   });
 
   // ========== Start Interactive Mode ==========
 
-  app.post('/api/sessions/:id/interactive', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/interactive', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
 
@@ -552,7 +622,7 @@ export function registerSessionRoutes(
       ctx.broadcast(SseEvent.SessionInteractive, { id });
       ctx.broadcast(SseEvent.SessionUpdated, { session: ctx.getSessionStateWithRespawn(session) });
 
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
@@ -560,7 +630,7 @@ export function registerSessionRoutes(
 
   // ========== Start Shell Mode ==========
 
-  app.post('/api/sessions/:id/shell', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/shell', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
 
@@ -578,7 +648,7 @@ export function registerSessionRoutes(
       });
       ctx.broadcast(SseEvent.SessionInteractive, { id, mode: 'shell' });
       ctx.broadcast(SseEvent.SessionUpdated, { session: ctx.getSessionStateWithRespawn(session) });
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
@@ -590,9 +660,9 @@ export function registerSessionRoutes(
 
   // ========== Send Input ==========
 
-  app.post('/api/sessions/:id/input', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/input', async (req) => {
     const { id } = req.params as { id: string };
-    const { input, useMux } = parseBody(SessionInputWithLimitSchema, req.body);
+    const { input, useMux, seq, clientId } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id);
 
     const inputStr = String(input);
@@ -601,6 +671,13 @@ export function registerSessionRoutes(
         ApiErrorCode.INVALID_INPUT,
         `Input exceeds maximum length (${MAX_INPUT_LENGTH} bytes)`
       );
+    }
+
+    // Reliable delivery (POST fallback when the WebSocket is down): a 2xx IS the
+    // client's ACK, so a tagged duplicate redelivery must still return 200 but
+    // skip the write. Untagged requests (curl/legacy) always apply.
+    if (typeof clientId === 'string' && typeof seq === 'number' && !session.shouldApplyInput(clientId, seq)) {
+      return {};
     }
 
     // Write input to PTY. Direct write is synchronous; writeViaMux
@@ -622,7 +699,7 @@ export function registerSessionRoutes(
     } else {
       session.write(inputStr);
     }
-    return { success: true };
+    return {};
   });
 
   // ========== Send Named Key (tmux send-keys -H) ==========
@@ -630,7 +707,7 @@ export function registerSessionRoutes(
   // Uses send-keys -H (hex) to inject 0x0a (line feed) which Claude Code's
   // Ink input recognizes as "insert newline" vs 0x0d (carriage return = submit).
 
-  app.post('/api/sessions/:id/send-key', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/send-key', async (req) => {
     const { id } = req.params as { id: string };
     const body = req.body as Record<string, unknown>;
     const key = typeof body?.key === 'string' ? body.key : '';
@@ -669,18 +746,18 @@ export function registerSessionRoutes(
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }
-    return { success: true };
+    return {};
   });
 
   // ========== Resize Terminal ==========
 
-  app.post('/api/sessions/:id/resize', async (req): Promise<ApiResponse> => {
+  app.post('/api/sessions/:id/resize', async (req) => {
     const { id } = req.params as { id: string };
-    const { cols, rows } = parseBody(ResizeSchema, req.body);
+    const { cols, rows, viewportType, force } = parseBody(ResizeSchema, req.body);
     const session = findSessionOrFail(ctx, id);
 
-    session.resize(cols, rows);
-    return { success: true };
+    session.resize(cols, rows, { viewportType, force });
+    return {};
   });
 
   // ========== Get Last Response (from transcript JSONL) ==========
@@ -887,8 +964,26 @@ export function registerSessionRoutes(
     const query = req.query as { tail?: string };
     const session = findSessionOrFail(ctx, id);
 
+    // Prepend the live tmux pane buffer so tab-switch replay shows the current
+    // on-screen frame, not just the accumulated byte history. This matters for
+    // TUI modes (codex/opencode) that repaint only their latest frame: the
+    // accumulated buffer alone replays as the idle banner. We clear the viewport
+    // (`\x1b[H\x1b[2J`) between the history and the live pane so they don't
+    // overlap. `captureActivePaneBuffer` is a no-op ('') under test mode and
+    // returns null when unavailable, in which case we fall back to history.
+    const muxName = session.muxName;
+    const liveMuxBuffer =
+      muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
+        ? ctx.mux.captureActivePaneBuffer(muxName)
+        : null;
+    const rawBuffer =
+      liveMuxBuffer !== null && liveMuxBuffer.length > 0
+        ? session.terminalBufferLength > 0
+          ? `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
+          : liveMuxBuffer
+        : session.terminalBuffer;
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
-    const fullSize = session.terminalBufferLength;
+    const fullSize = rawBuffer.length;
     let truncated = false;
     let cleanBuffer: string;
 
@@ -896,7 +991,18 @@ export function registerSessionRoutes(
     // During long thinking phases, Ink rewrites the same rows thousands of times
     // (500KB+). Without stripping, tail mode returns only spinner frames and
     // the terminal appears empty when switching tabs.
-    const strippedBuffer = stripInkRedrawBloat(session.terminalBuffer);
+    let strippedBuffer = stripInkRedrawBloat(rawBuffer);
+
+    // Strip alt-screen toggles and scrollback-erase from Codex/Claude byte
+    // streams. xterm.js obeys them by switching to its scrollback-less alt
+    // buffer and wiping saved lines, so conversation history disappears on tab
+    // switch. Same gate as the live-stream strip in session.ts.
+    if (isAltScreenStripMode(session.mode)) {
+      strippedBuffer = strippedBuffer
+        .replace(ALT_SCREEN_TOGGLE_PATTERN, '')
+        .replace(ERASE_SCROLLBACK_PATTERN, '')
+        .replace(MOUSE_TRACKING_PATTERN, '');
+    }
 
     if (tailBytes > 0 && strippedBuffer.length > tailBytes) {
       // Fast path: tail from the end, skip expensive banner search on full 2MB buffer.
@@ -978,6 +1084,27 @@ export function registerSessionRoutes(
           enabled: session.autoCompactEnabled,
           threshold: session.autoCompactThreshold,
           prompt: session.autoCompactPrompt,
+        },
+      },
+    };
+  });
+
+  // ========== Auto-Resume (usage-limit pause) ==========
+
+  app.post('/api/sessions/:id/auto-resume', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(AutoResumeSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
+
+    session.setAutoResume(body.enabled);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        autoResume: {
+          enabled: session.autoResumeEnabled,
+          resumeAt: session.autoResumeAt ?? undefined,
         },
       },
     };
@@ -1082,17 +1209,18 @@ export function registerSessionRoutes(
       const result = await session.runPrompt(prompt);
       // Clean up session after completion to prevent memory leak
       await ctx.cleanupSession(session.id, true, 'run_prompt_complete');
-      return { success: true, sessionId: session.id, ...result };
+      return { sessionId: session.id, ...result };
     } catch (err) {
-      // Clean up session on error too
+      // Clean up session on error too. The session is destroyed here, so its id
+      // is only useful for log correlation — carry it in the error message.
       await ctx.cleanupSession(session.id, true, 'run_prompt_error');
-      return { success: false, sessionId: session.id, error: getErrorMessage(err) };
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${getErrorMessage(err)} (session ${session.id})`);
     }
   });
 
   // ========== Quick Start ==========
 
-  app.post('/api/quick-start', async (req): Promise<QuickStartResponse> => {
+  app.post('/api/quick-start', async (req) => {
     // Prevent unbounded session creation
     if (ctx.sessions.size >= MAX_CONCURRENT_SESSIONS) {
       return createErrorResponse(
@@ -1105,7 +1233,9 @@ export function registerSessionRoutes(
       caseName = 'testcase',
       mode = 'claude',
       openCodeConfig,
+      codexConfig,
       envOverrides,
+      effort,
     } = parseBody(QuickStartSchema, req.body);
 
     // Check OpenCode availability if requested
@@ -1115,6 +1245,17 @@ export function registerSessionRoutes(
         return createErrorResponse(
           ApiErrorCode.OPERATION_FAILED,
           'OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash'
+        );
+      }
+    }
+
+    // Check Codex availability if requested
+    if (mode === 'codex') {
+      const { isCodexAvailable } = await import('../../utils/codex-cli-resolver.js');
+      if (!isCodexAvailable()) {
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          'Codex CLI not found. Install with: npm install -g @openai/codex'
         );
       }
     }
@@ -1156,6 +1297,11 @@ export function registerSessionRoutes(
       } catch (err) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to create case: ${getErrorMessage(err)}`);
       }
+    } else if (mode !== 'opencode') {
+      // COD-91 self-heal for an EXISTING case: refresh a pre-secret hooks block so the
+      // now-unconditional hook-secret gate keeps accepting its hook events. No-op when
+      // the hooks aren't ours or already carry the secret.
+      await refreshStaleHookSecret(casePath).catch(() => {});
     }
 
     // Strip stale disk entries for keys this request is actively setting (Claude only —
@@ -1171,9 +1317,11 @@ export function registerSessionRoutes(
     const qsModel =
       mode === 'opencode'
         ? openCodeConfig?.model
-        : mode !== 'shell'
-          ? qsModelConfig?.defaultModel || undefined
-          : undefined;
+        : mode === 'codex'
+          ? codexConfig?.model
+          : mode !== 'shell'
+            ? qsModelConfig?.defaultModel || undefined
+            : undefined;
     const qsClaudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir: casePath,
@@ -1185,7 +1333,9 @@ export function registerSessionRoutes(
       claudeMode: qsClaudeModeConfig.claudeMode,
       allowedTools: qsClaudeModeConfig.allowedTools,
       openCodeConfig: mode === 'opencode' ? openCodeConfig : undefined,
+      codexConfig: mode === 'codex' ? codexConfig : undefined,
       envOverrides,
+      effort,
     });
 
     // Auto-detect completion phrase from CLAUDE.md BEFORE broadcasting
@@ -1259,7 +1409,6 @@ export function registerSessionRoutes(
       }
 
       return {
-        success: true,
         sessionId: session.id,
         casePath,
         caseName,
@@ -1721,6 +1870,6 @@ export function registerSessionRoutes(
       await fh.close();
     }
 
-    return { success: true, path: filepath, filename };
+    return { path: filepath, filename };
   });
 }

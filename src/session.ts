@@ -42,9 +42,12 @@ import {
   NiceConfig,
   DEFAULT_NICE_CONFIG,
   getErrorMessage,
+  isEffortLevel,
   type ClaudeMode,
   type SessionMode,
   type OpenCodeConfig,
+  type CodexConfig,
+  type EffortLevel,
 } from './types.js';
 import type { TerminalMultiplexer, MuxSession } from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
@@ -75,10 +78,19 @@ import {
   buildShellEnv,
 } from './session-cli-builder.js';
 import { SessionAutoOps } from './session-auto-ops.js';
+import { detectUsageLimitPause } from './usage-limit-patterns.js';
 import { SessionTaskCache } from './session-task-cache.js';
+import { parseAttachmentMagicLinks } from './attachment-magic.js';
+import {
+  sanitizeAttachmentHistory,
+  upsertAttachmentHistory as upsertAttachmentHistoryList,
+} from './session-attachment-history.js';
+import type { SessionAttachmentHistoryItem } from './types/session.js';
 
 export type { BackgroundTask } from './task-tracker.js';
 export type { RalphTrackerState, RalphTodoItem, ActiveBashTool } from './types.js';
+
+export type ResizeViewportType = 'mobile' | 'tablet' | 'desktop';
 
 /** Line buffer flush interval (100ms) - forces processing of partial lines */
 const LINE_BUFFER_FLUSH_INTERVAL = 100;
@@ -118,6 +130,26 @@ const LEADING_ANSI_WHITESPACE_PATTERN = /^(\x1b\[\??[\d;]*[A-Za-z]|[\s\r\n])+/;
 const CTRL_L_PATTERN = /\x0c/g;
 /** Pattern to split by newlines (CR or LF) */
 const NEWLINE_SPLIT_PATTERN = /\r?\n/;
+
+/** True for external-CLI run modes (non-Claude) that use their own TUI and output format. */
+export function isExternalCliMode(mode: SessionMode): boolean {
+  return mode === 'opencode' || mode === 'codex';
+}
+
+/**
+ * Modes whose TUI emits alt-screen / scrollback-erase / mouse-tracking sequences
+ * that we strip so the browser keeps everything in the main buffer with scrollback
+ * reachable (the strip runs on both the live stream and the buffer replay).
+ *
+ * Codex and Claude Code are known, controlled TUIs that repaint via cursor
+ * positioning, so dropping the alt-screen switch is safe — content stays in the
+ * normal buffer. Excluded: `shell` (arbitrary programs like vim/less/htop
+ * legitimately need the alt screen) and `opencode` (renders its own TUI that
+ * may rely on it). Keep parity with the replay-side strip in session-routes.ts.
+ */
+export function isAltScreenStripMode(mode: SessionMode): boolean {
+  return mode === 'codex' || mode === 'claude';
+}
 
 // Note: Claude CLI PATH resolution moved to session-cli-builder.ts (buildClaudeEnv)
 
@@ -248,6 +280,10 @@ export class Session extends EventEmitter {
   private _messages: ClaudeMessage[] = [];
   private _lineBuffer: string = '';
   private _lineBufferFlushTimer: NodeJS.Timeout | null = null;
+  // Alt-screen-strip modes (Codex/Claude): trailing partial CSI held back so
+  // sequences split across PTY chunks can't slip past the alt-screen/scrollback
+  // strip (see _handleTerminalOutput / isAltScreenStripMode)
+  private _altScreenSeqCarry: string = '';
   private resolvePromise: ((value: { result: string; cost: number }) => void) | null = null;
   private rejectPromise: ((reason: Error) => void) | null = null;
   private _promptResolved: boolean = false; // Guard against race conditions in runPrompt
@@ -297,6 +333,10 @@ export class Session extends EventEmitter {
   private _parentAgentId: string | null = null;
   private _childAgentIds: string[] = [];
 
+  // Bounded dedup set for terminal attachment magic-links already requested.
+  private _attachmentMagicSeen = new Set<string>();
+  private _attachmentHistory: SessionAttachmentHistoryItem[] = [];
+
   // Nice prioritying configuration
   private _niceConfig: NiceConfig = { ...DEFAULT_NICE_CONFIG };
 
@@ -309,11 +349,18 @@ export class Session extends EventEmitter {
 
   // OpenCode configuration (only for mode === 'opencode')
   private _openCodeConfig: OpenCodeConfig | undefined;
+  // Codex configuration (only for mode === 'codex')
+  private _codexConfig: CodexConfig | undefined;
   private _resumeSessionId: string | undefined;
 
-  // Ephemeral env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL). Exported by tmux at spawn,
-  // preserved across respawns via persisted state. Not written to .claude/settings.local.json.
+  // Ephemeral env overrides (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Exported by tmux
+  // at spawn, preserved across respawns via persisted state. Not written to .claude/settings.local.json.
   private _envOverrides: Record<string, string> | undefined;
+
+  // Claude CLI effort level — injected as a `--settings` soft default at spawn so the
+  // user can still switch in-session via /effort (incl. ultracode). Never carried as
+  // the CLAUDE_CODE_EFFORT_LEVEL env var, which would hard-lock the session.
+  private _effort: EffortLevel | undefined;
 
   // Session color for visual differentiation
   private _color: import('./types.js').SessionColor = 'default';
@@ -372,10 +419,16 @@ export class Session extends EventEmitter {
       allowedTools?: string;
       /** OpenCode configuration (only for mode === 'opencode') */
       openCodeConfig?: OpenCodeConfig;
+      /** Codex configuration (only for mode === 'codex') */
+      codexConfig?: CodexConfig;
       /** Resume a previous Claude conversation (used after server reboot) */
       resumeSessionId?: string;
       /** Extra env vars exported to the CLI at spawn time (no disk persistence) */
       envOverrides?: Record<string, string>;
+      /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
+      effort?: EffortLevel;
+      /** Restored per-session attachment history. May include server-private external paths. */
+      attachmentHistory?: SessionAttachmentHistoryItem[];
     }
   ) {
     super();
@@ -423,9 +476,27 @@ export class Session extends EventEmitter {
       this._openCodeConfig = config.openCodeConfig;
     }
 
-    // Apply env overrides (exported at spawn, not persisted to disk)
+    // Apply Codex configuration
+    if (config.codexConfig) {
+      this._codexConfig = config.codexConfig;
+    }
+
+    // Apply env overrides (exported at spawn, not persisted to disk).
+    // Legacy migration: pre-0.7.2 carried effort as the CLAUDE_CODE_EFFORT_LEVEL env var,
+    // which hard-locks /effort switching. Extract it into _effort (--settings soft default)
+    // and never export it as an env var again. Explicit config.effort wins over legacy.
     if (config.envOverrides && Object.keys(config.envOverrides).length > 0) {
-      this._envOverrides = { ...config.envOverrides };
+      const { CLAUDE_CODE_EFFORT_LEVEL: legacyEffort, ...restOverrides } = config.envOverrides;
+      this._envOverrides = Object.keys(restOverrides).length > 0 ? restOverrides : undefined;
+      if (legacyEffort && isEffortLevel(legacyEffort)) {
+        this._effort = legacyEffort;
+      }
+    }
+    if (config.effort && isEffortLevel(config.effort)) {
+      this._effort = config.effort;
+    }
+    if (config.attachmentHistory && config.attachmentHistory.length > 0) {
+      this.restoreAttachmentHistory(config.attachmentHistory);
     }
 
     // Initialize task tracker and forward events (store handlers for cleanup)
@@ -484,6 +555,9 @@ export class Session extends EventEmitter {
       this._totalOutputTokens = 0;
       this.emit('autoClear', data);
     });
+    this._autoOps.on('limitPauseScheduled', (data) => this.emit('limitPauseScheduled', data));
+    this._autoOps.on('limitResume', (data) => this.emit('limitResume', data));
+    this._autoOps.on('limitResumeCancelled', (data) => this.emit('limitResumeCancelled', data));
   }
 
   get status(): SessionStatus {
@@ -675,6 +749,11 @@ export class Session extends EventEmitter {
     return this._allowedTools;
   }
 
+  /** Codex CLI configuration for this session. */
+  get codexConfig(): CodexConfig | undefined {
+    return this._codexConfig;
+  }
+
   // Note: _buildPermissionArgs removed — now using buildInteractiveArgs from session-cli-builder.ts
 
   /**
@@ -784,6 +863,39 @@ export class Session extends EventEmitter {
     this._autoOps.setAutoCompact(enabled, threshold, prompt);
   }
 
+  get autoResumeEnabled(): boolean {
+    return this._autoOps.autoResumeEnabled;
+  }
+
+  /** When the scheduled usage-limit auto-resume fires (epoch ms), or null. */
+  get autoResumeAt(): number | null {
+    return this._autoOps.autoResumeAt;
+  }
+
+  /** True while the session is paused on a Claude usage limit (auto-resume armed). */
+  get isLimitPaused(): boolean {
+    return this._autoOps.isLimitPaused;
+  }
+
+  setAutoResume(enabled: boolean): void {
+    this._autoOps.setAutoResume(enabled);
+    // Users typically enable this WHILE a session already sits paused — the
+    // limit footer won't reprint on its own, so scan the recent buffer once.
+    // Only a future reset time counts: stale scrollback must not arm a resume.
+    if (enabled && !isExternalCliMode(this.mode)) {
+      const tail = this._terminalBuffer.value.slice(-8192).replace(ANSI_ESCAPE_PATTERN_FULL, '');
+      const detection = detectUsageLimitPause(tail);
+      if (detection && detection.resetAt > Date.now()) {
+        this._autoOps.processCleanData(tail);
+      }
+    }
+  }
+
+  /** Restore auto-resume state (and a pending schedule) after Codeman restart. */
+  restoreAutoResume(enabled: boolean, resumeAt?: number): void {
+    this._autoOps.restoreAutoResume(enabled, resumeAt);
+  }
+
   get imageWatcherEnabled(): boolean {
     return this._imageWatcherEnabled;
   }
@@ -812,6 +924,30 @@ export class Session extends EventEmitter {
     return this._status === 'idle' || this._status === 'busy';
   }
 
+  get attachmentHistory(): SessionAttachmentHistoryItem[] {
+    return sanitizeAttachmentHistory(this._attachmentHistory);
+  }
+
+  upsertAttachmentHistory(item: SessionAttachmentHistoryItem): void {
+    this._attachmentHistory = upsertAttachmentHistoryList(this._attachmentHistory, item);
+  }
+
+  restoreAttachmentHistory(history: SessionAttachmentHistoryItem[] | undefined): void {
+    this._attachmentHistory = [];
+    for (const item of [...(history ?? [])].reverse()) {
+      // Guard against malformed/legacy on-disk entries (null, non-object, or
+      // missing required fields). historyKey() dereferences source/fileName, so
+      // a bad item would otherwise throw inside the constructor and abort the
+      // entire mux-recovery loop.
+      if (!item || typeof item !== 'object' || !item.source || !item.fileName) continue;
+      this.upsertAttachmentHistory(item);
+    }
+  }
+
+  getAttachmentHistoryForPersist(): SessionAttachmentHistoryItem[] | undefined {
+    return this._attachmentHistory.length > 0 ? this._attachmentHistory.map((item) => ({ ...item })) : undefined;
+  }
+
   toState(): SessionState {
     return {
       id: this.id,
@@ -828,6 +964,8 @@ export class Session extends EventEmitter {
       autoCompactEnabled: this._autoOps.autoCompactEnabled,
       autoCompactThreshold: this._autoOps.autoCompactThreshold,
       autoCompactPrompt: this._autoOps.autoCompactPrompt,
+      autoResumeEnabled: this._autoOps.autoResumeEnabled,
+      autoResumeAt: this._autoOps.autoResumeAt ?? undefined,
       imageWatcherEnabled: this._imageWatcherEnabled,
       totalCost: this._totalCost,
       inputTokens: this._totalInputTokens,
@@ -846,7 +984,10 @@ export class Session extends EventEmitter {
       cliAccountType: this._cliAccountType || undefined,
       cliLatestVersion: this._cliLatestVersion || undefined,
       openCodeConfig: this._openCodeConfig,
+      codexConfig: this._codexConfig,
       resumeSessionId: this._resumeSessionId,
+      effort: this._effort,
+      attachmentHistory: this.attachmentHistory.length > 0 ? this.attachmentHistory : undefined,
       // envOverrides intentionally NOT on the public SessionState type — they must not
       // leak into SSE / GET /api/sessions broadcasts (schema allows OPENCODE_*, which
       // can carry secrets). For disk persistence, session-manager calls
@@ -984,7 +1125,12 @@ export class Session extends EventEmitter {
     }
 
     // Attach to the mux session via PTY
-    // Query existing tmux window size so re-attach matches (avoids flicker from 120x40 default)
+    // Prevent tmux from letting the newest browser attach dictate global window
+    // size; accepted Codeman resize events update it explicitly below.
+    mux.setManualWindowSize?.(this._muxSession!.muxName);
+    // Query existing tmux window size so re-attach matches (avoids flicker from 120x40 default).
+    // MUST go through the dedicated socket (mux.muxSocket); a bare `tmux display` hits the
+    // default server, always fails for our socketed sessions, and silently falls back to 120x40.
     const { cols: ptyCols, rows: ptyRows } = queryTmuxWindowSize(this._muxSession!.muxName, mux.muxSocket);
     try {
       this.ptyProcess = pty.spawn(mux.getAttachCommand(), mux.getAttachArgs(this._muxSession!.muxName), {
@@ -1004,6 +1150,66 @@ export class Session extends EventEmitter {
   }
 
   private _handleTerminalOutput(data: string): void {
+    // Codex AND Claude Code emit sequences that wipe xterm.js scrollback, plus
+    // mouse-tracking enables that hijack the scroll wheel so the user can't reach
+    // scrollback. Claude Code does this intermittently (e.g. full-screen pickers /
+    // dialogs), which is why terminal scroll-up "randomly" breaks for Claude
+    // sessions on mobile and desktop until the dialog closes:
+    //   - \x1b[?1049h / \x1b[?47h / \x1b[?1047h: switch to the alt buffer (no
+    //     scrollback) — \x1b[?...l switches back.
+    //   - \x1b[3J: erase saved lines (scrollback). (\x1b[2J / \x1b[J — erase
+    //     the visible viewport — are left intact; the TUI repaints those rows.)
+    //   - \x1b[?1000h / 1002h / 1003h / 1005h / 1006h / 1007h: mouse-tracking
+    //     modes (X10, button-event, any-event, UTF-8, SGR, alt-scroll). Once on,
+    //     xterm.js forwards wheel events to the CLI instead of scrolling the
+    //     viewport, so the conversation is in scrollback but unreachable.
+    //     (Focus events at ?1004 are left alone — codeman uses them for
+    //     active-tab detection.)
+    // Strip them at the source so neither the persisted buffer nor the live
+    // SSE/WS stream carries them, keeping everything in the main buffer with
+    // scrollback intact. These are controlled TUIs whose cursor-positioned
+    // redraws overwrite only the cells they target, so non-erased rows keep
+    // their content. Gated to Codex/Claude (isAltScreenStripMode) — shell must
+    // keep the alt screen for vim/less/htop.
+    if (isAltScreenStripMode(this.mode)) {
+      // Reassemble sequences split across PTY chunk boundaries first: a chunk
+      // ending mid-sequence ('\x1b[?104' now, '9h' next) would slip past the
+      // strip below and leave xterm stuck in the scrollback-less alt buffer
+      // until the next buffer replay. Hold back an incomplete digit-only CSI
+      // tail (≤7 chars — the longest strippable intro is '\x1b[?1049') and
+      // prepend it to the next chunk; complete sequences are never held.
+      data = this._altScreenSeqCarry + data;
+      this._altScreenSeqCarry = '';
+      // eslint-disable-next-line no-control-regex
+      const splitTail = data.match(/\x1b(?:\[\??[0-9]{0,4})?$/);
+      if (splitTail) {
+        this._altScreenSeqCarry = splitTail[0];
+        data = data.slice(0, -splitTail[0].length);
+        if (!data) return;
+      }
+      data = data
+        // eslint-disable-next-line no-control-regex
+        .replace(/\x1b\[\?(?:47|1047|1049)[hl]/g, '')
+        // eslint-disable-next-line no-control-regex
+        .replace(/\x1b\[3J/g, '')
+        // eslint-disable-next-line no-control-regex
+        .replace(/\x1b\[\?(?:1000|1001|1002|1003|1005|1006|1007)[hl]/g, '');
+    }
+
+    // Scan terminal output for `codeman://attach?path=...` magic links and emit
+    // an attachmentRequested event for each newly-seen absolute path. The web
+    // server turns these into registered attachment cards.
+    const attachmentPaths = parseAttachmentMagicLinks(data);
+    for (const attachmentPath of attachmentPaths) {
+      if (this._attachmentMagicSeen.has(attachmentPath)) continue;
+      this._attachmentMagicSeen.add(attachmentPath);
+      if (this._attachmentMagicSeen.size > 200) {
+        const oldest = this._attachmentMagicSeen.values().next().value;
+        if (oldest) this._attachmentMagicSeen.delete(oldest);
+      }
+      this.emit('attachmentRequested', { sessionId: this.id, path: attachmentPath, timestamp: Date.now() });
+    }
+
     // BufferAccumulator handles auto-trimming when max size exceeded
     this._terminalBuffer.append(data);
     this._lastActivityAt = Date.now();
@@ -1018,7 +1224,7 @@ export class Session extends EventEmitter {
 
     this._resetBuffers();
 
-    const modeLabel = this.mode === 'opencode' ? 'OpenCode' : 'Claude';
+    const modeLabel = this.mode === 'opencode' ? 'OpenCode' : this.mode === 'codex' ? 'Codex' : 'Claude';
     console.log(
       `[Session] Starting interactive ${modeLabel} session` + (this._useMux ? ` (with ${this._mux!.backend})` : '')
     );
@@ -1036,8 +1242,10 @@ export class Session extends EventEmitter {
             claudeMode: this._claudeMode,
             allowedTools: this._allowedTools,
             openCodeConfig: this._openCodeConfig,
+            codexConfig: this._codexConfig,
             resumeSessionId: this._resumeSessionId,
             envOverrides: this._envOverrides,
+            effort: this._effort,
           },
           createSessionOptions: {
             sessionId: this.id,
@@ -1049,8 +1257,10 @@ export class Session extends EventEmitter {
             claudeMode: this._claudeMode,
             allowedTools: this._allowedTools,
             openCodeConfig: this._openCodeConfig,
+            codexConfig: this._codexConfig,
             resumeSessionId: this._resumeSessionId,
             envOverrides: this._envOverrides,
+            effort: this._effort,
           },
           spawnErrLabel: 'mux attachment',
         });
@@ -1061,8 +1271,8 @@ export class Session extends EventEmitter {
         // For NEW mux sessions: wait for readiness then clean buffer
         // For RESTORED mux sessions: don't do anything - client will fetch buffer on tab switch
         if (!isRestored) {
-          if (this.mode === 'opencode') {
-            // OpenCode uses Bubble Tea TUI — no ❯ prompt to detect.
+          if (isExternalCliMode(this.mode)) {
+            // External CLIs use custom TUIs — no ❯ prompt to detect.
             // Wait for TUI to stabilize (output stops changing), then mark ready.
             // Don't clear the buffer — the TUI's initial render IS the useful content.
             // Emit needsRefresh so the client fetches the full buffer once the TUI has rendered.
@@ -1117,10 +1327,14 @@ export class Session extends EventEmitter {
       if (this.mode === 'opencode') {
         throw new Error('OpenCode sessions require tmux. Direct PTY fallback is not supported.');
       }
+      // Codex sessions require tmux for OPENAI_API_KEY injection via setenv
+      if (this.mode === 'codex') {
+        throw new Error('Codex sessions require tmux. Direct PTY fallback is not supported.');
+      }
       try {
         // Pass --session-id to use the SAME ID as the Codeman session
         // This ensures subagents can be directly matched to the correct tab
-        const args = buildInteractiveArgs(this.id, this._claudeMode, this._model, this._allowedTools);
+        const args = buildInteractiveArgs(this.id, this._claudeMode, this._model, this._allowedTools, this._effort);
         this.ptyProcess = pty.spawn('claude', args, {
           name: 'xterm-256color',
           cols: 120,
@@ -1194,6 +1408,7 @@ export class Session extends EventEmitter {
           this._isWorking = true;
           this._status = 'busy';
           this.emit('working');
+          this._autoOps.notifyWorking();
         }
         this._awaitingIdleConfirmation = false;
         if (this.activityTimeout) clearTimeout(this.activityTimeout);
@@ -1276,9 +1491,9 @@ export class Session extends EventEmitter {
    * PTY data chunk. Receives accumulated raw data to process in one batch.
    */
   private _processExpensiveParsers(rawData: string): void {
-    // Skip Claude-specific parsers for OpenCode sessions — Ralph tracker, BashToolParser,
-    // token parsing, and CLI info parsing all depend on Claude's output format.
-    if (this.mode === 'opencode') return;
+    // Skip Claude-specific parsers for external CLI sessions (Ralph tracker,
+    // BashToolParser, token + CLI-info parsing all depend on Claude's output format).
+    if (isExternalCliMode(this.mode)) return;
 
     // Lazy ANSI strip: only compute cleanData when a consumer actually needs it.
     let _cleanData: string | null = null;
@@ -1298,6 +1513,11 @@ export class Session extends EventEmitter {
     // Forward to Bash tool parser to detect file-viewing commands
     if (this._bashToolParser.enabled) {
       this._bashToolParser.processCleanData(getCleanData());
+    }
+
+    // Usage-limit pause detection (auto-resume on usage limit)
+    if (this._autoOps.autoResumeEnabled) {
+      this._autoOps.processCleanData(getCleanData());
     }
 
     // Parse token count from status line (e.g., "123.4k tokens" or "5234 tokens")
@@ -1328,6 +1548,7 @@ export class Session extends EventEmitter {
         this._isWorking = true;
         this._status = 'busy';
         this.emit('working');
+        this._autoOps.notifyWorking();
         this._awaitingIdleConfirmation = false;
         if (this.activityTimeout) clearTimeout(this.activityTimeout);
       }
@@ -1609,6 +1830,7 @@ export class Session extends EventEmitter {
     this._errorBuffer = '';
     this._messages = [];
     this._lineBuffer = '';
+    this._altScreenSeqCarry = '';
     this._lastActivityAt = Date.now();
   }
 
@@ -1992,6 +2214,42 @@ export class Session extends EventEmitter {
   }
 
   /**
+   * Per-client highest-applied input sequence, for exactly-once input delivery.
+   * Keyed by the web client's stable `clientId`. Bounded so many devices over a
+   * long-lived session can't grow it without limit (insertion order = MRU, so
+   * eviction drops the least-recently-active client).
+   */
+  private _appliedInputSeq = new Map<string, number>();
+  private static readonly MAX_INPUT_DEDUP_CLIENTS = 256;
+
+  /**
+   * Decide whether an input frame should be applied to the PTY or skipped as a
+   * duplicate redelivery. Returns true exactly once per (clientId, seq): the
+   * first time a seq strictly greater than the client's last-applied is seen.
+   * A redelivery of an already-applied seq (the client never got our ACK and
+   * resent) returns false. Callers should ACK regardless — a duplicate is, from
+   * the client's view, "delivered" — and only `write()` the PTY when this is
+   * true. Relies on the client delivering one client's frames in seq order over
+   * a single ordered stream, so `seq <= last` ⇒ already applied.
+   *
+   * Without this, the client's at-least-once redelivery (needed because a
+   * half-open socket silently drops frames with no error) would type a prompt
+   * twice whenever an ACK is lost after the write landed.
+   */
+  shouldApplyInput(clientId: string, seq: number): boolean {
+    const last = this._appliedInputSeq.get(clientId);
+    if (last !== undefined && seq <= last) return false;
+    // Re-insert to move this client to the MRU end for fair eviction.
+    if (last !== undefined) this._appliedInputSeq.delete(clientId);
+    this._appliedInputSeq.set(clientId, seq);
+    if (this._appliedInputSeq.size > Session.MAX_INPUT_DEDUP_CLIENTS) {
+      const oldest = this._appliedInputSeq.keys().next().value;
+      if (oldest !== undefined) this._appliedInputSeq.delete(oldest);
+    }
+    return true;
+  }
+
+  /**
    * Sends input via the terminal multiplexer's direct input mechanism.
    *
    * More reliable than direct PTY write for programmatic input, especially
@@ -2024,17 +2282,101 @@ export class Session extends EventEmitter {
   private _ptyRows = 40;
 
   /**
+   * Live WebSocket connections that have announced a desktop viewport for this
+   * session. While at least one is registered, small-viewport (mobile/tablet)
+   * resizes are ignored so a phone glancing at the session can't reflow the
+   * PTY under an active desktop view. Claims are connection-scoped: ws-routes
+   * registers them on a desktop-typed resize and releases them on socket
+   * close, so a mobile-only session (no desktop connected) keeps full control
+   * of its own size — including narrowing below the spawn default.
+   *
+   * Deliberate tradeoff: claims are WS-only because only a socket has a
+   * liveness signal. A desktop degraded to the stateless HTTP resize fallback
+   * still applies its typed resizes but holds no claim, so a concurrent phone
+   * can reflow it. This is cooperative UX arbitration, not a security
+   * boundary — untyped (legacy/API) resizes bypass claims by design.
+   */
+  private _desktopSizeClaims = new Set<symbol>();
+
+  /**
+   * A desktop sizing claim only blocks small-viewport resizes while the
+   * desktop is RECENTLY ACTIVE (claim registration or typed input within this
+   * window). An abandoned-but-connected desktop tab (left open at home, screen
+   * locked) must not hold a phone's view hostage: without this, the phone
+   * renders a desktop-width stream in a narrow xterm — mid-word wraps, tmux
+   * dot-fill, and Ink overdraw soup (the 0.9.8–0.9.12 mobile regression).
+   */
+  private static readonly DESKTOP_CLAIM_IDLE_MS = 90_000;
+
+  /** Last evidence of a live desktop user (claim registered / typed input). */
+  private _lastDesktopActivityAt = 0;
+
+  /** Last desktop-typed dimensions, for re-asserting after a mobile override. */
+  private _lastDesktopDims: { cols: number; rows: number } | null = null;
+
+  /** True while a small viewport reflowed the pane past an idle desktop claim. */
+  private _mobileSizeOverride = false;
+
+  /** Register a live desktop sizing claim (see _desktopSizeClaims). */
+  claimDesktopSizing(token: symbol): void {
+    this._desktopSizeClaims.add(token);
+    this._lastDesktopActivityAt = Date.now();
+  }
+
+  /** Release a desktop sizing claim when its connection goes away. */
+  releaseDesktopSizing(token: symbol): void {
+    this._desktopSizeClaims.delete(token);
+  }
+
+  /**
+   * Record desktop user activity (typed input over a claim-holding socket).
+   * If a phone reflowed the pane while the desktop was idle, the desktop
+   * layout is restored — "whoever is actively using the session wins".
+   */
+  noteDesktopActivity(): void {
+    this._lastDesktopActivityAt = Date.now();
+    if (this._mobileSizeOverride && this._lastDesktopDims) {
+      this._mobileSizeOverride = false;
+      this.resize(this._lastDesktopDims.cols, this._lastDesktopDims.rows, { viewportType: 'desktop' });
+    }
+  }
+
+  /**
    * Resizes the PTY terminal dimensions.
    * Skips the resize if dimensions haven't changed to avoid triggering
    * unnecessary Ink full-screen redraws (visible flicker on tab switch).
    *
+   * Arbitration: while a desktop connection holds a sizing claim AND has been
+   * active within DESKTOP_CLAIM_IDLE_MS, resizes from small viewports
+   * (mobile/tablet) are ignored — shrink AND grow would both reflow the
+   * desktop view. Once the desktop goes idle, a phone may take the pane (the
+   * desktop re-asserts its size on its next typed input via
+   * noteDesktopActivity). Without a desktop connected, small viewports
+   * control the PTY size freely.
+   *
    * @param cols - Number of columns (width in characters)
    * @param rows - Number of rows (height in lines)
    */
-  resize(cols: number, rows: number): void {
-    if (this.ptyProcess && (cols !== this._ptyCols || rows !== this._ptyRows)) {
+  resize(cols: number, rows: number, options: { viewportType?: ResizeViewportType; force?: boolean } = {}): void {
+    const isSmallViewport = options.viewportType === 'mobile' || options.viewportType === 'tablet';
+    if (options.viewportType === 'desktop') {
+      this._lastDesktopDims = { cols, rows };
+      this._lastDesktopActivityAt = Date.now();
+      this._mobileSizeOverride = false;
+    }
+    if (isSmallViewport && this._desktopSizeClaims.size > 0) {
+      if (Date.now() - this._lastDesktopActivityAt < Session.DESKTOP_CLAIM_IDLE_MS) {
+        return;
+      }
+      this._mobileSizeOverride = true;
+    }
+    const dimsChanged = cols !== this._ptyCols || rows !== this._ptyRows;
+    if (this.ptyProcess && (dimsChanged || options.force)) {
       this._ptyCols = cols;
       this._ptyRows = rows;
+      if (this._mux && this._muxSession) {
+        this._mux.resizeWindow?.(this._muxSession.muxName, cols, rows);
+      }
       this.ptyProcess.resize(cols, rows);
     }
   }
@@ -2125,6 +2467,12 @@ export class Session extends EventEmitter {
     this._isStopped = true;
 
     this._clearAllTimers();
+
+    // Drop desktop sizing claims defensively. Sockets normally release their
+    // own claim on close, but a hung client's close event can lag the session
+    // teardown by up to a ping cycle — don't let a stale claim suppress
+    // mobile resizes if this Session object sees any further use.
+    this._desktopSizeClaims.clear();
 
     // Immediately cleanup Promise callbacks to prevent orphaned references
     // during the rest of stop() processing (e.g., if mux kill times out)

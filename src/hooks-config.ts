@@ -3,8 +3,9 @@
  *
  * Generates `.claude/settings.local.json` with hook definitions that POST
  * to Codeman's `/api/hook-event` endpoint when Claude Code fires hooks.
- * Uses `$CODEMAN_API_URL` and `$CODEMAN_SESSION_ID` env vars (set on every
- * managed session) so the config is static per case directory.
+ * Uses `$CODEMAN_API_URL`, `$CODEMAN_SESSION_ID`, and `$CODEMAN_HOOK_SECRET_FILE`
+ * env vars (set on every managed session) so the config is static per case
+ * directory and free of secret values.
  *
  * Key exports:
  * - `generateHooksConfig()` — returns hooks object for settings.local.json
@@ -31,6 +32,30 @@ import type { HookEventType } from './types.js';
 import { HOOK_TIMEOUT_MS } from './config/auth-config.js';
 
 /**
+ * Serializes read-modify-write access to a `settings.local.json` path. Every
+ * writer in this module (hooks, env, model, statusLine) shares this map, so
+ * concurrent updates to the SAME file — e.g. session-create writing hooks/model
+ * while an App-Settings toggle injects the statusLine into the same repo — can't
+ * lose each other's changes through interleaved read-then-write. Per-path chains
+ * are independent; the map self-prunes when a path's chain goes idle.
+ */
+const settingsWriteLocks = new Map<string, Promise<unknown>>();
+function withSettingsLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const prev = settingsWriteLocks.get(path) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run after the prior writer, regardless of its outcome
+  // Tail never rejects, so a failed write doesn't poison subsequent writers.
+  const tail = run.then(
+    () => {},
+    () => {}
+  );
+  settingsWriteLocks.set(path, tail);
+  void tail.then(() => {
+    if (settingsWriteLocks.get(path) === tail) settingsWriteLocks.delete(path);
+  });
+  return run;
+}
+
+/**
  * Generates the hooks section for .claude/settings.local.json
  *
  * The hook commands read stdin JSON from Claude Code (contains tool_name,
@@ -41,11 +66,18 @@ import { HOOK_TIMEOUT_MS } from './config/auth-config.js';
 export function generateHooksConfig(): { hooks: Record<string, unknown[]> } {
   // Read Claude Code's stdin JSON and forward it as the data field.
   // Falls back to empty object if stdin is unavailable or malformed.
+  // COD-54: present the per-instance hook secret so the bypass keeps working while
+  // a tunnel is running. The value is read from the secret file AT EXECUTION TIME
+  // (path via $CODEMAN_HOOK_SECRET_FILE, set in every managed session's env), so it
+  // never lands in this config and rotation needs no respawn. If the var/file is
+  // missing the header is empty — the middleware then allows the request only on
+  // the plain loopback bypass (tunnel down), same as pre-secret behavior.
   const curlCmd = (event: HookEventType) =>
     `HOOK_DATA=$(cat 2>/dev/null || echo '{}'); ` +
     `printf '{"event":"${event}","sessionId":"%s","data":%s}' "$CODEMAN_SESSION_ID" "$HOOK_DATA" | ` +
     `curl -s -X POST "$CODEMAN_API_URL/api/hook-event" ` +
     `-H 'Content-Type: application/json' ` +
+    `-H "X-Codeman-Hook-Secret: $(cat "$CODEMAN_HOOK_SECRET_FILE" 2>/dev/null)" ` +
     `--data @- ` +
     `2>/dev/null || true`;
 
@@ -95,29 +127,31 @@ export async function stripCaseEnvKeys(casePath: string, keysToRemove: readonly 
   if (keysToRemove.length === 0) return;
 
   const settingsPath = join(casePath, '.claude', 'settings.local.json');
-  if (!existsSync(settingsPath)) return;
+  await withSettingsLock(settingsPath, async () => {
+    if (!existsSync(settingsPath)) return;
 
-  let existing: Record<string, unknown>;
-  try {
-    existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
-  } catch {
-    return; // Malformed — don't rewrite it
-  }
-
-  const env = existing.env as Record<string, string> | undefined;
-  if (!env) return;
-
-  let changed = false;
-  for (const key of keysToRemove) {
-    if (key in env) {
-      delete env[key];
-      changed = true;
+    let existing: Record<string, unknown>;
+    try {
+      existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    } catch {
+      return; // Malformed — don't rewrite it
     }
-  }
-  if (!changed) return;
 
-  existing.env = env;
-  await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+    const env = existing.env as Record<string, string> | undefined;
+    if (!env) return;
+
+    let changed = false;
+    for (const key of keysToRemove) {
+      if (key in env) {
+        delete env[key];
+        changed = true;
+      }
+    }
+    if (!changed) return;
+
+    existing.env = env;
+    await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+  });
 }
 
 /**
@@ -126,30 +160,31 @@ export async function stripCaseEnvKeys(casePath: string, keysToRemove: readonly 
  */
 export async function updateCaseEnvVars(casePath: string, envVars: Record<string, string>): Promise<void> {
   const claudeDir = join(casePath, '.claude');
-  if (!existsSync(claudeDir)) {
-    await mkdir(claudeDir, { recursive: true });
-  }
-
   const settingsPath = join(claudeDir, 'settings.local.json');
-  let existing: Record<string, unknown> = {};
-
-  try {
-    existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
-  } catch {
-    existing = {};
-  }
-
-  const currentEnv = (existing.env as Record<string, string>) || {};
-  for (const [key, value] of Object.entries(envVars)) {
-    if (value) {
-      currentEnv[key] = value;
-    } else {
-      delete currentEnv[key];
+  await withSettingsLock(settingsPath, async () => {
+    if (!existsSync(claudeDir)) {
+      await mkdir(claudeDir, { recursive: true });
     }
-  }
-  existing.env = currentEnv;
 
-  await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    } catch {
+      existing = {};
+    }
+
+    const currentEnv = (existing.env as Record<string, string>) || {};
+    for (const [key, value] of Object.entries(envVars)) {
+      if (value) {
+        currentEnv[key] = value;
+      } else {
+        delete currentEnv[key];
+      }
+    }
+    existing.env = currentEnv;
+
+    await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+  });
 }
 
 /**
@@ -158,26 +193,27 @@ export async function updateCaseEnvVars(casePath: string, envVars: Record<string
  */
 export async function updateCaseModel(casePath: string, model: string | null): Promise<void> {
   const claudeDir = join(casePath, '.claude');
-  if (!existsSync(claudeDir)) {
-    await mkdir(claudeDir, { recursive: true });
-  }
-
   const settingsPath = join(claudeDir, 'settings.local.json');
-  let existing: Record<string, unknown> = {};
+  await withSettingsLock(settingsPath, async () => {
+    if (!existsSync(claudeDir)) {
+      await mkdir(claudeDir, { recursive: true });
+    }
 
-  try {
-    existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
-  } catch {
-    existing = {};
-  }
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    } catch {
+      existing = {};
+    }
 
-  if (model) {
-    existing.model = model;
-  } else {
-    delete existing.model;
-  }
+    if (model) {
+      existing.model = model;
+    } else {
+      delete existing.model;
+    }
 
-  await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+    await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+  });
 }
 
 /**
@@ -186,22 +222,125 @@ export async function updateCaseModel(casePath: string, model: string | null): P
  */
 export async function writeHooksConfig(casePath: string): Promise<void> {
   const claudeDir = join(casePath, '.claude');
-  if (!existsSync(claudeDir)) {
-    await mkdir(claudeDir, { recursive: true });
-  }
-
   const settingsPath = join(claudeDir, 'settings.local.json');
-  let existing: Record<string, unknown> = {};
+  await withSettingsLock(settingsPath, async () => {
+    if (!existsSync(claudeDir)) {
+      await mkdir(claudeDir, { recursive: true });
+    }
 
-  try {
-    existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
-  } catch {
-    // If file is malformed or doesn't exist, start fresh
-    existing = {};
-  }
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    } catch {
+      // If file is malformed or doesn't exist, start fresh
+      existing = {};
+    }
 
-  const hooksConfig = generateHooksConfig();
-  const merged = { ...existing, ...hooksConfig };
+    const hooksConfig = generateHooksConfig();
+    const merged = { ...existing, ...hooksConfig };
 
-  await writeFile(settingsPath, JSON.stringify(merged, null, 2) + '\n');
+    await writeFile(settingsPath, JSON.stringify(merged, null, 2) + '\n');
+  });
+}
+
+/**
+ * Self-heal a case's hooks block so the COD-91 unconditional hook-secret gate keeps
+ * accepting its hook events.
+ *
+ * `writeHooksConfig` only runs when a case is first CREATED. Cases created before the
+ * X-Codeman-Hook-Secret header was added (COD-54, 2026-06-10) keep hook curls in their
+ * settings.local.json that POST to /api/hook-event WITHOUT the secret — which, once the
+ * gate requires it unconditionally (COD-91), silently 401 on a password-protected
+ * install. This refreshes the hooks block so those stale curls regain the header.
+ *
+ * Deliberately surgical: regenerates ONLY when settings.local.json already contains
+ * Codeman's own hook curls (they target `/api/hook-event`) that lack the secret header.
+ * No-op when the file/hooks are absent (we never impose hooks on a user who removed
+ * them), when the hooks aren't ours, or when the secret is already present — so it never
+ * clobbers a user's customizations and is cheap enough to call on every Claude spawn.
+ */
+export async function refreshStaleHookSecret(casePath: string): Promise<void> {
+  const settingsPath = join(casePath, '.claude', 'settings.local.json');
+  if (!existsSync(settingsPath)) return;
+  await withSettingsLock(settingsPath, async () => {
+    let existing: Record<string, unknown>;
+    try {
+      existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+    } catch {
+      return; // malformed — leave it untouched (case-create owns the happy path)
+    }
+    const hooksJson = JSON.stringify(existing.hooks ?? null);
+    const isOurs = hooksJson.includes('/api/hook-event');
+    // The generated curl carries this header literal (see generateHooksConfig); its
+    // absence on our own hooks means they predate COD-54 and need regenerating.
+    const hasSecret = hooksJson.includes('X-Codeman-Hook-Secret');
+    if (!isOurs || hasSecret) return;
+    const merged = { ...existing, ...generateHooksConfig() };
+    await writeFile(settingsPath, JSON.stringify(merged, null, 2) + '\n');
+  });
+}
+
+/** Unique marker identifying Codeman's own statusLine command (vs a user's). */
+const STATUSLINE_MARKER = '/api/status-telemetry';
+
+/**
+ * The plan-usage statusLine exporter command. Mirrors the hook `curlCmd` pattern:
+ * reads Claude Code's statusline stdin JSON, POSTs `{sessionId,data}` to Codeman,
+ * and prints the response body (a compact "⟳ 5h 15% · 7d 34%" footer) back to
+ * stdout so the in-terminal statusline stays useful. Env vars resolve at runtime
+ * (present in every managed session via tmux setenv), so the config is static.
+ */
+export function generateStatusLineCommand(): string {
+  // `curl -sk`: CODEMAN_API_URL is loopback HTTPS with a self-signed cert in the
+  // production setup; without -k curl returns 000 and the statusline shows
+  // nothing. -k is safe here (loopback only). Falls back to a brand string so the
+  // footer is never blank if Codeman is unreachable.
+  return (
+    `INPUT=$(cat 2>/dev/null || echo '{}'); ` +
+    `printf '{"sessionId":"%s","data":%s}' "$CODEMAN_SESSION_ID" "$INPUT" | ` +
+    `curl -sk -X POST "$CODEMAN_API_URL${STATUSLINE_MARKER}" ` +
+    `-H 'Content-Type: application/json' ` +
+    `-H "X-Codeman-Hook-Secret: $(cat "$CODEMAN_HOOK_SECRET_FILE" 2>/dev/null)" ` +
+    `--data @- 2>/dev/null || echo codeman`
+  );
+}
+
+/**
+ * Add or remove Codeman's plan-usage statusLine exporter in
+ * `.claude/settings.local.json`. Only ever touches a statusLine that is OURS
+ * (command targets `/api/status-telemetry`), so a user's hand-authored
+ * statusLine is never removed OR overwritten — on both the enable and disable
+ * paths we bail out when an existing statusLine isn't ours. Callers gate on
+ * Claude mode. Merges, preserving all other keys (hooks, env, model).
+ */
+export async function applyStatusLineConfig(casePath: string, enabled: boolean): Promise<void> {
+  const claudeDir = join(casePath, '.claude');
+  const settingsPath = join(claudeDir, 'settings.local.json');
+
+  await withSettingsLock(settingsPath, async () => {
+    let existing: Record<string, unknown> = {};
+    if (existsSync(settingsPath)) {
+      try {
+        existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+      } catch {
+        return; // Malformed — don't rewrite it
+      }
+    }
+
+    const current = existing.statusLine as { command?: unknown } | undefined;
+    const isOurs = !!current && typeof current.command === 'string' && current.command.includes(STATUSLINE_MARKER);
+
+    if (enabled) {
+      const desired = generateStatusLineCommand();
+      if (isOurs && current?.command === desired) return; // already current — skip rewrite
+      if (current && !isOurs) return; // user has their OWN statusLine — never clobber it
+      if (!existsSync(claudeDir)) await mkdir(claudeDir, { recursive: true });
+      existing.statusLine = { type: 'command', command: desired }; // add, or update an out-of-date ours
+    } else {
+      if (!isOurs) return; // nothing of ours to remove (leave a user's own statusLine alone)
+      delete existing.statusLine;
+    }
+
+    await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+  });
 }

@@ -36,13 +36,15 @@ import fastifyMultipart from '@fastify/multipart';
 import { startPasteImageGc } from './paste-image-gc.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, readFileSync, chmodSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, chmodSync, rmSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
-import { homedir, hostname as getHostname } from 'node:os';
+import { hostname as getHostname } from 'node:os';
+import { dataPath } from '../config/instance.js';
+import { getHookSecret } from '../config/hook-secret.js';
 import { EventEmitter } from 'node:events';
-import { Session, type BackgroundTask } from '../session.js';
-import type { ClaudeMode, SessionState } from '../types.js';
+import { Session, isExternalCliMode, type BackgroundTask } from '../session.js';
+import type { ClaudeMode, SessionAttachmentHistoryItem, SessionState, WorkflowRunInfo } from '../types.js';
 import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
@@ -58,6 +60,12 @@ import {
   type SubagentToolResult,
 } from '../subagent-watcher.js';
 import { imageWatcher } from '../image-watcher.js';
+import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
+import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
+import {
+  buildDetectedAttachmentHistoryItem,
+  buildExternalAttachmentHistoryItem,
+} from '../session-attachment-history.js';
 import { TranscriptWatcher } from '../transcript-watcher.js';
 import { TeamWatcher } from '../team-watcher.js';
 import { TunnelManager } from '../tunnel-manager.js';
@@ -84,23 +92,48 @@ import {
   type RespawnWiringDeps,
 } from './respawn-event-wiring.js';
 
+import { reconcileUpdateOnBoot } from './self-update.js';
+
 // Load version from package.json
 const require = createRequire(import.meta.url);
 const { version: APP_VERSION } = require('../../package.json');
+
+/**
+ * `/api/v1/*` is the versioned public alias of the (unversioned) `/api/*` routes.
+ * Rewriting at the server level lets external clients pin to a stable surface while
+ * the bundled frontend keeps using `/api/*`. See docs/api-reference.md.
+ */
+function rewriteApiV1Url(url: string): string {
+  if (url === '/api/v1') return '/api';
+  if (url.startsWith('/api/v1/')) return '/api/' + url.slice('/api/v1/'.length);
+  return url;
+}
 import {
   getErrorMessage,
+  httpStatusForErrorCode,
+  createErrorResponse,
+  ApiErrorCode,
   type PersistedRespawnConfig,
   type NiceConfig,
   type ImageDetectedEvent,
+  type AttachmentDetectedEvent,
   DEFAULT_NICE_CONFIG,
 } from '../types.js';
-import { CleanupManager, KeyedDebouncer, StaleExpirationMap, startEventLoopMonitor } from '../utils/index.js';
+import {
+  CleanupManager,
+  KeyedDebouncer,
+  StaleExpirationMap,
+  startEventLoopMonitor,
+  isSafePushEndpoint,
+} from '../utils/index.js';
 import type { EventLoopMonitorHandle } from '../utils/index.js';
 import { MAX_CONCURRENT_SESSIONS, MAX_SSE_CLIENTS } from '../config/map-limits.js';
 import { SseEvent } from './sse-events.js';
+import { getLatestPlanUsage } from './plan-usage-latest.js';
 import type { ScheduledRun } from './ports/index.js';
-import { registerAuthMiddleware, registerSecurityHeaders } from './middleware/auth.js';
+import { registerAuthMiddleware, registerSecurityHeaders, registerHostGuard } from './middleware/auth.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
+import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
 import {
   registerPushRoutes,
   registerTeamRoutes,
@@ -108,6 +141,7 @@ import {
   registerFileRoutes,
   registerScheduledRoutes,
   registerHookEventRoutes,
+  registerStatusTelemetryRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
   registerSessionRoutes,
@@ -146,7 +180,7 @@ import {
  * Certs are stored in ~/.codeman/certs/ and reused across restarts.
  */
 function getOrCreateSelfSignedCert(): { key: string; cert: string } {
-  const certsDir = join(homedir(), '.codeman', 'certs');
+  const certsDir = dataPath('certs');
   const keyPath = join(certsDir, 'server.key');
   const certPath = join(certsDir, 'server.crt');
 
@@ -190,6 +224,7 @@ export class WebServer extends EventEmitter {
   private sse: SseStreamManager;
   private store = getStore();
   private port: number;
+  private host: string;
   private https: boolean;
   private testMode: boolean;
   private mux: TerminalMultiplexer;
@@ -222,15 +257,26 @@ export class WebServer extends EventEmitter {
   } | null = null;
   private imageWatcherHandlers: {
     detected: (event: ImageDetectedEvent) => void;
+    attachmentDetected: (event: AttachmentDetectedEvent) => void;
     error: (error: Error, sessionId?: string) => void;
+  } | null = null;
+  private workflowRunWatcherHandlers: {
+    discovered: (info: WorkflowRunInfo) => void;
+    updated: (info: WorkflowRunInfo) => void;
+    removed: (data: { runId: string }) => void;
   } | null = null;
   private tunnelManager: TunnelManager = new TunnelManager();
   private authSessions: StaleExpirationMap<string, import('./ports/auth-port.js').AuthSessionRecord> | null = null;
   private authFailures: StaleExpirationMap<string, number> | null = null;
   private qrAuthFailures: StaleExpirationMap<string, number> | null = null;
+  private hookSecretFailures: StaleExpirationMap<string, number> | null = null;
   private pushStore: PushSubscriptionStore = new PushSubscriptionStore();
   private teamWatcher: TeamWatcher = new TeamWatcher();
   private _orchestratorLoop: import('../orchestrator-loop.js').OrchestratorLoop | null = null;
+  private readonly titleHostname: string;
+  private readonly windowTitle: string;
+  private readonly indexHtmlTemplate: string;
+  private readonly allowUnauthenticatedNetwork: boolean;
   private _pasteImageGcStop: (() => void) | null = null;
   private _eventLoopMonitor: EventLoopMonitorHandle | null = null;
   private teamWatcherHandlers: {
@@ -239,24 +285,32 @@ export class WebServer extends EventEmitter {
     teamRemoved: (config: unknown) => void;
     taskUpdated: (data: unknown) => void;
   } | null = null;
-  private readonly titleHostname: string;
-  private readonly windowTitle: string;
-  private readonly indexHtmlTemplate: string;
-  constructor(port: number = 3000, https: boolean = false, testMode: boolean = false, titleHostname?: string) {
+  constructor(
+    port: number = 3000,
+    https: boolean = false,
+    testMode: boolean = false,
+    host: string = '127.0.0.1',
+    titleHostname?: string,
+    allowUnauthenticatedNetwork: boolean = false
+  ) {
     super();
     this.setMaxListeners(0);
+    this.host = host;
     this.port = port;
     this.https = https;
     this.testMode = testMode;
+    this.allowUnauthenticatedNetwork =
+      allowUnauthenticatedNetwork || isExplicitlyEnabled(process.env.CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK);
     this.titleHostname = titleHostname || getHostname();
     this.windowTitle = `codeman:${this.titleHostname}`;
     this.indexHtmlTemplate = readFileSync(join(__dirname, 'public', 'index.html'), 'utf-8');
 
+    const rewriteUrl = (req: { url?: string }): string => rewriteApiV1Url(req.url || '');
     if (https) {
       const { key, cert } = getOrCreateSelfSignedCert();
-      this.app = Fastify({ logger: false, https: { key, cert } });
+      this.app = Fastify({ logger: false, https: { key, cert }, rewriteUrl });
     } else {
-      this.app = Fastify({ logger: false });
+      this.app = Fastify({ logger: false, rewriteUrl });
     }
     this.mux = createMultiplexer();
     this.sse = new SseStreamManager(
@@ -290,6 +344,7 @@ export class WebServer extends EventEmitter {
 
     // Set up subagent watcher listeners
     this.setupSubagentWatcherListeners();
+    this.setupWorkflowRunWatcherListeners();
 
     // Set up image watcher listeners
     this.setupImageWatcherListeners();
@@ -390,6 +445,31 @@ export class WebServer extends EventEmitter {
   }
 
   /**
+   * Bridge WorkflowRunWatcher events → SSE. Broadcasts run SUMMARIES (no agents[])
+   * to keep payloads small; the full agents[] is fetched per-run via
+   * GET /api/workflows/:runId when the user selects a run.
+   */
+  private setupWorkflowRunWatcherListeners(): void {
+    this.workflowRunWatcherHandlers = {
+      discovered: (info: WorkflowRunInfo) => this.broadcast(SseEvent.WorkflowRunDiscovered, summarizeRun(info)),
+      updated: (info: WorkflowRunInfo) => this.broadcast(SseEvent.WorkflowRunUpdated, summarizeRun(info)),
+      removed: (data: { runId: string }) => this.broadcast(SseEvent.WorkflowRunRemoved, data),
+    };
+    workflowRunWatcher.on('run_discovered', this.workflowRunWatcherHandlers.discovered);
+    workflowRunWatcher.on('run_updated', this.workflowRunWatcherHandlers.updated);
+    workflowRunWatcher.on('run_removed', this.workflowRunWatcherHandlers.removed);
+  }
+
+  private cleanupWorkflowRunWatcherListeners(): void {
+    if (this.workflowRunWatcherHandlers) {
+      workflowRunWatcher.off('run_discovered', this.workflowRunWatcherHandlers.discovered);
+      workflowRunWatcher.off('run_updated', this.workflowRunWatcherHandlers.updated);
+      workflowRunWatcher.off('run_removed', this.workflowRunWatcherHandlers.removed);
+      this.workflowRunWatcherHandlers = null;
+    }
+  }
+
+  /**
    * Set up event listeners for image watcher.
    * Broadcasts image detection events to SSE clients for auto-popup.
    */
@@ -397,12 +477,27 @@ export class WebServer extends EventEmitter {
     // Store handlers for cleanup on shutdown
     this.imageWatcherHandlers = {
       detected: (event: ImageDetectedEvent) => this.broadcast(SseEvent.ImageDetected, event),
+      attachmentDetected: (event: AttachmentDetectedEvent) => {
+        const attachmentEvent = {
+          ...event,
+          source: event.source || 'detected',
+          thumbnailUrl:
+            event.thumbnailUrl || buildFileThumbnailRoute(event.sessionId, event.relativePath || event.fileName),
+        };
+        const session = this.sessions.get(event.sessionId);
+        if (session) {
+          session.upsertAttachmentHistory(buildDetectedAttachmentHistoryItem(attachmentEvent));
+          this.persistSessionState(session);
+        }
+        this.broadcast(SseEvent.AttachmentDetected, attachmentEvent);
+      },
       error: (error: Error, sessionId?: string) => {
         console.error(`[ImageWatcher] Error${sessionId ? ` for ${sessionId}` : ''}:`, error.message);
       },
     };
 
     imageWatcher.on('image:detected', this.imageWatcherHandlers.detected);
+    imageWatcher.on('attachment:detected', this.imageWatcherHandlers.attachmentDetected);
     imageWatcher.on('image:error', this.imageWatcherHandlers.error);
   }
 
@@ -412,6 +507,7 @@ export class WebServer extends EventEmitter {
   private cleanupImageWatcherListeners(): void {
     if (this.imageWatcherHandlers) {
       imageWatcher.off('image:detected', this.imageWatcherHandlers.detected);
+      imageWatcher.off('attachment:detected', this.imageWatcherHandlers.attachmentDetected);
       imageWatcher.off('image:error', this.imageWatcherHandlers.error);
       this.imageWatcherHandlers = null;
     }
@@ -515,6 +611,14 @@ export class WebServer extends EventEmitter {
     };
   }
 
+  /**
+   * Current Host/Origin allowlist policy. Read per request so a tunnel started at
+   * runtime (PUT /api/settings) is reflected without a restart.
+   */
+  private getHostPolicy(): HostPolicy {
+    return buildHostPolicy(this.host, this.tunnelManager.getUrl());
+  }
+
   private async setupRoutes(): Promise<void> {
     // multipart/form-data: parser is provided by @fastify/multipart (registered
     // below). Its parser is a no-op marker that leaves the body on req.raw, so
@@ -531,12 +635,39 @@ export class WebServer extends EventEmitter {
     // Cookie plugin (needed for auth session tokens)
     await this.app.register(fastifyCookie);
 
+    // Uniform response envelope (stable HTTP contract — docs/api-reference.md):
+    // wrap bare JSON payloads as { success:true, data } and map { success:false }
+    // error envelopes to a conventional HTTP status (instead of 200). Skips
+    // non-JSON responses (buffers/streams) and non-/api routes.
+    this.app.addHook('preSerialization', (req, reply, payload: unknown, done) => {
+      if (!req.url.startsWith('/api')) return done(null, payload);
+      if (payload === null || typeof payload !== 'object') return done(null, payload);
+      if (Buffer.isBuffer(payload) || typeof (payload as { pipe?: unknown }).pipe === 'function') {
+        return done(null, payload);
+      }
+      const p = payload as { success?: unknown; errorCode?: unknown };
+      if (p.success === false) {
+        if (reply.statusCode === 200 && typeof p.errorCode === 'string') {
+          reply.code(httpStatusForErrorCode(p.errorCode as ApiErrorCode));
+        }
+        return done(null, payload);
+      }
+      if (p.success === true) return done(null, payload);
+      return done(null, { success: true, data: payload });
+    });
+
+    // Anti-DNS-rebinding Host allowlist + cross-site (CSRF) Origin guard. Registered
+    // before auth so forged cross-site / rebound requests are rejected up front, even
+    // on the default no-password install. See docs/reports/security-review-2026-06-09.md.
+    registerHostGuard(this.app, () => this.getHostPolicy());
+
     // Auth middleware (Basic Auth + session cookies + rate limiting)
     const authState = registerAuthMiddleware(this.app, this.https);
     if (authState) {
       this.authSessions = authState.authSessions;
       this.authFailures = authState.authFailures;
       this.qrAuthFailures = authState.qrAuthFailures;
+      this.hookSecretFailures = authState.hookSecretFailures;
     }
 
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
@@ -557,10 +688,30 @@ export class WebServer extends EventEmitter {
     // Security headers + CORS
     registerSecurityHeaders(this.app, this.https);
     this.app.get('/', async (_req, reply) => {
-      return reply.header('Cache-Control', 'no-cache').type('text/html; charset=utf-8').send(this.renderIndexHtml());
+      return reply
+        .header('Cache-Control', 'no-cache')
+        .type('text/html; charset=utf-8')
+        .send(await this.renderIndexHtml());
     });
     this.app.get('/index.html', async (_req, reply) => {
-      return reply.header('Cache-Control', 'no-cache').type('text/html; charset=utf-8').send(this.renderIndexHtml());
+      return reply
+        .header('Cache-Control', 'no-cache')
+        .type('text/html; charset=utf-8')
+        .send(await this.renderIndexHtml());
+    });
+    // Detached single-session window (undock). Serves the same SPA shell but
+    // flags the client into "solo mode" for one session. Auth applies normally
+    // (the popup carries the dashboard's cookie on navigation). We serve 200
+    // even for an unknown id — the client renders a friendly "session
+    // unavailable" state, which also covers a session that ends while its
+    // detached window is still open. Registered before the static plugin so the
+    // explicit route wins over the '/' static prefix.
+    this.app.get('/session/:id', async (req, reply) => {
+      const { id } = req.params as { id: string };
+      return reply
+        .header('Cache-Control', 'no-cache')
+        .type('text/html; charset=utf-8')
+        .send(await this.renderIndexHtml(id));
     });
     // Service worker must never be cached — browsers check for SW updates on navigation
     this.app.get('/sw.js', async (_req, reply) => {
@@ -648,7 +799,7 @@ export class WebServer extends EventEmitter {
     this.app.post('/api/events/subscribe', (req, reply) => {
       const body = (req.body || {}) as { clientId?: string; sessions?: string[] | null };
       if (typeof body.clientId !== 'string' || !SSE_CLIENT_ID_RE.test(body.clientId)) {
-        reply.code(400).send({ error: 'clientId required' });
+        reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'clientId required'));
         return;
       }
       const sessions = Array.isArray(body.sessions)
@@ -662,24 +813,40 @@ export class WebServer extends EventEmitter {
     // parseBody. Shared with the route test harness so test behavior matches prod.
     installRouteErrorHandler(this.app);
 
-    // Crash diagnostics beacon — frontend POSTs breadcrumbs, GET to read them
+    // Stable-contract 404 for unknown /api routes — without this, Fastify's
+    // default not-found payload {message,error,statusCode} would be wrapped by
+    // the envelope hook into a contradictory HTTP 404 {success:true,...}.
+    this.app.setNotFoundHandler((req, reply) => {
+      const notFound = `Route ${req.method}:${req.url} not found`;
+      if (req.url.startsWith('/api')) {
+        reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, notFound));
+        return;
+      }
+      reply.code(404).send({ message: notFound, error: 'Not Found', statusCode: 404 });
+    });
+
+    // Crash diagnostics beacon — frontend POSTs breadcrumbs, GET to read them.
+    // text/plain is used ONLY by this beacon (navigator.sendBeacon sends text/plain).
+    // Keep the body as a RAW STRING and parse it inside the handler — a global
+    // text/plain -> JSON parser would let a cross-site "simple request" (no CORS
+    // preflight) submit JSON to any route. See security review C2.
     let _crashBreadcrumbs = '';
     this.app.addContentTypeParser('text/plain;charset=UTF-8', { parseAs: 'string' }, (_req, body, done) => {
-      try {
-        done(null, JSON.parse(body as string));
-      } catch {
-        done(null, { data: body });
-      }
+      done(null, body);
     });
     this.app.addContentTypeParser('text/plain', { parseAs: 'string' }, (_req, body, done) => {
-      try {
-        done(null, JSON.parse(body as string));
-      } catch {
-        done(null, { data: body });
-      }
+      done(null, body);
     });
     this.app.post('/api/crash-diag', (req, reply) => {
-      _crashBreadcrumbs = String((req.body as { data?: string })?.data || '');
+      const raw = typeof req.body === 'string' ? req.body : '';
+      let data = raw;
+      try {
+        const parsed = JSON.parse(raw) as { data?: unknown };
+        if (parsed && typeof parsed.data === 'string') data = parsed.data;
+      } catch {
+        /* not JSON — treat the raw beacon text as the breadcrumbs */
+      }
+      _crashBreadcrumbs = String(data || '');
       reply.code(204).send();
     });
     this.app.get('/api/crash-diag', (_req, reply) => {
@@ -694,6 +861,7 @@ export class WebServer extends EventEmitter {
     registerFileRoutes(this.app, ctx);
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
+    registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
     registerSessionRoutes(this.app, ctx);
@@ -702,7 +870,7 @@ export class WebServer extends EventEmitter {
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
     registerOrchestratorRoutes(this.app, ctx);
-    registerWsRoutes(this.app, ctx);
+    registerWsRoutes(this.app, ctx, () => this.getHostPolicy());
   }
 
   /**
@@ -784,7 +952,14 @@ export class WebServer extends EventEmitter {
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
     const envOverrides = session.getEnvOverridesForPersist();
-    const state = (envOverrides ? { ...base, __envOverrides: envOverrides } : base) as SessionState;
+    // __attachmentHistory keeps the private (externalPath-bearing) history on disk,
+    // separate from the sanitized public attachmentHistory in toState().
+    const attachmentHistory = session.getAttachmentHistoryForPersist();
+    const state = {
+      ...base,
+      ...(envOverrides ? { __envOverrides: envOverrides } : {}),
+      ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
+    } as SessionState;
     const controller = this.respawnControllers.get(session.id);
     if (controller) {
       const config = controller.getConfig();
@@ -957,6 +1132,8 @@ export class WebServer extends EventEmitter {
       session.removeAllListeners();
       // Close any active file streams for this session
       fileStreamManager.closeSessionStreams(sessionId);
+      // Drop live external attachment registrations for this session
+      attachmentRegistry.clearSession(sessionId);
       // Stop watching for images in this session's directory
       imageWatcher.unwatchSession(sessionId);
       // Clean up pasted images directory for this session
@@ -980,11 +1157,105 @@ export class WebServer extends EventEmitter {
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
 
-  private renderIndexHtml(): string {
-    return this.indexHtmlTemplate.replace(
+  private async renderIndexHtml(soloSessionId?: string): Promise<string> {
+    let html = this.indexHtmlTemplate.replace(
       '<title>Codeman</title>',
       `<title>${escapeHtmlText(this.windowTitle)}</title>`
     );
+    // Cache-bust same-origin module scripts + stylesheets so a normal reload
+    // always serves the latest (static assets carry a 1-year immutable cache).
+    html = this.cacheBustAssets(html);
+    // Per-user App-Settings flags, read server-side so the page renders in the
+    // right initial state on every normal reload (the client apply* functions
+    // only run on save). Read FRESH (bypass the 2s cache): a setting toggled
+    // moments ago triggers a reload here, and the cached value would render the
+    // pre-toggle state (e.g. the gesture bundle wouldn't inject until a 2nd
+    // reload). Skipped for solo popups (their header differs).
+    const settings: Record<string, unknown> = soloSessionId ? {} : await this.readSettings(true);
+    // Multi-monitor header button: carries the `btn-multimonitor--hidden` class
+    // in the template by default (App Settings → Display → "Header Displays");
+    // reveal by stripping that class when the user enabled it. Matching a unique
+    // class token (not user-facing copy) keeps this robust against template edits.
+    if (settings.showMultiMonitorButton === true) {
+      html = html.replace(' btn-multimonitor--hidden', '');
+    }
+    // Plan-usage chip: ships hidden (`header-plan-usage--hidden`) and is revealed
+    // PER-DEVICE by the client (settings-ui.js applyHeaderVisibilitySettings). It
+    // used to be server-revealed from a synced setting, but that leaked the desktop
+    // choice onto mobile — display is now per-device only (like the response viewer).
+    // Telemetry collection stays server-side via the statusLineTelemetry action.
+    // Detached single-session ("solo") window: inject the target session id so
+    // the client can enter solo mode even if a (network-first) service worker
+    // later serves a cached shell. The client primarily detects solo mode from
+    // the /session/:id URL path; this global is a belt-and-suspenders fallback.
+    // The id is gated to JSON + <-escaped so it can't break out of the inline
+    // <script> (ids are UUIDs in practice, but defense-in-depth is cheap).
+    if (soloSessionId) {
+      const safeId = JSON.stringify(soloSessionId).replace(/</g, '\\u003c');
+      html = html.replace('</head>', `<script>window.__CODEMAN_SOLO__=${safeId};</script>\n</head>`);
+    }
+    // Gesture-control overlay (Phase 5): dashboard only (not solo popups, which
+    // have no tab strip). `CODEMAN_GESTURE=1` makes the feature *available* on
+    // this instance (it also widens CSP + serves the assets); the per-user
+    // `gestureControlEnabled` setting (App Settings → Input, default OFF) is the
+    // actual on/off. We expose `__codemanGestureAvailable` so the settings UI can
+    // show the toggle only when the feature is available, and inject the bundle
+    // (served same-origin from /gesture/, so 'self' covers it) only when enabled.
+    if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
+      html = html.replace('</head>', `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
+      if (settings.gestureControlEnabled === true) {
+        const v = this.gestureBundleVersion();
+        html = html.replace(
+          '</head>',
+          `<script type="module" src="/gesture/gesture-codeman.js${v}"></script>\n</head>`
+        );
+      }
+    }
+    return html;
+  }
+
+  /** mtime memo for asset cache-busting (keyed by absolute path). A full index
+   *  render does one stat per script/link tag (~25-30); without this each `/`,
+   *  `/index.html` and `/session/:id` hit would re-stat them all. A 1s TTL keeps
+   *  a burst of renders cheap while still picking up an edited/redeployed file
+   *  within a second (no server restart needed). */
+  private _assetVersionMemo = new Map<string, { v: number; ts: number }>();
+  private assetVersion(absPath: string): number | null {
+    const now = Date.now();
+    const hit = this._assetVersionMemo.get(absPath);
+    if (hit && now - hit.ts < 1000) return hit.v;
+    try {
+      const v = Math.floor(statSync(absPath).mtimeMs);
+      this._assetVersionMemo.set(absPath, { v, ts: now });
+      return v;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Cache-busting query for the gesture bundle: its mtime (memoized, see
+   *  assetVersion). The bundle is served from /gesture/ with a 1-year cache, so
+   *  without a version that changes on redeploy the browser would keep running a
+   *  stale bundle forever. Empty string if the file is missing. */
+  private gestureBundleVersion(): string {
+    const v = this.assetVersion(join(__dirname, 'public', 'gesture', 'gesture-codeman.js'));
+    return v === null ? '' : `?v=${v}`;
+  }
+
+  /** Append ?v=<mtime> to every same-origin .js/.css reference in the page so a
+   *  normal reload always serves the latest. Codeman's static assets are sent
+   *  with `Cache-Control: max-age=1y, immutable` and the script/link tags carry
+   *  no version, so without this an edited module (panels-ui.js, styles.css, …)
+   *  stays cached until a manual hard refresh. mtime is memoized (1s TTL) so a
+   *  changed file is picked up with no server restart. External URLs (have a
+   *  `:` scheme), already-versioned refs (have a `?`), and refs with no matching
+   *  file on disk are left untouched. */
+  private cacheBustAssets(html: string): string {
+    const publicDir = join(__dirname, 'public');
+    return html.replace(/(\s(?:src|href)=")([^"?:]+\.(?:js|css))(")/g, (full, pre, ref, post) => {
+      const v = this.assetVersion(join(publicDir, ref));
+      return v === null ? full : `${pre}${ref}?v=${v}${post}`;
+    });
   }
 
   private async setupSessionListeners(session: Session): Promise<void> {
@@ -993,8 +1264,8 @@ export class WebServer extends EventEmitter {
     this.runSummaryTrackers.set(session.id, summaryTracker);
     summaryTracker.recordSessionStarted(session.mode, session.workingDir);
 
-    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for opencode sessions)
-    if (session.mode !== 'opencode') {
+    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for external CLIs)
+    if (!isExternalCliMode(session.mode)) {
       session.ralphTracker.setWorkingDir(session.workingDir);
     }
 
@@ -1053,7 +1324,45 @@ export class WebServer extends EventEmitter {
         }
       },
       getStore: () => this.store,
+      registerAttachment: (id: string, filePath: string) => this.registerAttachment(id, filePath),
     };
+  }
+
+  /**
+   * Register a terminal-requested external file as a live attachment and
+   * broadcast it. Triggered by the session's `attachmentRequested` event
+   * (codeman://attach magic links). Because terminal output is
+   * attacker-influenceable (a prompt-injected session can print an arbitrary
+   * `codeman://attach?path=` link), the scanned path is FORCE-confined to the
+   * session workspace — passive magic links can't expose arbitrary host files.
+   * Deliberate cross-workspace attachment goes through the explicit,
+   * Origin-guarded `POST /attachments` route (and `codeman attach`, which POSTs
+   * directly inside a managed session). Registration also enforces the COD-53
+   * blocklist as defense-in-depth.
+   */
+  private async registerAttachment(sessionId: string, filePath: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const event = await registerExternalAttachment(sessionId, filePath, {
+      sessionWorkingDir: session.workingDir,
+      forceWorkspaceConfinement: true,
+    });
+    const record = attachmentRegistry.get(sessionId, event.attachmentId);
+    if (record) {
+      session.upsertAttachmentHistory(
+        buildExternalAttachmentHistoryItem({
+          sessionId,
+          externalPath: record.filePath,
+          fileName: record.fileName,
+          extension: record.extension,
+          size: record.size,
+          mtimeMs: record.mtimeMs,
+          timestamp: event.timestamp,
+        })
+      );
+      this.persistSessionState(session);
+    }
+    this.broadcast(SseEvent.AttachmentDetected, event);
   }
 
   private setupRespawnListeners(sessionId: string, controller: RespawnController): void {
@@ -1088,7 +1397,7 @@ export class WebServer extends EventEmitter {
 
   // Helper to get custom CLAUDE.md template path from settings
   private async getDefaultClaudeMdPath(): Promise<string | undefined> {
-    const settingsPath = join(homedir(), '.codeman', 'settings.json');
+    const settingsPath = dataPath('settings.json');
 
     try {
       const content = await fs.readFile(settingsPath, 'utf-8');
@@ -1106,13 +1415,16 @@ export class WebServer extends EventEmitter {
 
   // Read ~/.codeman/settings.json once and return the parsed object.
   // Cached for 2s to avoid redundant reads during session creation bursts.
+  // The settings PUT route writes the file without invalidating this cache, so
+  // callers that must observe a just-saved value (e.g. renderIndexHtml on a
+  // post-save reload) pass forceFresh=true to bypass the cache.
   private _settingsCache: { data: Record<string, unknown>; ts: number } | null = null;
-  private async readSettings(): Promise<Record<string, unknown>> {
+  private async readSettings(forceFresh = false): Promise<Record<string, unknown>> {
     const now = Date.now();
-    if (this._settingsCache && now - this._settingsCache.ts < 2000) {
+    if (!forceFresh && this._settingsCache && now - this._settingsCache.ts < 2000) {
       return this._settingsCache.data;
     }
-    const settingsPath = join(homedir(), '.codeman', 'settings.json');
+    const settingsPath = dataPath('settings.json');
     try {
       const content = await fs.readFile(settingsPath, 'utf-8');
       const data = JSON.parse(content) as Record<string, unknown>;
@@ -1389,8 +1701,10 @@ export class WebServer extends EventEmitter {
       respawnStatus,
       globalStats: this.store.getAggregateStats(activeSessionTokens),
       subagents: subagentWatcher.getRecentSubagents(15), // 15 min to avoid stale agents
+      workflowRuns: workflowRunWatcher.getAllRunSummaries(), // ultracode run summaries (no agents[]) for the LEFT list
       timestamp: now,
       inputCjkForm: process.env.INPUT_CJK_FORM?.toUpperCase() === 'ON',
+      planUsage: getLatestPlanUsage(), // last-known plan-usage telemetry, for the header chip on fresh load
     };
 
     this.cachedLightState = { data: result, timestamp: now };
@@ -1494,6 +1808,14 @@ export class WebServer extends EventEmitter {
       // Check per-subscription preferences
       if (sub.pushPreferences[event] === false) continue;
 
+      // Re-validate the stored endpoint before fetching it server-side (SSRF, M7).
+      // Defense-in-depth: subscribe-time validation already rejects unsafe URLs.
+      if (!isSafePushEndpoint(sub.endpoint)) {
+        console.warn('[push] skipping notification to unsafe endpoint:', sub.endpoint);
+        this.pushStore.removeByEndpoint(sub.endpoint);
+        continue;
+      }
+
       const pushSub = {
         endpoint: sub.endpoint,
         keys: sub.keys,
@@ -1539,6 +1861,13 @@ export class WebServer extends EventEmitter {
     lifecycleLog.log({ event: 'server_started', sessionId: '*' });
     await lifecycleLog.trimIfNeeded();
 
+    // If a self-update restarted us into this process, finalize its status file
+    // (flip the persisted "restarting" marker → completed/failed based on the
+    // version we actually booted). No-op on a normal boot. See web/self-update.ts.
+    if (!this.testMode) {
+      reconcileUpdateOnBoot();
+    }
+
     // Restore mux sessions BEFORE accepting connections
     // This prevents race conditions where clients connect before state is ready
     // CRITICAL: Skip in test mode to prevent tests from picking up user sessions
@@ -1559,19 +1888,52 @@ export class WebServer extends EventEmitter {
       this._eventLoopMonitor = startEventLoopMonitor();
     }
 
-    await this.app.listen({ port: this.port, host: '0.0.0.0' });
+    await this.app.listen({ port: this.port, host: this.host });
     const protocol = this.https ? 'https' : 'http';
-    console.log(`Codeman web interface running at ${protocol}://localhost:${this.port}`);
+    const displayHost = this.host === '0.0.0.0' ? 'localhost' : this.host;
+    console.log(`Codeman web interface running at ${protocol}://${displayHost}:${this.port}`);
 
-    // Security warning: server binds to 0.0.0.0 (all interfaces) — warn if no auth configured
-    if (!process.env.CODEMAN_PASSWORD) {
-      console.warn('\n⚠  WARNING: No CODEMAN_PASSWORD set — server is accessible without authentication.');
-      console.warn('   Anyone on your network can access and control Claude sessions.');
-      console.warn('   Set CODEMAN_PASSWORD environment variable to enable auth.\n');
+    // Anti-DNS-rebinding Host allowlist is always on. Localhost, any bare IP, the
+    // bind host, *.ts.net / *.trycloudflare.com / *.cfargotunnel.com, and the active
+    // managed tunnel are accepted automatically; add any other domain you front this
+    // with (e.g. a custom reverse-proxy host) via CODEMAN_ALLOWED_HOSTS=host1,.suffix.
+    const extraAllowed = (process.env.CODEMAN_ALLOWED_HOSTS || '').trim();
+    if (extraAllowed) {
+      console.log(`   Host allowlist also accepts: ${extraAllowed}`);
+    }
+
+    // Codeman binds loopback (127.0.0.1) by default, which is safe out of the box.
+    // If the user opts into a non-loopback bind (e.g. --host 0.0.0.0) WITHOUT a
+    // password we no longer refuse to start — that surprised people whose setups
+    // "just worked" before. Instead we start and warn loudly, pointing at the ways
+    // to secure it. --allow-unauthenticated-network just acknowledges the risk (a
+    // terser note). See docs/security-architecture.md.
+    if (!isLoopbackBindHost(this.host) && !process.env.CODEMAN_PASSWORD) {
+      if (this.allowUnauthenticatedNetwork) {
+        console.warn(
+          `\n⚠  Codeman is reachable WITHOUT a password on ${displayHost}:${this.port} ` +
+            '(explicitly allowed). Anyone who can reach it can control your Claude sessions.\n'
+        );
+      } else {
+        console.warn(`\n⚠  WARNING: Codeman is bound to a non-loopback host (${this.host}) with NO password.`);
+        console.warn(`   Anyone who can reach ${displayHost}:${this.port} can control your Claude sessions.`);
+        console.warn('   Secure it with ONE of:');
+        console.warn('     • set CODEMAN_PASSWORD=<password>   (HTTP Basic auth), or');
+        console.warn('     • bind loopback only: --host 127.0.0.1, then front it with an');
+        console.warn('       authenticated tunnel (cloudflared) or `tailscale serve`, or');
+        console.warn('     • keep this bind and accept the risk: --allow-unauthenticated-network');
+        console.warn('   See docs/security-architecture.md for details.\n');
+      }
     }
 
     // Set API URL for child processes (MCP server, spawned sessions)
-    process.env.CODEMAN_API_URL = `${protocol}://localhost:${this.port}`;
+    const apiHost =
+      this.host === '0.0.0.0' || this.host === 'localhost' || this.host === '::1' ? '127.0.0.1' : this.host;
+    process.env.CODEMAN_API_URL = `${protocol}://${apiHost}:${this.port}`;
+
+    // Ensure the COD-54 hook secret exists on disk before any session exports
+    // $CODEMAN_HOOK_SECRET_FILE — hook curls cat that path at execution time.
+    getHookSecret();
 
     // Start scheduled runs cleanup timer
     this.cleanup.setInterval(
@@ -1608,6 +1970,14 @@ export class WebServer extends EventEmitter {
       console.log('Subagent watcher disabled by user settings');
     }
 
+    // Start workflow run watcher for ultracode / Workflow run visualization (if enabled)
+    if (await this.isWorkflowAgentTrackingEnabled()) {
+      workflowRunWatcher.start();
+      console.log('Workflow run watcher started - monitoring ~/.claude/projects for ultracode run activity');
+    } else {
+      console.log('Workflow run watcher disabled by user settings (showUltracodeAgents off)');
+    }
+
     // Start image watcher for auto-popup of screenshots (if enabled)
     if (await this.isImageWatcherEnabled()) {
       imageWatcher.start();
@@ -1619,7 +1989,7 @@ export class WebServer extends EventEmitter {
     // Tunnel only starts when user clicks the toggle in the UI — never on boot.
     // Reset persisted tunnelEnabled so the UI toggle reflects actual state.
     if (await this.isTunnelEnabled()) {
-      const settingsPath = join(homedir(), '.codeman', 'settings.json');
+      const settingsPath = dataPath('settings.json');
       try {
         const content = await fs.readFile(settingsPath, 'utf-8');
         const settings = JSON.parse(content);
@@ -1640,7 +2010,7 @@ export class WebServer extends EventEmitter {
    * Check if subagent tracking is enabled in settings (default: true)
    */
   private async isSubagentTrackingEnabled(): Promise<boolean> {
-    const settingsPath = join(homedir(), '.codeman', 'settings.json');
+    const settingsPath = dataPath('settings.json');
     try {
       const content = await fs.readFile(settingsPath, 'utf-8');
       const settings = JSON.parse(content);
@@ -1655,10 +2025,29 @@ export class WebServer extends EventEmitter {
   }
 
   /**
+   * Check if ultracode/workflow run tracking is enabled in settings (default: FALSE — opt-in).
+   * The watcher feeds BOTH the docked Ultracode Agents panel (`showUltracodeAgents`) and the
+   * floating run windows (`ultracodeFloatingWindows`), so either toggle starts it.
+   */
+  private async isWorkflowAgentTrackingEnabled(): Promise<boolean> {
+    const settingsPath = dataPath('settings.json');
+    try {
+      const content = await fs.readFile(settingsPath, 'utf-8');
+      const settings = JSON.parse(content);
+      return (settings.showUltracodeAgents ?? false) || (settings.ultracodeFloatingWindows ?? false);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error('Failed to read showUltracodeAgents setting:', err);
+      }
+    }
+    return false; // Default disabled (opt-in)
+  }
+
+  /**
    * Check if image watcher is enabled in settings (default: false)
    */
   private async isImageWatcherEnabled(): Promise<boolean> {
-    const settingsPath = join(homedir(), '.codeman', 'settings.json');
+    const settingsPath = dataPath('settings.json');
     try {
       const content = await fs.readFile(settingsPath, 'utf-8');
       const settings = JSON.parse(content);
@@ -1676,7 +2065,7 @@ export class WebServer extends EventEmitter {
    * Check if Cloudflare tunnel is enabled in settings (default: false)
    */
   private async isTunnelEnabled(): Promise<boolean> {
-    const settingsPath = join(homedir(), '.codeman', 'settings.json');
+    const settingsPath = dataPath('settings.json');
     try {
       const content = await fs.readFile(settingsPath, 'utf-8');
       const settings = JSON.parse(content);
@@ -1716,7 +2105,14 @@ export class WebServer extends EventEmitter {
             const recoveryClaudeMode = await this.getClaudeModeConfig();
             // Recover envOverrides from the internal __envOverrides field written by
             // session-manager (see updateSessionState). Cast to read the non-public field.
+            // Note: a legacy CLAUDE_CODE_EFFORT_LEVEL entry is auto-migrated to `effort`
+            // by the Session constructor (env var would hard-lock /effort switching).
             const savedEnvOverrides = (savedState as { __envOverrides?: Record<string, string> })?.__envOverrides;
+            // Prefer the private (externalPath-bearing) history; fall back to the
+            // sanitized public copy for sessions persisted before that split.
+            const savedAttachmentHistory =
+              (savedState as { __attachmentHistory?: SessionAttachmentHistoryItem[] })?.__attachmentHistory ??
+              savedState?.attachmentHistory;
             const session = new Session({
               id: muxSession.sessionId, // Preserve the original session ID
               workingDir: muxSession.workingDir,
@@ -1728,6 +2124,8 @@ export class WebServer extends EventEmitter {
               claudeMode: recoveryClaudeMode.claudeMode,
               allowedTools: recoveryClaudeMode.allowedTools,
               envOverrides: savedEnvOverrides,
+              effort: savedState?.effort,
+              attachmentHistory: savedAttachmentHistory,
             });
 
             // Update session name if it was a "Restored:" placeholder or doesn't match saved name
@@ -1746,6 +2144,12 @@ export class WebServer extends EventEmitter {
               // Auto-clear
               if (savedState.autoClearEnabled !== undefined || savedState.autoClearThreshold !== undefined) {
                 session.setAutoClear(savedState.autoClearEnabled ?? false, savedState.autoClearThreshold);
+              }
+              // Auto-resume on usage limit (re-arms a pending schedule; an
+              // overdue one fires shortly after boot — the limit footer won't
+              // reprint on its own, so the pause would otherwise stall)
+              if (savedState.autoResumeEnabled) {
+                session.restoreAutoResume(true, savedState.autoResumeAt);
               }
               // Token tracking
               if (
@@ -1770,8 +2174,8 @@ export class WebServer extends EventEmitter {
                   );
                 }
               }
-              // Ralph / Todo tracker (not supported for opencode sessions)
-              if (session.mode !== 'opencode') {
+              // Ralph / Todo tracker (not supported for external-CLI sessions)
+              if (!isExternalCliMode(session.mode)) {
                 if (savedState.ralphAutoEnableDisabled) {
                   session.ralphTracker.disableAutoEnable();
                   console.log(`[Server] Restored Ralph auto-enable disabled for session ${session.id}`);
@@ -1800,8 +2204,8 @@ export class WebServer extends EventEmitter {
               if (savedState.flickerFilterEnabled !== undefined) {
                 session.flickerFilterEnabled = savedState.flickerFilterEnabled;
               }
-              // Respawn controller (not supported for opencode sessions)
-              if (session.mode !== 'opencode' && savedState.respawnEnabled && savedState.respawnConfig) {
+              // Respawn controller (not supported for external-CLI sessions)
+              if (!isExternalCliMode(session.mode) && savedState.respawnEnabled && savedState.respawnConfig) {
                 try {
                   this.restoreRespawnController(session, savedState.respawnConfig, 'state.json');
                 } catch (err) {
@@ -1810,9 +2214,9 @@ export class WebServer extends EventEmitter {
               }
             }
 
-            // Fallback: restore respawn from mux-sessions.json if state.json didn't have it (not supported for opencode)
+            // Fallback: restore respawn from mux-sessions.json if state.json didn't have it (not supported for external CLIs)
             if (
-              session.mode !== 'opencode' &&
+              !isExternalCliMode(session.mode) &&
               !this.respawnControllers.has(session.id) &&
               muxSession.respawnConfig?.enabled
             ) {
@@ -1827,9 +2231,9 @@ export class WebServer extends EventEmitter {
             }
 
             // Fallback: restore Ralph state from state-inner.json if not already set and not explicitly disabled
-            // Ralph tracker is not supported for opencode sessions
+            // Ralph tracker is not supported for external-CLI sessions
             if (
-              session.mode !== 'opencode' &&
+              !isExternalCliMode(session.mode) &&
               !session.ralphTracker.enabled &&
               !session.ralphTracker.autoEnableDisabled
             ) {
@@ -1840,9 +2244,9 @@ export class WebServer extends EventEmitter {
               }
             }
 
-            // Fallback: auto-detect completion phrase from CLAUDE.md (not supported for opencode)
+            // Fallback: auto-detect completion phrase from CLAUDE.md (not supported for external CLIs)
             if (
-              session.mode !== 'opencode' &&
+              !isExternalCliMode(session.mode) &&
               session.ralphTracker.enabled &&
               !session.ralphTracker.loopState.completionPhrase
             ) {
@@ -1993,11 +2397,15 @@ export class WebServer extends EventEmitter {
 
     // Clean up watcher listeners to prevent memory leaks
     this.cleanupSubagentWatcherListeners();
+    this.cleanupWorkflowRunWatcherListeners();
     this.cleanupImageWatcherListeners();
     this.cleanupTeamWatcherListeners();
 
     // Stop subagent watcher
     subagentWatcher.stop();
+
+    // Stop workflow run watcher
+    workflowRunWatcher.stop();
 
     // Stop image watcher
     imageWatcher.stop();
@@ -2046,6 +2454,10 @@ export class WebServer extends EventEmitter {
       this.qrAuthFailures.dispose();
       this.qrAuthFailures = null;
     }
+    if (this.hookSecretFailures) {
+      this.hookSecretFailures.dispose();
+      this.hookSecretFailures = null;
+    }
     this.activePlanOrchestrators.clear();
     this.cleaningUp.clear();
 
@@ -2060,9 +2472,11 @@ export async function startWebServer(
   port: number = 3000,
   https: boolean = false,
   testMode: boolean = false,
-  titleHostname?: string
+  host: string = '127.0.0.1',
+  titleHostname?: string,
+  allowUnauthenticatedNetwork: boolean = false
 ): Promise<WebServer> {
-  const server = new WebServer(port, https, testMode, titleHostname);
+  const server = new WebServer(port, https, testMode, host, titleHostname, allowUnauthenticatedNetwork);
   await server.start();
   return server;
 }

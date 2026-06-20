@@ -185,9 +185,9 @@ Object.assign(CodemanApp.prototype, {
     try {
       // Get VAPID public key from server
       const keyData = await this._apiJson('/api/push/vapid-key');
-      if (!keyData?.success) throw new Error('Failed to get VAPID key');
+      if (!keyData) throw new Error('Failed to get VAPID key');
 
-      const applicationServerKey = urlBase64ToUint8Array(keyData.data.publicKey);
+      const applicationServerKey = urlBase64ToUint8Array(keyData.publicKey);
       const subscription = await this._swRegistration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey,
@@ -204,11 +204,11 @@ Object.assign(CodemanApp.prototype, {
           pushPreferences: this._buildPushPreferences(),
         },
       });
-      if (!data?.success) throw new Error('Failed to register subscription');
+      if (!data) throw new Error('Failed to register subscription');
 
       this._pushSubscription = subscription;
-      this._pushSubscriptionId = data.data.id;
-      localStorage.setItem('codeman-push-subscription-id', data.data.id);
+      this._pushSubscriptionId = data.id;
+      localStorage.setItem('codeman-push-subscription-id', data.id);
       this._updatePushUI(true);
       this.showToast('Push notifications enabled', 'success');
     } catch (err) {
@@ -305,20 +305,34 @@ Object.assign(CodemanApp.prototype, {
     // Header visibility settings
     document.getElementById('appSettingsShowFontControls').checked = settings.showFontControls ?? defaults.showFontControls ?? false;
     document.getElementById('appSettingsShowSystemStats').checked = settings.showSystemStats ?? defaults.showSystemStats ?? true;
-    document.getElementById('appSettingsShowTokenCount').checked = settings.showTokenCount ?? defaults.showTokenCount ?? true;
-    document.getElementById('appSettingsShowCost').checked = settings.showCost ?? defaults.showCost ?? false;
     document.getElementById('appSettingsShowLifecycleLog').checked = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? true;
-    document.getElementById('appSettingsShowMonitor').checked = settings.showMonitor ?? defaults.showMonitor ?? true;
+    document.getElementById('appSettingsShowResponseViewer').checked = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
+    document.getElementById('appSettingsShowAttachmentsButton').checked = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
+    document.getElementById('appSettingsSkin').value = settings.skin ?? defaults.skin ?? 'daylight-blue';
+    document.getElementById('appSettingsShowMonitor').checked = settings.showMonitor ?? defaults.showMonitor ?? false;
     document.getElementById('appSettingsShowProjectInsights').checked = settings.showProjectInsights ?? defaults.showProjectInsights ?? false;
     document.getElementById('appSettingsShowFileBrowser').checked = settings.showFileBrowser ?? defaults.showFileBrowser ?? false;
     document.getElementById('appSettingsShowSubagents').checked = settings.showSubagents ?? defaults.showSubagents ?? false;
+    document.getElementById('appSettingsShowUltracodeAgents').checked = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    document.getElementById('appSettingsUltracodeFloatingWindows').checked =
+      settings.ultracodeFloatingWindows ?? defaults.ultracodeFloatingWindows ?? false;
+    document.getElementById('appSettingsShowMultiMonitorButton').checked = settings.showMultiMonitorButton ?? defaults.showMultiMonitorButton ?? false;
+    document.getElementById('appSettingsShowPlanUsageLimits').checked = settings.showPlanUsageLimits ?? defaults.showPlanUsageLimits ?? false;
+    document.getElementById('appSettingsShowRedrawButton').checked = settings.showRedrawButton ?? defaults.showRedrawButton ?? false;
+    // Gesture control lives in the Input section (alongside Local Echo / CJK Input)
+    // but is only available when the instance runs with CODEMAN_GESTURE=1 (server sets
+    // window.__codemanGestureAvailable). Hide just this item otherwise so the toggle
+    // can't promise something that won't work.
+    const gestureItem = document.getElementById('appSettingsGestureControlItem');
+    if (gestureItem) gestureItem.style.display = window.__codemanGestureAvailable ? '' : 'none';
+    document.getElementById('appSettingsGestureControl').checked = settings.gestureControlEnabled ?? defaults.gestureControlEnabled ?? false;
     document.getElementById('appSettingsSubagentTracking').checked = settings.subagentTrackingEnabled ?? defaults.subagentTrackingEnabled ?? true;
     document.getElementById('appSettingsSubagentActiveTabOnly').checked = settings.subagentActiveTabOnly ?? defaults.subagentActiveTabOnly ?? true;
     document.getElementById('appSettingsImageWatcherEnabled').checked = settings.imageWatcherEnabled ?? defaults.imageWatcherEnabled ?? false;
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
-    document.getElementById('appSettingsCjkInput').checked = settings.cjkInputEnabled ?? false;
+    document.getElementById('appSettingsCjkInput').checked = settings.cjkInputEnabled ?? defaults.cjkInputEnabled ?? false;
     document.getElementById('appSettingsExtendedKeyboardBar').checked = settings.extendedKeyboardBar ?? false;
     document.getElementById('appSettingsTabTwoRows').checked = settings.tabTwoRows ?? defaults.tabTwoRows ?? false;
     // Claude CLI settings
@@ -331,8 +345,12 @@ Object.assign(CodemanApp.prototype, {
     claudeModeSelect.onchange = () => {
       allowedToolsRow.style.display = claudeModeSelect.value === 'allowedTools' ? '' : 'none';
     };
+    // Codex CLI settings
+    document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked =
+      settings.codexDangerouslyBypassApprovals ?? false;
     // Claude Permissions settings
     document.getElementById('appSettingsAgentTeams').checked = settings.agentTeamsEnabled ?? false;
+    document.getElementById('appSettingsClaudeModel').value = settings.claudeModel ?? '';
     document.getElementById('appSettingsOpusContext1m').checked = settings.opusContext1mEnabled ?? false;
     document.getElementById('appSettingsThinkingEffort').value = settings.thinkingEffort ?? '';
     // CPU Priority settings
@@ -422,6 +440,9 @@ Object.assign(CodemanApp.prototype, {
     providerEl.textContent = providerName;
     providerEl.className = 'voice-provider-status' + (providerName.startsWith('Deepgram') ? ' active' : '');
 
+    // Updates section — show current version, reset transient result/progress UI.
+    this._initUpdatesSection();
+
     // Reset to first tab and wire up tab switching
     this.switchSettingsTab('settings-display');
     const modal = document.getElementById('appSettingsModal');
@@ -457,10 +478,195 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // ───────────────────────────────────────────────────────────────
+  // Self-Update (App Settings → Updates). Backend: src/web/self-update.ts.
+  // ───────────────────────────────────────────────────────────────
+
+  /** Friendly label for an in-flight update phase. */
+  _updatePhaseText(phase) {
+    return {
+      queued: 'Queued…',
+      preparing: 'Preparing…',
+      stashing: 'Stashing local changes…',
+      fetching: 'Fetching release…',
+      checkout: 'Checking out release…',
+      installing: 'Installing dependencies…',
+      building: 'Building…',
+      restarting: 'Restarting Codeman…',
+    }[phase] || phase;
+  },
+
+  /** Populate the version row and clear transient UI when the modal opens. */
+  _initUpdatesSection() {
+    const verEl = this.$('updateCurrentVersion');
+    if (verEl) verEl.textContent = (this.$('versionDisplay')?.textContent || '').trim() || '—';
+    for (const id of ['updateResult', 'updateActionRow', 'updateNotes', 'updateProgress']) {
+      const el = this.$(id);
+      if (el) el.style.display = 'none';
+    }
+    this._updateCheck = null;
+  },
+
+  _setUpdateResult(html) {
+    const el = this.$('updateResult');
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  },
+
+  _setUpdateProgress(html) {
+    const el = this.$('updateProgress');
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  },
+
+  /** Manual "Check for updates" — asks the server to query GitHub. */
+  async checkForUpdate() {
+    const btn = this.$('updateCheckBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    const data = await this._apiJson('/api/system/update/check');
+    if (btn) { btn.disabled = false; btn.textContent = 'Check now'; }
+
+    const actionRow = this.$('updateActionRow');
+    const notes = this.$('updateNotes');
+    if (actionRow) actionRow.style.display = 'none';
+    if (notes) notes.style.display = 'none';
+
+    if (!data) {
+      this._setUpdateResult('Could not check for updates. Try again later.');
+      return;
+    }
+    this._updateCheck = data;
+    const verEl = this.$('updateCurrentVersion');
+    if (verEl && data.currentVersion) verEl.textContent = `v${data.currentVersion}`;
+
+    if (data.installKind && data.installKind !== 'git') {
+      this._setUpdateResult(
+        `This install can't update itself (${escapeHtml(data.installKind)}). Update with <code>npm i -g aicodeman@latest</code>.`
+      );
+      return;
+    }
+    if (data.selfUpdateEnabled === false) {
+      this._setUpdateResult('In-app updates are disabled on this server (CODEMAN_DISABLE_SELF_UPDATE=1).');
+      return;
+    }
+    if (data.error && !data.updateAvailable) {
+      this._setUpdateResult(escapeHtml(data.error));
+      return;
+    }
+    if (data.updateAvailable && data.latestVersion) {
+      this._setUpdateResult(
+        `Update available: <strong>v${escapeHtml(data.latestVersion)}</strong> &nbsp;(current v${escapeHtml(data.currentVersion || '')})`
+      );
+      const label = this.$('updateActionLabel');
+      if (label) label.textContent = `Update to v${data.latestVersion}`;
+      if (actionRow) actionRow.style.display = 'flex';
+      const nowBtn = this.$('updateNowBtn');
+      if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = 'Update now'; }
+      if (notes && data.notes) {
+        notes.style.display = 'block';
+        notes.textContent = data.notes;
+      }
+    } else {
+      this._setUpdateResult(`You're up to date (v${escapeHtml(data.currentVersion || '')}).`);
+    }
+  },
+
+  /** Start the update, then poll status across the service restart. */
+  async startSelfUpdate() {
+    const target = this._updateCheck?.latestVersion ? `v${this._updateCheck.latestVersion}` : 'the latest release';
+    if (!confirm(`Update Codeman to ${target}? The server will restart and this page will reload.`)) return;
+
+    const btn = this.$('updateNowBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    const res = await this._apiPost('/api/system/update', {});
+    if (!res || !res.ok) {
+      let msg = 'Failed to start the update.';
+      try { const j = await res.json(); if (typeof j?.error === 'string' && j.error) msg = j.error; } catch {}
+      this._setUpdateProgress(`<span style="color:var(--danger,#e5534b)">${escapeHtml(msg)}</span>`);
+      if (btn) { btn.disabled = false; btn.textContent = 'Update now'; }
+      return;
+    }
+    const actionRow = this.$('updateActionRow');
+    if (actionRow) actionRow.style.display = 'none';
+    const notes = this.$('updateNotes');
+    if (notes) notes.style.display = 'none';
+    this._setUpdateProgress('Starting update…');
+    this._pollUpdateStatus();
+  },
+
+  _stopUpdatePolling() {
+    if (this._updatePollTimer) { clearInterval(this._updatePollTimer); this._updatePollTimer = null; }
+  },
+
+  /**
+   * Poll the status file every 1.5s. Survives the connection drop while the
+   * server restarts (fetch throws → "restarting"), then reads the reconciled
+   * terminal state from the freshly-booted server.
+   */
+  _pollUpdateStatus() {
+    this._stopUpdatePolling();
+    const terminal = new Set(['completed', 'completed-needs-manual-restart', 'failed', 'idle']);
+    const poll = async () => {
+      let data = null;
+      try {
+        const res = await fetch('/api/system/update/status');
+        if (res.ok) {
+          const env = await res.json();
+          data = env && env.success === true ? env.data : env;
+        }
+      } catch { /* server restarting — keep polling */ }
+
+      if (!data) {
+        this._setUpdateProgress('↻ Restarting Codeman…');
+        return;
+      }
+      if (!terminal.has(data.phase)) {
+        // Prefer the live status message — the updater's heartbeat enriches it with
+        // the latest npm/build output line so a slow step doesn't look frozen — and
+        // fall back to the static phase label. Append total elapsed so the counter
+        // keeps ticking between heartbeats: a clear "still working" signal.
+        const label = (data.message && data.message.trim()) ? data.message.trim() : this._updatePhaseText(data.phase);
+        let elapsed = '';
+        if (data.startedAt) {
+          const secs = Math.max(0, Math.round((Date.now() - data.startedAt) / 1000));
+          elapsed = ` <span style="color:var(--text-secondary)">· ${secs}s</span>`;
+        }
+        this._setUpdateProgress(`<span class="tunnel-spinner"></span> ${escapeHtml(label)}${elapsed}`);
+        return;
+      }
+      this._stopUpdatePolling();
+      if (data.phase === 'completed') {
+        let html = `<span style="color:var(--success,#3fb950)">✓ Updated to v${escapeHtml(data.toVersion || '')}. Reloading…</span>`;
+        if (data.stashRef) {
+          html += `<br><span style="color:var(--text-secondary)">Local changes stashed as <code>${escapeHtml(data.stashRef)}</code> — run <code>git stash pop</code> to restore.</span>`;
+        }
+        this._setUpdateProgress(html);
+        setTimeout(() => location.reload(), 2500);
+      } else if (data.phase === 'completed-needs-manual-restart') {
+        this._setUpdateProgress(
+          `Update staged. Restart Codeman to apply:<br><code>${escapeHtml(data.manualRestartCommand || 'restart codeman web')}</code>`
+        );
+      } else if (data.phase === 'failed') {
+        let html = `<span style="color:var(--danger,#e5534b)">✗ ${escapeHtml(data.message || 'Update failed')}.</span>`;
+        if (data.error) html += `<br><span style="color:var(--text-secondary)">${escapeHtml(data.error)}</span>`;
+        html += `<br><span style="color:var(--text-secondary)">The previous version is still running.</span>`;
+        if (data.stashRef) {
+          html += `<br><span style="color:var(--text-secondary)">Local changes stashed as <code>${escapeHtml(data.stashRef)}</code>.</span>`;
+        }
+        this._setUpdateProgress(html);
+        const nowBtn = this.$('updateNowBtn');
+        const actionRow = this.$('updateActionRow');
+        if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = 'Try again'; }
+        if (actionRow) actionRow.style.display = 'flex';
+      }
+    };
+    poll();
+    this._updatePollTimer = setInterval(poll, 1500);
+  },
+
   async loadTunnelStatus() {
     try {
       const res = await fetch('/api/tunnel/status');
-      const status = await res.json();
+      const env = await res.json();
+      const status = env?.success === true ? env.data : env;
       const active = status.running && status.url;
       this._tunnelUrl = active ? status.url : null;
       this._updateTunnelUrlDisplay(this._tunnelUrl);
@@ -529,7 +735,8 @@ Object.assign(CodemanApp.prototype, {
         if (!res.ok) throw new Error('Tunnel not running');
         return res.json();
       })
-      .then(data => {
+      .then(env => {
+        const data = env?.success === true ? env.data : env;
         const container = document.getElementById('tunnelQrContainer');
         if (container && data.svg) container.innerHTML = data.svg;
         // Show auth badge, countdown, and regenerate button when auth is enabled
@@ -562,7 +769,8 @@ Object.assign(CodemanApp.prototype, {
     // Fetch URL for display
     fetch('/api/tunnel/status')
       .then(r => r.json())
-      .then(status => {
+      .then(env => {
+        const status = env?.success === true ? env.data : env;
         const urlEl = document.getElementById('tunnelQrUrl');
         if (urlEl && status.url) {
           urlEl.textContent = status.url;
@@ -594,7 +802,8 @@ Object.assign(CodemanApp.prototype, {
   _refreshTunnelQrFromApi() {
     fetch('/api/tunnel/qr')
       .then(res => res.ok ? res.json() : null)
-      .then(data => {
+      .then(env => {
+        const data = env?.success === true ? env.data : env;
         if (!data?.svg) return;
         const container = document.getElementById('tunnelQrContainer');
         if (container) container.innerHTML = data.svg;
@@ -640,11 +849,18 @@ Object.assign(CodemanApp.prototype, {
     btn.disabled = true;
     try {
       const newEnabled = !isActive;
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tunnelEnabled: newEnabled }),
       });
+      // COD-55: server refuses an unauthenticated public tunnel (403). Surface it.
+      if (newEnabled && (await this._handleTunnelEnableRefusal(res))) {
+        this._dismissTunnelConnecting();
+        this._updateWelcomeTunnelBtn(false);
+        btn.disabled = false;
+        return;
+      }
       if (newEnabled) {
         this._showTunnelConnecting();
         // Poll tunnel status as fallback in case SSE event is missed
@@ -709,7 +925,8 @@ Object.assign(CodemanApp.prototype, {
     this._tunnelPollTimer = setTimeout(async () => {
       try {
         const res = await fetch('/api/tunnel/status');
-        const status = await res.json();
+        const env = await res.json();
+        const status = env?.success === true ? env.data : env;
         if (status.running && status.url) {
           // Tunnel is up — update UI
           this._dismissTunnelConnecting();
@@ -768,7 +985,7 @@ Object.assign(CodemanApp.prototype, {
       }
       fetch('/api/tunnel/qr')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-        .then(data => { if (data.svg) qrInner.innerHTML = data.svg; })
+        .then(env => { const data = env?.success === true ? env.data : env; if (data.svg) qrInner.innerHTML = data.svg; })
         .catch(() => { qrInner.innerHTML = '<div style="color:#999;font-size:11px;padding:20px">QR unavailable</div>'; });
     } else {
       clearTimeout(this._welcomeQrShrinkTimer);
@@ -840,7 +1057,8 @@ Object.assign(CodemanApp.prototype, {
     // Fetch tunnel info
     try {
       const res = await fetch('/api/tunnel/info');
-      const info = await res.json();
+      const env = await res.json();
+      const info = env?.success === true ? env.data : env;
       this._renderTunnelPanel(info);
     } catch {
       const body = document.getElementById('tunnelPanelBody');
@@ -942,13 +1160,82 @@ Object.assign(CodemanApp.prototype, {
     return `${Math.floor(hrs / 24)}d ago`;
   },
 
+  /**
+   * COD-55: detect the server's refusal to start an unauthenticated public tunnel.
+   * The PUT /api/settings route returns a 4xx with { success:false, error } when no
+   * CODEMAN_PASSWORD is set and the unauthenticated-network opt-in is not acknowledged.
+   * Shows the server's (actionable) message as an error toast.
+   * @param {Response|null} res - the fetch Response from the settings PUT
+   * @returns {Promise<boolean>} true if the tunnel-enable was refused (caller should abort)
+   */
+  async _handleTunnelEnableRefusal(res) {
+    if (!res || res.ok) return false;
+    let message = 'Tunnel refused: set CODEMAN_PASSWORD before exposing Codeman publicly.';
+    try {
+      const body = await res.json();
+      if (body && body.error) message = body.error;
+    } catch {
+      /* non-JSON body — use the default message */
+    }
+    // 403 = the no-password safety refusal (COD-55). Warn loudly and let the
+    // operator acknowledge the risk; on confirm, retry with explicit acknowledgment.
+    if (res.status === 403) {
+      const confirmed = confirm(
+        '⚠️ SECURITY WARNING — no password set\n\n' +
+          'Enabling the Cloudflare tunnel will publish THIS machine to a public URL with ' +
+          'NO login. Anyone who gets the URL has full terminal control — effectively remote ' +
+          'code execution on your computer.\n\n' +
+          'Strongly recommended: set CODEMAN_PASSWORD instead.\n\n' +
+          'Enable the unauthenticated public tunnel anyway?'
+      );
+      if (!confirmed) {
+        this._dismissTunnelConnecting?.();
+        this.showToast('Tunnel not enabled', 'info');
+        return true;
+      }
+      try {
+        const retry = await fetch('/api/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tunnelEnabled: true, acknowledgeUnauthTunnel: true }),
+        });
+        if (retry.ok) {
+          this.showToast('Public tunnel enabling — no password set ⚠️', 'warning');
+          return false; // proceed with the caller's success/connecting path
+        }
+        let m = 'Failed to enable tunnel.';
+        try {
+          const b = await retry.json();
+          if (b && b.error) m = b.error;
+        } catch {
+          /* non-JSON */
+        }
+        this._dismissTunnelConnecting?.();
+        this.showToast(m, 'error');
+        return true;
+      } catch {
+        this._dismissTunnelConnecting?.();
+        this.showToast('Failed to enable tunnel', 'error');
+        return true;
+      }
+    }
+    this._dismissTunnelConnecting?.();
+    this.showToast(message, 'error');
+    return true;
+  },
+
   async _tunnelPanelToggle(enable) {
     try {
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tunnelEnabled: enable }),
       });
+      // COD-55: server refuses an unauthenticated public tunnel (403). Surface it.
+      if (enable && (await this._handleTunnelEnableRefusal(res))) {
+        this.closeTunnelPanel();
+        return;
+      }
       if (enable) {
         this._updateTunnelIndicator(false);
         const indicator = document.getElementById('tunnelIndicator');
@@ -974,7 +1261,8 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('All sessions revoked', 'success');
       // Refresh panel
       const res = await fetch('/api/tunnel/info');
-      const info = await res.json();
+      const env = await res.json();
+      const info = env?.success === true ? env.data : env;
       this._renderTunnelPanel(info);
     } catch {
       this.showToast('Failed to revoke sessions', 'error');
@@ -1069,7 +1357,8 @@ Object.assign(CodemanApp.prototype, {
 
     try {
       const res = await fetch(`/api/session-lifecycle?${params}`);
-      const data = await res.json();
+      const env = await res.json();
+      const data = env?.success === true ? env.data : env;
       const tbody = document.getElementById('lifecycleTableBody');
       const empty = document.getElementById('lifecycleEmpty');
 
@@ -1107,6 +1396,10 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async saveAppSettings() {
+    // Gesture overlay is injected at page render (server-side), so a change to it
+    // only takes effect on reload — remember the prior value to decide below.
+    const _prev = this.loadAppSettingsFromStorage();
+    const _prevGestureEnabled = (_prev.gestureControlEnabled ?? false) === true;
     const settings = {
       defaultClaudeMdPath: document.getElementById('appSettingsClaudeMdPath').value.trim(),
       defaultWorkingDir: document.getElementById('appSettingsDefaultDir').value.trim(),
@@ -1114,13 +1407,19 @@ Object.assign(CodemanApp.prototype, {
       // Header visibility settings
       showFontControls: document.getElementById('appSettingsShowFontControls').checked,
       showSystemStats: document.getElementById('appSettingsShowSystemStats').checked,
-      showTokenCount: document.getElementById('appSettingsShowTokenCount').checked,
-      showCost: document.getElementById('appSettingsShowCost').checked,
       showLifecycleLog: document.getElementById('appSettingsShowLifecycleLog').checked,
+      showResponseViewer: document.getElementById('appSettingsShowResponseViewer').checked,
+      showAttachmentsButton: document.getElementById('appSettingsShowAttachmentsButton').checked,
       showMonitor: document.getElementById('appSettingsShowMonitor').checked,
       showProjectInsights: document.getElementById('appSettingsShowProjectInsights').checked,
       showFileBrowser: document.getElementById('appSettingsShowFileBrowser').checked,
       showSubagents: document.getElementById('appSettingsShowSubagents').checked,
+      showUltracodeAgents: document.getElementById('appSettingsShowUltracodeAgents').checked,
+      ultracodeFloatingWindows: document.getElementById('appSettingsUltracodeFloatingWindows').checked,
+      showMultiMonitorButton: document.getElementById('appSettingsShowMultiMonitorButton').checked,
+      showPlanUsageLimits: document.getElementById('appSettingsShowPlanUsageLimits').checked,
+      showRedrawButton: document.getElementById('appSettingsShowRedrawButton').checked,
+      gestureControlEnabled: document.getElementById('appSettingsGestureControl').checked,
       subagentTrackingEnabled: document.getElementById('appSettingsSubagentTracking').checked,
       subagentActiveTabOnly: document.getElementById('appSettingsSubagentActiveTabOnly').checked,
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
@@ -1129,11 +1428,15 @@ Object.assign(CodemanApp.prototype, {
       cjkInputEnabled: document.getElementById('appSettingsCjkInput').checked,
       extendedKeyboardBar: document.getElementById('appSettingsExtendedKeyboardBar').checked,
       tabTwoRows: document.getElementById('appSettingsTabTwoRows').checked,
+      skin: document.getElementById('appSettingsSkin').value,
       // Claude CLI settings
       claudeMode: document.getElementById('appSettingsClaudeMode').value,
       allowedTools: document.getElementById('appSettingsAllowedTools').value.trim(),
+      // Codex CLI settings
+      codexDangerouslyBypassApprovals: document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked,
       // Claude Permissions settings
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
+      claudeModel: document.getElementById('appSettingsClaudeModel').value,
       opusContext1mEnabled: document.getElementById('appSettingsOpusContext1m').checked,
       thinkingEffort: document.getElementById('appSettingsThinkingEffort').value,
       // CPU Priority settings
@@ -1142,6 +1445,16 @@ Object.assign(CodemanApp.prototype, {
         niceValue: parseInt(document.getElementById('appSettingsNiceValue').value) || 10,
       },
     };
+
+    // The "Token Count" / "Show Cost ($)" header toggles were removed from the
+    // UI, but their features still read settings.showTokenCount / settings.showCost
+    // (applyHeaderVisibilitySettings, the header cost render). saveAppSettings
+    // rebuilds `settings` fresh from the DOM (a full replacement, not a merge), so
+    // without this these keys would be DROPPED on every save and fall back to their
+    // defaults — silently re-enabling the token chip for anyone who'd turned it off,
+    // with no UI left to turn it back off. Preserve the prior stored preference.
+    if (_prev.showTokenCount !== undefined) settings.showTokenCount = _prev.showTokenCount;
+    if (_prev.showCost !== undefined) settings.showCost = _prev.showCost;
 
     // Save to localStorage
     this.saveAppSettingsToStorage(settings);
@@ -1240,6 +1553,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Apply header visibility immediately
     this.applyHeaderVisibilitySettings();
+    this.applySkin();
     this.applyTabWrapSettings();
     this._updateTokensImmediate();  // Re-render token display (picks up showCost change)
     this.applyMonitorVisibility();
@@ -1252,11 +1566,42 @@ Object.assign(CodemanApp.prototype, {
     // Apply keyboard bar mode
     KeyboardAccessoryBar.setMode(settings.extendedKeyboardBar ? 'extended' : 'simple');
 
-    // Save to server (includes notification prefs for cross-browser persistence)
-    // Strip device-specific keys — localEchoEnabled/cjkInputEnabled are per-platform
-    const { localEchoEnabled: _leo, cjkInputEnabled: _cjk, extendedKeyboardBar: _ekb, ...serverSettings } = settings;
+    // Save to server (includes notification prefs for cross-browser persistence).
+    // Strip device-specific DISPLAY keys so they never sync across devices —
+    // localEcho/cjk/extendedKeyboard/skin are per-platform, and showPlanUsageLimits
+    // is per-device too (desktop can show the usage chip while mobile stays hidden).
+    // Telemetry COLLECTION is requested out-of-band via statusLineTelemetry (sent on
+    // ENABLE only, so a device with the chip OFF never strips the exporter that
+    // another device's chip depends on — see system-routes settings handler).
+    const {
+      localEchoEnabled: _leo,
+      cjkInputEnabled: _cjk,
+      extendedKeyboardBar: _ekb,
+      skin: _skin,
+      showPlanUsageLimits: _pul,
+      showAttachmentsButton: _ahb,
+      ...serverSettings
+    } = settings;
     try {
-      await this._apiPut('/api/settings', { ...serverSettings, notificationPreferences: notifPrefsToSave, voiceSettings });
+      const res = await this._apiPut('/api/settings', {
+        ...serverSettings,
+        ...(settings.showPlanUsageLimits ? { statusLineTelemetry: true } : {}),
+        notificationPreferences: notifPrefsToSave,
+        voiceSettings,
+      });
+
+      // COD-55: the server refuses an unauthenticated public tunnel with a 403 — which
+      // rejects the WHOLE settings PUT. Surface the message and revert the tunnel toggle
+      // (in the UI + localStorage) so it doesn't look enabled. Other settings persisted
+      // to localStorage above still apply locally.
+      if (settings.tunnelEnabled && (await this._handleTunnelEnableRefusal(res))) {
+        settings.tunnelEnabled = false;
+        this.saveAppSettingsToStorage(settings);
+        const cb = document.getElementById('appSettingsTunnelEnabled');
+        if (cb) cb.checked = false;
+        this.closeAppSettings();
+        return;
+      }
 
       // Save model configuration separately
       await this.saveModelConfigFromSettings();
@@ -1273,6 +1618,18 @@ Object.assign(CodemanApp.prototype, {
     }
 
     this.closeAppSettings();
+
+    // The gesture overlay is injected at page render (server reads
+    // gestureControlEnabled from settings.json), so a change only takes effect on
+    // reload. Reload when it actually changed — the server PUT above already
+    // persisted the new value.
+    if (settings.gestureControlEnabled !== _prevGestureEnabled) {
+      this.showToast(
+        settings.gestureControlEnabled ? 'Enabling gesture control — reloading…' : 'Disabling gesture control — reloading…',
+        'info'
+      );
+      setTimeout(() => location.reload(), 400);
+    }
   },
 
   // Load model configuration from server for the settings modal
@@ -1374,12 +1731,22 @@ Object.assign(CodemanApp.prototype, {
         showProjectInsights: false,
         showFileBrowser: false,
         showSubagents: false,
+        showUltracodeAgents: false,
+        ultracodeFloatingWindows: false,
+        showMultiMonitorButton: false,
+        showPlanUsageLimits: false,
+        showAttachmentsButton: false,
+        showRedrawButton: false,
+        // Input
+        gestureControlEnabled: false,
         // Feature toggles - keep tracking on even on mobile
         subagentTrackingEnabled: true,
         subagentActiveTabOnly: true, // Only show subagents for active tab
         imageWatcherEnabled: false,
         ralphTrackerEnabled: false,
         tabTwoRows: false,
+        cjkInputEnabled: false,
+        skin: 'daylight-blue',
       };
     }
     // Desktop defaults - rely on ?? operators in apply functions
@@ -1417,12 +1784,31 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // Apply the chosen skin live: sets the html[data-skin] attribute, syncs BOTH
+  // localStorage locations (the standalone 'codeman:skin' key the pre-paint head
+  // script reads + the app-settings blob field written by saveAppSettingsToStorage),
+  // updates window.__codemanSkin, and re-themes any live terminals.
+  applySkin() {
+    const settings = this.loadAppSettingsFromStorage();
+    const defaults = this.getDefaultSettings();
+    const skin = settings.skin ?? defaults.skin ?? 'daylight-blue';
+    document.documentElement.setAttribute('data-skin', skin);
+    window.__codemanSkin = skin;
+    try {
+      localStorage.setItem('codeman:skin', skin);
+    } catch (_e) {
+      /* private mode */
+    }
+    if (typeof this.applyTerminalSkin === 'function') this.applyTerminalSkin(skin);
+  },
+
   applyHeaderVisibilitySettings() {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
-    const showFontControls = settings.showFontControls ?? defaults.showFontControls ?? false;
-    const showSystemStats = settings.showSystemStats ?? defaults.showSystemStats ?? true;
-    const showTokenCount = settings.showTokenCount ?? defaults.showTokenCount ?? true;
+    const compactHeader = MobileDetection.getDeviceType() !== 'desktop';
+    const showFontControls = compactHeader ? false : (settings.showFontControls ?? defaults.showFontControls ?? false);
+    const showSystemStats = compactHeader ? false : (settings.showSystemStats ?? defaults.showSystemStats ?? true);
+    const showTokenCount = compactHeader ? false : (settings.showTokenCount ?? defaults.showTokenCount ?? true);
 
     const fontControlsEl = document.querySelector('.header-font-controls');
     const systemStatsEl = document.getElementById('headerSystemStats');
@@ -1445,13 +1831,65 @@ Object.assign(CodemanApp.prototype, {
       lifecycleBtn.style.display = showLifecycleLog ? '' : 'none';
     }
 
-    // Hide notification bell when notifications are disabled
-    const notifEnabled = this.notificationManager?.preferences?.enabled ?? true;
+    // Hide the response viewer (eye) button when setting is disabled.
+    // Marker class, not inline style — the base rule is display:inline-flex !important.
+    const showResponseViewer = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
+    const responseViewerBtn = document.querySelector('.btn-response-viewer-header');
+    if (responseViewerBtn) {
+      responseViewerBtn.classList.toggle('btn-response-viewer-header--hidden', !showResponseViewer);
+    }
+
+    // Hide the attachments (history) button when disabled. Opt-in, default OFF —
+    // marker class, base is display:inline-flex !important.
+    const showAttachmentsButton = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
+    const attachmentsBtn = document.getElementById('attachmentsHistoryBtn');
+    if (attachmentsBtn) {
+      attachmentsBtn.classList.toggle('btn-attachments-history--hidden', !showAttachmentsButton);
+    }
+
+    // Multi-monitor button — hidden by default (App Settings → Display → "Header
+    // Displays"). The server renders the correct initial state on every reload;
+    // this handles a live toggle from a settings save (no reload). Toggle the
+    // marker class (matches the server-side reveal) rather than an inline style.
+    const showMultiMonitorButton = settings.showMultiMonitorButton ?? defaults.showMultiMonitorButton ?? false;
+    const multiMonitorBtn = document.querySelector('.btn-multimonitor');
+    if (multiMonitorBtn) {
+      multiMonitorBtn.classList.toggle('btn-multimonitor--hidden', !showMultiMonitorButton);
+    }
+
+    // Ultracode/Workflow agents launcher — hidden by default; reveal when enabled.
+    // Marker class only (base is display:inline-flex !important) so it's auto-excluded
+    // from the mobile-header-buttons-policy guard.
+    const showUltracodeAgents = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    const ultracodeBtn = document.querySelector('.btn-ultracode-agents');
+    if (ultracodeBtn) {
+      ultracodeBtn.classList.toggle('btn-ultracode-agents--hidden', !showUltracodeAgents);
+    }
+
+    // Plan-usage chip — hidden by default (App Settings → Display → "Plan Usage
+    // Limits"). Server renders the initial state on reload; this handles a live
+    // toggle from a settings save. Marker class (base is display:inline-flex
+    // !important), matching the response-viewer/multimonitor pattern.
+    const showPlanUsageLimits = settings.showPlanUsageLimits ?? defaults.showPlanUsageLimits ?? false;
+    const planUsageChip = document.getElementById('planUsageChip');
+    if (planUsageChip) {
+      planUsageChip.classList.toggle('header-plan-usage--hidden', !showPlanUsageLimits);
+    }
+
+    const showRedrawButton = settings.showRedrawButton ?? defaults.showRedrawButton ?? false;
+    const redrawBtn = document.querySelector('.btn-redraw-terminal');
+    if (redrawBtn) {
+      redrawBtn.classList.toggle('btn-redraw-terminal--hidden', !showRedrawButton);
+    }
+
+    // Notification bell is retired (notifications live in Settings → Notifications
+    // + the drawer); keep it hidden regardless of the notification-enabled state.
     const notifBtn = document.querySelector('.btn-notifications');
     if (notifBtn) {
-      notifBtn.style.display = notifEnabled ? '' : 'none';
+      notifBtn.style.display = 'none';
     }
     // Close the drawer if notifications got disabled while it's open
+    const notifEnabled = this.notificationManager?.preferences?.enabled ?? true;
     if (!notifEnabled) {
       const drawer = document.getElementById('notifDrawer');
       if (drawer) drawer.classList.remove('open');
@@ -1482,7 +1920,7 @@ Object.assign(CodemanApp.prototype, {
   applyMonitorVisibility() {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
-    const showMonitor = settings.showMonitor ?? defaults.showMonitor ?? true;
+    const showMonitor = settings.showMonitor ?? defaults.showMonitor ?? false;
     const showSubagents = settings.showSubagents ?? defaults.showSubagents ?? false;
     const showFileBrowser = settings.showFileBrowser ?? defaults.showFileBrowser ?? false;
 
@@ -1503,6 +1941,27 @@ Object.assign(CodemanApp.prototype, {
       } else {
         subagentsPanel.classList.add('hidden');
       }
+    }
+
+    // Ultracode agents panel visibility (SYNCED setting — not in displayKeys)
+    const showUltracodeAgents = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    const ultracodePanel = document.getElementById('ultracodeAgentsPanel');
+    if (ultracodePanel) {
+      if (showUltracodeAgents) {
+        ultracodePanel.classList.remove('hidden');
+      } else {
+        ultracodePanel.classList.remove('open');
+        ultracodePanel.classList.add('hidden');
+      }
+    }
+    // Floating ultracode run windows have their OWN opt-in (default OFF), independent of the
+    // docked panel above: pop active runs when enabled, tear them all down when disabled
+    // (additional layer — ultracode-windows.js).
+    const ultracodeFloatingWindows = settings.ultracodeFloatingWindows ?? defaults.ultracodeFloatingWindows ?? false;
+    if (ultracodeFloatingWindows) {
+      if (typeof this.syncAllUltracodeFloatingWindows === 'function') this.syncAllUltracodeFloatingWindows();
+    } else if (typeof this.removeAllUltracodeWindows === 'function') {
+      this.removeAllUltracodeWindows();
     }
 
     // File browser panel visibility
@@ -1626,8 +2085,27 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async loadAppSettingsFromServer(settingsPromise = null) {
+    // One-time migration: showPlanUsageLimits became a per-device display setting.
+    // Before this, it synced from the server, so the (separate) mobile settings blob
+    // may carry a stale `true` the user never enabled on this device. Clear it once
+    // so mobile defaults to OFF; the desktop blob is untouched and keeps its value.
     try {
-      const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null);
+      if (
+        MobileDetection.getDeviceType() === 'mobile' &&
+        !localStorage.getItem('codeman:planUsagePerDeviceMigrated')
+      ) {
+        const s = this.loadAppSettingsFromStorage();
+        if (s && s.showPlanUsageLimits) {
+          s.showPlanUsageLimits = false;
+          this.saveAppSettingsToStorage(s);
+        }
+        localStorage.setItem('codeman:planUsagePerDeviceMigrated', '1');
+      }
+    } catch {
+      /* best-effort migration */
+    }
+    try {
+      const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null).then(env => env?.success === true ? env.data : env);
       if (settings) {
         // Extract notification prefs before merging app settings
         const { notificationPreferences, voiceSettings, respawnPresets, runMode, ...appSettings } = settings;
@@ -1637,9 +2115,17 @@ Object.assign(CodemanApp.prototype, {
         // are NOT display keys — they control server-side behavior and must sync from server.
         const displayKeys = new Set([
           'showFontControls', 'showSystemStats', 'showTokenCount', 'showCost',
+          'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
           'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
           'subagentActiveTabOnly', 'tabTwoRows', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
+          'skin', 'showPlanUsageLimits', 'showAttachmentsButton',
         ]);
+        // The plan-usage chip is a PER-DEVICE display setting (default OFF): desktop
+        // can show it while mobile stays hidden. It used to sync, so an older
+        // server.json may still carry `true` — drop it so the server value is NEVER
+        // seeded into a device that didn't explicitly enable it (collection is handled
+        // separately via the statusLineTelemetry action, not this display flag).
+        delete appSettings.showPlanUsageLimits;
         // Merge settings: non-display keys always sync from server,
         // display keys only seed from server when localStorage has no value
         // (prevents cross-device overwrite while fixing settings re-enabling on fresh loads)
@@ -1719,7 +2205,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch('/api/subagent-window-states');
       if (res.ok) {
-        states = await res.json();
+        const env = await res.json();
+        states = env?.success === true ? env.data : env;
         // Also update localStorage
         localStorage.setItem('codeman-subagent-window-states', JSON.stringify(states));
       }
@@ -1786,7 +2273,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch('/api/subagent-parents');
       if (res.ok) {
-        mapData = await res.json();
+        const env = await res.json();
+        mapData = env?.success === true ? env.data : env;
         // Update localStorage as cache
         localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
       }

@@ -88,10 +88,10 @@ async function createSession(baseUrl: string): Promise<string> {
     body: JSON.stringify({ workingDir: '/tmp' }),
   });
   const data = await res.json();
-  if (!data.session?.id) {
+  if (!data.data?.session?.id) {
     throw new Error(`Failed to create session: ${JSON.stringify(data)}`);
   }
-  return data.session.id;
+  return data.data.session.id;
 }
 
 // Helper to delete a session
@@ -392,9 +392,9 @@ describe('Operation Lightspeed', () => {
 
       expect(res.status).toBe(200);
       // terminalBuffer may be empty for a fresh session, but field should exist
-      expect(data).toHaveProperty('terminalBuffer');
-      expect(data).toHaveProperty('truncated');
-      expect(data.truncated).toBe(false);
+      expect(data.data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('truncated');
+      expect(data.data.truncated).toBe(false);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -407,7 +407,7 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -431,7 +431,7 @@ describe('Operation Lightspeed', () => {
 
       // All should succeed
       for (const data of results) {
-        expect(data).toHaveProperty('terminalBuffer');
+        expect(data.data).toHaveProperty('terminalBuffer');
       }
 
       // Cleanup
@@ -692,7 +692,8 @@ describe('Operation Lightspeed', () => {
       const sessionId = await createSession(baseUrl);
 
       const res = await fetch(`${baseUrl}/api/sessions`);
-      const sessions = await res.json();
+      const body = await res.json();
+      const sessions = body.data;
 
       expect(Array.isArray(sessions)).toBe(true);
       const session = sessions.find((s: any) => s.id === sessionId);
@@ -718,7 +719,8 @@ describe('Operation Lightspeed', () => {
       await new Promise((resolve) => setTimeout(resolve, 1100));
 
       const res = await fetch(`${baseUrl}/api/sessions`);
-      const sessions = await res.json();
+      const body = await res.json();
+      const sessions = body.data;
 
       // All 3 should be present in the response
       const foundIds = sessions.map((s: any) => s.id);
@@ -911,10 +913,10 @@ describe('Operation Lightspeed', () => {
 
       expect(res.status).toBe(200);
       // Local echo overlay needs session status to know when to show/hide
-      expect(data).toHaveProperty('status');
-      expect(typeof data.status).toBe('string');
+      expect(data.data).toHaveProperty('status');
+      expect(typeof data.data.status).toBe('string');
       // Fresh session starts as 'starting'
-      expect(['starting', 'running', 'idle', 'error']).toContain(data.status);
+      expect(['starting', 'running', 'idle', 'error']).toContain(data.data.status);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -926,9 +928,9 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('fullSize');
-      expect(typeof data.fullSize).toBe('number');
-      expect(data.fullSize).toBeGreaterThanOrEqual(0);
+      expect(data.data).toHaveProperty('fullSize');
+      expect(typeof data.data.fullSize).toBe('number');
+      expect(data.data.fullSize).toBeGreaterThanOrEqual(0);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -942,9 +944,9 @@ describe('Operation Lightspeed', () => {
       ]);
 
       // tail=0 means "don't tail" — should return same as no tail param
-      expect(fullRes.truncated).toBe(false);
-      expect(tailZeroRes.truncated).toBe(false);
-      expect(fullRes.terminalBuffer).toBe(tailZeroRes.terminalBuffer);
+      expect(fullRes.data.truncated).toBe(false);
+      expect(tailZeroRes.data.truncated).toBe(false);
+      expect(fullRes.data.terminalBuffer).toBe(tailZeroRes.data.terminalBuffer);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -957,8 +959,8 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
-      expect(data.truncated).toBe(false); // Can't truncate if tail > fullSize
+      expect(data.data).toHaveProperty('terminalBuffer');
+      expect(data.data.truncated).toBe(false); // Can't truncate if tail > fullSize
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -971,7 +973,7 @@ describe('Operation Lightspeed', () => {
 
       // Should handle gracefully (either return full buffer or error cleanly)
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -984,7 +986,7 @@ describe('Operation Lightspeed', () => {
 
       // NaN tail should be handled (parseInt('abc') = NaN, which is falsy)
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -1235,7 +1237,7 @@ describe('Operation Lightspeed', () => {
         )
       );
 
-      const ids = results.map((r) => r.session.id);
+      const ids = results.map((r) => r.data.session.id);
       expect(ids.length).toBe(5);
       expect(new Set(ids).size).toBe(5); // All unique
 
@@ -1256,7 +1258,7 @@ describe('Operation Lightspeed', () => {
       await Promise.all(ids.map((id) => deleteSession(baseUrl, id)));
     });
 
-    it('should correctly filter SSE under concurrent session lifecycle', async () => {
+    it('should broadcast lifecycle events while filtering concurrent session terminal streams', async () => {
       // Create 2 sessions
       const target = await createSession(baseUrl);
       const other = await createSession(baseUrl);
@@ -1309,15 +1311,21 @@ describe('Operation Lightspeed', () => {
 
       const events = parseSSEEvents(receivedData);
 
-      // Should see target's rename but not other's events
-      const targetUpdated = events.find((e) => e.event === 'session:updated' && (e.data as any).id === target);
+      // session:updated is a lifecycle event broadcast to all clients; the
+      // subscription filter applies only to high-volume terminal streams.
+      const updatedEvents = events.filter((e) => e.event === 'session:updated');
+      const targetUpdated = updatedEvents.find((e) => (e.data as any).id === target);
       expect(targetUpdated).toBeDefined();
 
-      // Should NOT see other's events
-      const otherEvents = events.filter(
-        (e) => ((e.data as any)?.id === other || (e.data as any)?.sessionId === other) && e.event !== 'init'
+      const otherLifecycleEvents = events.filter(
+        (e) => e.event !== 'init' && e.event !== 'session:terminal' && (e.data as any)?.id === other
       );
-      expect(otherEvents.length).toBe(0);
+      expect(otherLifecycleEvents.length).toBeGreaterThan(0);
+
+      const otherTerminalEvents = events.filter(
+        (e) => e.event === 'session:terminal' && (e.data as any)?.sessionId === other
+      );
+      expect(otherTerminalEvents.length).toBe(0);
 
       await deleteSession(baseUrl, target);
     });

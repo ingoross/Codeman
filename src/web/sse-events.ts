@@ -5,7 +5,7 @@
  * and referenced by the frontend (`SSE_EVENTS` in `constants.js`).
  * Both files MUST be kept in sync.
  *
- * ~117 event constants organized by category:
+ * 120 event constants organized by category:
  * - **Core** (1): init
  * - **Session lifecycle** (17): created, updated, deleted, terminal, idle, working, ...
  * - **Session: Ralph** (6): ralphLoopUpdate, todoUpdate, completionDetected, ...
@@ -13,8 +13,9 @@
  * - **Session: Plan** (4): planTaskUpdate, planCheckpoint, planRollback, planTaskAdded
  * - **Tasks** (4): created, completed, failed, updated
  * - **Mux** (4): created, killed, died, statsUpdated
- * - **Respawn** (17): stateChanged, cycleStarted, aiCheck*, timer*, log, ...
+ * - **Respawn** (24): stateChanged, cycleStarted/Completed, step*, aiCheck*, planCheck*, timer*, log, ...
  * - **Subagents** (7): discovered, updated, tool_call, tool_result, progress, message, completed
+ * - **Workflow runs** (3): run_discovered, run_updated, run_removed (ultracode / Workflow tool)
  * - **Scheduled** (6): created, updated, completed, stopped, log, deleted
  * - **Teams** (4): created, updated, removed, taskUpdated
  * - **Transcript** (4): complete, plan_mode, tool_start, tool_end
@@ -22,7 +23,9 @@
  * - **Tunnel** (7): started, stopped, progress, error, qrRotated, qrRegenerated, qrAuthUsed
  * - **Image** (1): detected
  * - **Hooks** (6): idle_prompt, permission_prompt, elicitation_dialog, stop, teammate_idle, task_completed
- * - **Cases** (2): created, linked
+ * - **Orchestrator** (12): stateChanged, planProgress, planReady, phase*, verification, task*, completed, error
+ * - **Clipboard** (1): write
+ * - **Cases** (4): created, linked, deleted, order-changed
  *
  * Naming convention: `domain:action` (e.g., `session:created`, `respawn:stateChanged`)
  *
@@ -71,6 +74,12 @@ export const SessionWorking = 'session:working' as const;
 export const SessionAutoClear = 'session:autoClear' as const;
 /** Auto-compact triggered for the session. */
 export const SessionAutoCompact = 'session:autoCompact' as const;
+/** Usage-limit pause detected; auto-resume scheduled. */
+export const SessionLimitPauseScheduled = 'session:limitPauseScheduled' as const;
+/** Auto-resume prompt sent after a usage-limit reset. */
+export const SessionLimitResume = 'session:limitResume' as const;
+/** Pending usage-limit auto-resume cancelled (session resumed or feature disabled). */
+export const SessionLimitResumeCancelled = 'session:limitResumeCancelled' as const;
 /** CLI version/model info detected from session output. */
 export const SessionCliInfo = 'session:cliInfo' as const;
 /** General session message (e.g. status text). */
@@ -79,6 +88,8 @@ export const SessionMessage = 'session:message' as const;
 export const SessionInteractive = 'session:interactive' as const;
 /** Prompt sent to session for execution. */
 export const SessionRunning = 'session:running' as const;
+/** Claude plan-usage telemetry (5-hour + weekly limits) parsed from the statusline. */
+export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 
 // ─── Session: Ralph ──────────────────────────────────────────────────────────
 
@@ -205,6 +216,15 @@ export const SubagentMessage = 'subagent:message' as const;
 /** Subagent finished. */
 export const SubagentCompleted = 'subagent:completed' as const;
 
+// ─── Workflow Runs (ultracode / Workflow tool) ───────────────────────────────
+
+/** A workflow run was discovered (first time seen). Payload: WorkflowRunInfo. */
+export const WorkflowRunDiscovered = 'workflow:run_discovered' as const;
+/** A workflow run changed (agent state/token tick). Payload: WorkflowRunInfo. */
+export const WorkflowRunUpdated = 'workflow:run_updated' as const;
+/** A workflow run's file disappeared. Payload: { runId: string }. */
+export const WorkflowRunRemoved = 'workflow:run_removed' as const;
+
 // ─── Scheduled Runs ──────────────────────────────────────────────────────────
 
 /** Scheduled run created. */
@@ -276,6 +296,8 @@ export const TunnelQrAuthUsed = 'tunnel:qrAuthUsed' as const;
 
 /** New image file detected (e.g. screenshot upload). */
 export const ImageDetected = 'image:detected' as const;
+/** New document/image attachment detected in a session working directory. */
+export const AttachmentDetected = 'attachment:detected' as const;
 
 // ─── Hooks ───────────────────────────────────────────────────────────────────
 
@@ -359,10 +381,14 @@ export const SseEvent = {
   SessionWorking,
   SessionAutoClear,
   SessionAutoCompact,
+  SessionLimitPauseScheduled,
+  SessionLimitResume,
+  SessionLimitResumeCancelled,
   SessionCliInfo,
   SessionMessage,
   SessionInteractive,
   SessionRunning,
+  SessionStatusTelemetry,
 
   // Session: Ralph
   SessionRalphLoopUpdate,
@@ -430,6 +456,11 @@ export const SseEvent = {
   SubagentMessage,
   SubagentCompleted,
 
+  // Workflow runs (ultracode)
+  WorkflowRunDiscovered,
+  WorkflowRunUpdated,
+  WorkflowRunRemoved,
+
   // Scheduled runs
   ScheduledCreated,
   ScheduledUpdated,
@@ -468,6 +499,7 @@ export const SseEvent = {
 
   // Image
   ImageDetected,
+  AttachmentDetected,
 
   // Hooks
   HookIdlePrompt,

@@ -252,6 +252,7 @@ if (isGlobalInstall) {
         const require = createRequire(import.meta.url);
         const xtermDir = join(require.resolve('@xterm/xterm'), '..', '..');
         const fitDir = join(require.resolve('@xterm/addon-fit'), '..', '..');
+        const serializeDir = join(require.resolve('@xterm/addon-serialize'), '..', '..');
         const webglDir = join(require.resolve('@xterm/addon-webgl'), '..', '..');
         const unicode11Dir = join(require.resolve('@xterm/addon-unicode11'), '..', '..');
         const vendorDir = join(srcDir, 'web', 'public', 'vendor');
@@ -264,12 +265,14 @@ if (isGlobalInstall) {
         try {
             execSync(`npx esbuild "${join(xtermDir, 'lib', 'xterm.js')}" --minify --outfile="${join(vendorDir, 'xterm.min.js')}"`, { stdio: 'pipe' });
             execSync(`npx esbuild "${join(fitDir, 'lib', 'addon-fit.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-fit.min.js')}"`, { stdio: 'pipe' });
+            execSync(`npx esbuild "${join(serializeDir, 'lib', 'addon-serialize.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-serialize.min.js')}"`, { stdio: 'pipe' });
             execSync(`npx esbuild "${join(unicode11Dir, 'lib', 'addon-unicode11.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-unicode11.min.js')}"`, { stdio: 'pipe' });
             console.log(colors.green('✓ xterm vendor files copied to src/web/public/vendor/'));
         } catch {
             // Fallback: copy unminified
             copyFileSync(join(xtermDir, 'lib', 'xterm.js'), join(vendorDir, 'xterm.min.js'));
             copyFileSync(join(fitDir, 'lib', 'addon-fit.js'), join(vendorDir, 'xterm-addon-fit.min.js'));
+            copyFileSync(join(serializeDir, 'lib', 'addon-serialize.js'), join(vendorDir, 'xterm-addon-serialize.min.js'));
             copyFileSync(join(unicode11Dir, 'lib', 'addon-unicode11.js'), join(vendorDir, 'xterm-addon-unicode11.min.js'));
             console.log(colors.green('✓ xterm vendor files copied') + colors.dim(' (unminified — esbuild not available)'));
         }
@@ -309,6 +312,20 @@ if (isGlobalInstall) {
         console.log(colors.yellow('⚠ Failed to copy xterm vendor files'));
         console.log(colors.dim(`  ${err.message}`));
         console.log(colors.dim('  Dev server may fail to load xterm.js — run: npm run build'));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 4b. Fetch gesture-overlay runtime assets (MediaPipe wasm + model) for dev mode
+//     (src/web/public/gesture/). Opt-in feature (CODEMAN_GESTURE=1); non-fatal.
+//     Large binaries kept out of git; the build copies them into dist/.
+// ----------------------------------------------------------------------------
+
+if (!isGlobalInstall) {
+    try {
+        execSync(`node "${join(import.meta.dirname, 'fetch-gesture-assets.mjs')}"`, { stdio: 'inherit' });
+    } catch {
+        // Non-fatal — the gesture overlay is opt-in.
     }
 }
 
@@ -446,3 +463,16 @@ if (process.env.CI || process.env.CODEMAN_NO_AUTOSTART) {
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Security note — printed on every install path
+// ----------------------------------------------------------------------------
+
+console.log(colors.bold('Security:'));
+console.log(colors.dim('  Codeman binds ') + colors.cyan('127.0.0.1') + colors.dim(' (this machine only) — no password needed by default.'));
+console.log(colors.dim('  To reach it from another device, do ONE of:'));
+console.log(colors.dim('    • ') + colors.cyan('tailscale serve') + colors.dim(' / ') + colors.cyan('cloudflared tunnel') + colors.dim('   (recommended), or'));
+console.log(colors.dim('    • ') + colors.cyan('codeman web --host 0.0.0.0') + colors.dim('  AND set ') + colors.cyan('CODEMAN_PASSWORD'));
+console.log(colors.dim('  A non-loopback bind without a password still starts, but warns loudly.'));
+console.log(colors.dim('  Details: docs/security-architecture.md'));
+console.log('');

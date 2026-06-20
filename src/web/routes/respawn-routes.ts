@@ -11,6 +11,7 @@ import { SseEvent } from '../sse-events.js';
 import { findSessionOrFail, autoConfigureRalph, parseBody } from '../route-helpers.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
+import { isExternalCliMode } from '../../session.js';
 import {
   AI_CHECK_MODEL,
   AI_IDLE_CHECK_MAX_CONTEXT,
@@ -62,16 +63,16 @@ export function registerRespawnRoutes(
     const controller = ctx.respawnControllers.get(id);
 
     if (controller) {
-      return { success: true, config: controller.getConfig(), active: true };
+      return { config: controller.getConfig(), active: true };
     }
 
     // Return pre-saved config from mux-sessions.json
     const preConfig = ctx.mux.getSession(id)?.respawnConfig;
     if (preConfig) {
-      return { success: true, config: preConfig, active: false };
+      return { config: preConfig, active: false };
     }
 
-    return { success: true, config: null, active: false };
+    return { config: null, active: false };
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -88,9 +89,9 @@ export function registerRespawnRoutes(
     }
     const session = findSessionOrFail(ctx, id);
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     // Create or get existing controller
@@ -114,7 +115,7 @@ export function registerRespawnRoutes(
 
     ctx.broadcast(SseEvent.RespawnStarted, { sessionId: id, status: controller.getStatus() });
 
-    return { success: true, status: controller.getStatus() };
+    return { status: controller.getStatus() };
   });
 
   // ========== Stop Respawn ==========
@@ -150,7 +151,7 @@ export function registerRespawnRoutes(
 
     ctx.broadcast(SseEvent.RespawnStopped, { sessionId: id });
 
-    return { success: true };
+    return {};
   });
 
   // ========== Update Respawn Config ==========
@@ -169,7 +170,7 @@ export function registerRespawnRoutes(
       ctx.saveRespawnConfig(id, controller.getConfig());
       ctx.persistSessionState(session);
       ctx.broadcast(SseEvent.RespawnConfigUpdated, { sessionId: id, config: controller.getConfig() });
-      return { success: true, config: controller.getConfig() };
+      return { config: controller.getConfig() };
     }
 
     // No controller running - save as pre-config for when respawn starts
@@ -206,7 +207,7 @@ export function registerRespawnRoutes(
     ctx.mux.updateRespawnConfig(id, merged);
     ctx.persistSessionState(session);
     ctx.broadcast(SseEvent.RespawnConfigUpdated, { sessionId: id, config: merged });
-    return { success: true, config: merged };
+    return { config: merged };
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -231,9 +232,9 @@ export function registerRespawnRoutes(
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
     }
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     try {
@@ -296,9 +297,9 @@ export function registerRespawnRoutes(
     const body = reResult.data as { config?: Partial<RespawnConfig>; durationMinutes?: number };
     const session = findSessionOrFail(ctx, id);
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     // Check if session is running (has a PID)
@@ -332,7 +333,6 @@ export function registerRespawnRoutes(
     ctx.broadcast(SseEvent.RespawnStarted, { sessionId: id, status: controller.getStatus() });
 
     return {
-      success: true,
       message: 'Respawn enabled on existing session',
       respawnStatus: controller.getStatus(),
     };

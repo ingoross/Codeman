@@ -28,8 +28,8 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { dirname } from 'node:path';
+import { dataPath, DEFAULT_TMUX_SOCKET } from './config/instance.js';
 import {
   ProcessStats,
   PersistedRespawnConfig,
@@ -39,8 +39,11 @@ import {
   type ClaudeMode,
   type SessionMode,
   type OpenCodeConfig,
+  type CodexConfig,
+  type EffortLevel,
 } from './types.js';
-import { wrapWithNice, SAFE_PATH_PATTERN, findClaudeDir, resolveOpenCodeDir } from './utils/index.js';
+import { buildEffortCliArgs } from './session-cli-builder.js';
+import { wrapWithNice, SAFE_PATH_PATTERN, findClaudeDir, resolveOpenCodeDir, resolveCodexDir } from './utils/index.js';
 import type {
   TerminalMultiplexer,
   MuxSession,
@@ -71,6 +74,9 @@ const GRACEFUL_SHUTDOWN_WAIT_MS = 100;
 /** Default stats collection interval (2 seconds) */
 const DEFAULT_STATS_INTERVAL_MS = 2000;
 
+/** Stable cwd for tmux server/pane launch; actual session cwd is reached inside the pane. */
+const TMUX_LAUNCH_CWD = '/tmp';
+
 /** Claude Code native macOS recommendation for avoiding low nofile startup failures. */
 export const CLAUDE_CODE_NOFILE_LIMIT = 2147483646;
 
@@ -90,7 +96,7 @@ export const CLAUDE_CODE_NOFILE_LIMIT = 2147483646;
 const IS_TEST_MODE = !!process.env.VITEST;
 
 /** Path to persisted mux session metadata */
-const MUX_SESSIONS_FILE = join(homedir(), '.codeman', 'mux-sessions.json');
+const MUX_SESSIONS_FILE = dataPath('mux-sessions.json');
 
 /** Regex to validate tmux session names (only allow safe characters) */
 const SAFE_MUX_NAME_PATTERN = /^codeman-[a-f0-9-]+$/;
@@ -101,8 +107,9 @@ const LEGACY_MUX_NAME_PATTERN = /^claudeman-[a-f0-9-]+$/;
 /** Regex to validate tmux pane targets (e.g., "%0", "%1", "0", "1") */
 const SAFE_PANE_TARGET_PATTERN = /^(%\d+|\d+)$/;
 
-/** Dedicated tmux socket for new Codeman-owned sessions. */
-const DEFAULT_CODEMAN_TMUX_SOCKET = 'codeman';
+/** Dedicated tmux socket for new Codeman-owned sessions (instance-scoped:
+ *  `codeman` for prod, `codeman-beta` on the beta branch). */
+const DEFAULT_CODEMAN_TMUX_SOCKET = DEFAULT_TMUX_SOCKET;
 
 /** Regex to validate tmux socket names passed to `tmux -L`. */
 const SAFE_TMUX_SOCKET_PATTERN = /^[a-zA-Z0-9_.-]+$/;
@@ -158,6 +165,285 @@ export function parsePaneList(output: string): Map<string, number> {
   return result;
 }
 
+/**
+ * Resolve a target pane id from `tmux list-panes -F '#{pane_id}:#{pane_active}'`.
+ * Prefers the active pane and falls back to the first valid pane.
+ */
+export function resolveTmuxPaneTarget(muxName: string, paneTarget?: string): string | null {
+  if (!isValidMuxName(muxName)) {
+    return null;
+  }
+  if (paneTarget === undefined || paneTarget === 'active') {
+    return muxName;
+  }
+  if (!SAFE_PANE_TARGET_PATTERN.test(paneTarget)) {
+    return null;
+  }
+  return `${muxName}.${paneTarget}`;
+}
+
+/**
+ * Pick the active pane id from `tmux list-panes -F '#{pane_id}:#{pane_active}'`
+ * output (lines like `%0:1`). Returns the pane id whose active flag is 1.
+ */
+export function resolveActivePaneTarget(output: string): string | null {
+  for (const line of output.split('\n')) {
+    const sep = line.indexOf(':');
+    if (sep === -1) continue;
+    const paneId = line.slice(0, sep).trim();
+    const active = line.slice(sep + 1).trim();
+    if (paneId && active === '1') return paneId;
+  }
+  return null;
+}
+
+type GraphemeSegmenter = {
+  segment(input: string): Iterable<{ segment: string }>;
+};
+
+const GRAPHEME_SEGMENTER: GraphemeSegmenter | null = (() => {
+  try {
+    const Segmenter = (
+      Intl as typeof Intl & {
+        Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => GraphemeSegmenter;
+      }
+    ).Segmenter;
+    return Segmenter ? new Segmenter(undefined, { granularity: 'grapheme' }) : null;
+  } catch {
+    return null;
+  }
+})();
+
+function findEscapeEnd(text: string, start: number): number {
+  const type = text[start + 1];
+  if (type === '[') {
+    for (let i = start + 2; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 0x40 && code <= 0x7e) return i;
+    }
+    return text.length - 1;
+  }
+
+  if (type === ']') {
+    for (let i = start + 2; i < text.length; i++) {
+      if (text.charCodeAt(i) === 0x07) return i;
+      if (text[i] === '\x1b' && text[i + 1] === '\\') return i + 1;
+    }
+    return text.length - 1;
+  }
+
+  if (type === 'P' || type === '^' || type === '_' || type === 'X') {
+    for (let i = start + 2; i < text.length; i++) {
+      if (text.charCodeAt(i) === 0x07) return i;
+      if (text[i] === '\x1b' && text[i + 1] === '\\') return i + 1;
+    }
+    return text.length - 1;
+  }
+
+  return Math.min(start + 1, text.length - 1);
+}
+
+function sanitizePaneLineStyles(line: string): string {
+  let result = '';
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== '\x1b') {
+      result += line[i];
+      continue;
+    }
+
+    const end = findEscapeEnd(line, i);
+    const sequence = line.slice(i, end + 1);
+    if (isSgrSequence(sequence)) {
+      result += sequence;
+    }
+    i = end;
+  }
+  return result;
+}
+
+function isSgrSequence(sequence: string): boolean {
+  return (
+    sequence.length >= 3 &&
+    sequence.charCodeAt(0) === 27 &&
+    sequence[1] === '[' &&
+    sequence.endsWith('m') &&
+    /^[0-9;:]*$/.test(sequence.slice(2, -1))
+  );
+}
+
+function isZeroWidthCodePoint(codePoint: number): boolean {
+  return (
+    codePoint === 0x00ad ||
+    codePoint === 0x034f ||
+    codePoint === 0x061c ||
+    codePoint === 0x115f ||
+    codePoint === 0x1160 ||
+    codePoint === 0x17b4 ||
+    codePoint === 0x17b5 ||
+    codePoint === 0x180e ||
+    codePoint === 0x200b ||
+    codePoint === 0x200c ||
+    codePoint === 0x200d ||
+    codePoint === 0x2060 ||
+    codePoint === 0xfeff ||
+    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
+    (codePoint >= 0x0483 && codePoint <= 0x0489) ||
+    (codePoint >= 0x0591 && codePoint <= 0x05bd) ||
+    codePoint === 0x05bf ||
+    (codePoint >= 0x05c1 && codePoint <= 0x05c2) ||
+    (codePoint >= 0x05c4 && codePoint <= 0x05c5) ||
+    codePoint === 0x05c7 ||
+    (codePoint >= 0x0610 && codePoint <= 0x061a) ||
+    (codePoint >= 0x064b && codePoint <= 0x065f) ||
+    codePoint === 0x0670 ||
+    (codePoint >= 0x06d6 && codePoint <= 0x06dc) ||
+    (codePoint >= 0x06df && codePoint <= 0x06e4) ||
+    (codePoint >= 0x06e7 && codePoint <= 0x06e8) ||
+    (codePoint >= 0x06ea && codePoint <= 0x06ed) ||
+    codePoint === 0x0711 ||
+    (codePoint >= 0x0730 && codePoint <= 0x074a) ||
+    (codePoint >= 0x07a6 && codePoint <= 0x07b0) ||
+    (codePoint >= 0x07eb && codePoint <= 0x07f3) ||
+    (codePoint >= 0x0816 && codePoint <= 0x0819) ||
+    (codePoint >= 0x081b && codePoint <= 0x0823) ||
+    (codePoint >= 0x0825 && codePoint <= 0x0827) ||
+    (codePoint >= 0x0829 && codePoint <= 0x082d) ||
+    (codePoint >= 0x0859 && codePoint <= 0x085b) ||
+    (codePoint >= 0x08d3 && codePoint <= 0x08e1) ||
+    (codePoint >= 0x08e3 && codePoint <= 0x0902) ||
+    (codePoint >= 0x093a && codePoint <= 0x093c) ||
+    codePoint === 0x094d ||
+    (codePoint >= 0x0951 && codePoint <= 0x0957) ||
+    (codePoint >= 0x0962 && codePoint <= 0x0963) ||
+    (codePoint >= 0x1ab0 && codePoint <= 0x1aff) ||
+    (codePoint >= 0x1dc0 && codePoint <= 0x1dff) ||
+    (codePoint >= 0x20d0 && codePoint <= 0x20ff) ||
+    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+    (codePoint >= 0xfe20 && codePoint <= 0xfe2f) ||
+    (codePoint >= 0xe0100 && codePoint <= 0xe01ef)
+  );
+}
+
+function isWideCodePoint(codePoint: number): boolean {
+  return (
+    codePoint >= 0x1100 &&
+    (codePoint <= 0x115f ||
+      codePoint === 0x2329 ||
+      codePoint === 0x232a ||
+      (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
+      (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+      (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+      (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+      (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+      (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+      (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+      (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
+      (codePoint >= 0x20000 && codePoint <= 0x3fffd))
+  );
+}
+
+function nextGrapheme(text: string, start: number): { value: string; nextIndex: number } {
+  if (GRAPHEME_SEGMENTER) {
+    const iterator = GRAPHEME_SEGMENTER.segment(text.slice(start))[Symbol.iterator]();
+    const next = iterator.next();
+    if (!next.done && next.value.segment) {
+      return { value: next.value.segment, nextIndex: start + next.value.segment.length };
+    }
+  }
+
+  const first = text.codePointAt(start);
+  if (first === undefined) return { value: '', nextIndex: start + 1 };
+  let value = String.fromCodePoint(first);
+  let nextIndex = start + value.length;
+  while (nextIndex < text.length) {
+    const codePoint = text.codePointAt(nextIndex);
+    if (codePoint === undefined || !isZeroWidthCodePoint(codePoint)) break;
+    const mark = String.fromCodePoint(codePoint);
+    value += mark;
+    nextIndex += mark.length;
+  }
+  return { value, nextIndex };
+}
+
+function terminalCellWidth(grapheme: string): number {
+  let hasVisible = false;
+  let hasWide = false;
+  for (let i = 0; i < grapheme.length; i++) {
+    const codePoint = grapheme.codePointAt(i);
+    if (codePoint === undefined) continue;
+    if (codePoint > 0xffff) i++;
+    if (isZeroWidthCodePoint(codePoint) || codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) {
+      continue;
+    }
+    hasVisible = true;
+    if (isWideCodePoint(codePoint)) hasWide = true;
+  }
+  if (!hasVisible) return 0;
+  return hasWide ? 2 : 1;
+}
+
+function truncatePaneLineByVisibleColumns(line: string, maxColumns: number): string {
+  let result = '';
+  let visibleColumns = 0;
+  let sawSgr = false;
+
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '\x1b') {
+      const end = findEscapeEnd(line, i);
+      const sequence = line.slice(i, end + 1);
+      if (isSgrSequence(sequence)) {
+        result += sequence;
+        sawSgr = true;
+      }
+      i = end;
+      continue;
+    }
+
+    const grapheme = nextGrapheme(line, i);
+    const width = terminalCellWidth(grapheme.value);
+    if (width === 0) {
+      result += grapheme.value;
+    } else if (visibleColumns + width <= maxColumns) {
+      result += grapheme.value;
+      visibleColumns += width;
+    } else {
+      break;
+    }
+    i = grapheme.nextIndex - 1;
+    if (visibleColumns >= maxColumns) {
+      continue;
+    }
+  }
+
+  if (sawSgr) {
+    result += '\x1b[0m';
+  }
+  return result;
+}
+
+export function formatPaneSnapshot(
+  lines: string[],
+  geometry: { cols: number; rows: number; cursorX: number; cursorY: number }
+): string {
+  const cols = Math.max(1, geometry.cols);
+  // Paint the full pane width. Earlier this dropped the rightmost column
+  // (cols - 1) out of caution about last-column autowrap, but every painted
+  // row is immediately followed by an absolute cursor-position CSI (the next
+  // row's `\x1b[r;1H`, or the final cursor move), which cancels xterm's
+  // pending-wrap state before any further glyph — so the last column is safe.
+  const paintCols = cols;
+  const rows = Math.max(1, geometry.rows);
+  const parts: string[] = [];
+  for (let row = 0; row < Math.min(lines.length, rows); row++) {
+    const safeLine = truncatePaneLineByVisibleColumns(sanitizePaneLineStyles(lines[row]), paintCols);
+    parts.push(`\x1b[${row + 1};1H${safeLine}`);
+  }
+  const cursorX = Math.max(0, Math.min(cols - 1, geometry.cursorX));
+  const cursorY = Math.max(0, Math.min(rows - 1, geometry.cursorY));
+  parts.push(`\x1b[${cursorY + 1};${cursorX + 1}H`);
+  return parts.join('');
+}
+
 /** Characters unsafe in paths — shell metacharacters, quotes, and control chars */
 const UNSAFE_PATH_CHARS = /[;&|$`(){}<>'"\n\r]/;
 
@@ -167,6 +453,10 @@ const UNSAFE_PATH_CHARS = /[;&|$`(){}<>'"\n\r]/;
  */
 function isValidMuxName(name: string): boolean {
   return SAFE_MUX_NAME_PATTERN.test(name) || LEGACY_MUX_NAME_PATTERN.test(name);
+}
+
+function isValidTerminalDimension(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0 && value <= 1000;
 }
 
 /**
@@ -256,9 +546,49 @@ function buildOpenCodeCommand(config?: OpenCodeConfig): string {
 }
 
 /**
+ * Build the codex CLI command with appropriate flags.
+ *
+ * Codeman launches Codex's native TUI and handles replay/scrollback by
+ * stripping destructive terminal sequences before xterm.js sees them.
+ */
+export function buildCodexCommand(config?: CodexConfig): string {
+  const parts = ['codex'];
+
+  if (config?.dangerouslyBypassApprovals) {
+    parts.push('--dangerously-bypass-approvals-and-sandbox');
+  }
+
+  if (config?.model) {
+    const safeModel = /^[a-zA-Z0-9._\-/]+$/.test(config.model) ? config.model : undefined;
+    if (safeModel) parts.push('--model', safeModel);
+  }
+
+  if (config?.resumeSessionId) {
+    const safeId = /^[a-zA-Z0-9_-]+$/.test(config.resumeSessionId) ? config.resumeSessionId : undefined;
+    if (safeId) parts.push('resume', safeId);
+  }
+
+  return parts.join(' ');
+}
+
+/**
  * Build the spawn command for any session mode.
  * Shared by createSession() and respawnPane() to avoid duplication.
  */
+/**
+ * Build the shell fragment carrying the effort level as a SOFT default
+ * (see buildEffortCliArgs — `--effort <level>` for regular levels incl. max,
+ * `--settings '{"ultracode":true}'` for ultracode; deliberately not the
+ * CLAUDE_CODE_EFFORT_LEVEL env var, which hard-locks /effort switching).
+ *
+ * Injection-safe: effort is validated against the EFFORT_LEVELS allowlist inside
+ * buildEffortCliArgs, so the single-quoted values contain no user-controlled characters.
+ */
+function buildEffortSettingsFlag(effort?: EffortLevel): string {
+  const [flag, value] = buildEffortCliArgs(effort);
+  return flag && value ? ` ${flag} '${value}'` : '';
+}
+
 function buildSpawnCommand(options: {
   mode: SessionMode;
   sessionId: string;
@@ -266,12 +596,15 @@ function buildSpawnCommand(options: {
   claudeMode?: ClaudeMode;
   allowedTools?: string;
   openCodeConfig?: OpenCodeConfig;
+  codexConfig?: CodexConfig;
   resumeSessionId?: string;
+  effort?: EffortLevel;
 }): string {
   if (options.mode === 'claude') {
     // Validate model to prevent command injection
     const safeModel = options.model && /^[a-zA-Z0-9._\-[\]]+$/.test(options.model) ? options.model : undefined;
     const modelFlag = safeModel ? ` --model "${safeModel}"` : '';
+    const effortFlag = buildEffortSettingsFlag(options.effort);
     // Use --resume to restore a previous conversation, otherwise --session-id for new sessions.
     // Wrap --resume in a fallback: if it exits non-zero (session not found, corrupt, etc.),
     // fall back to a new session with --session-id so the pane doesn't die.
@@ -279,14 +612,17 @@ function buildSpawnCommand(options: {
       options.resumeSessionId && /^[a-f0-9-]+$/.test(options.resumeSessionId) ? options.resumeSessionId : undefined;
     const permFlags = buildClaudePermissionFlags(options.claudeMode, options.allowedTools);
     if (safeResumeId) {
-      const resumeCmd = `claude${permFlags} --resume "${safeResumeId}"${modelFlag}`;
-      const fallbackCmd = `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}`;
+      const resumeCmd = `claude${permFlags} --resume "${safeResumeId}"${modelFlag}${effortFlag}`;
+      const fallbackCmd = `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}${effortFlag}`;
       return `${resumeCmd} || ${fallbackCmd}`;
     }
-    return `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}`;
+    return `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}${effortFlag}`;
   }
   if (options.mode === 'opencode') {
     return buildOpenCodeCommand(options.openCodeConfig);
+  }
+  if (options.mode === 'codex') {
+    return buildCodexCommand(options.codexConfig);
   }
   return '$SHELL';
 }
@@ -301,6 +637,29 @@ function setOpenCodeEnvVars(tmuxCmd: string, muxName: string): void {
     const val = process.env[key];
     if (val) {
       // Shell-escape: wrap in single quotes, escape any inner single quotes
+      const escaped = val.replace(/'/g, "'\\''");
+      try {
+        execSync(`${tmuxCmd} setenv -t '${muxName}' ${key} '${escaped}'`, {
+          encoding: 'utf8',
+          timeout: EXEC_TIMEOUT_MS,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch {
+        /* Non-critical — key may not be needed */
+      }
+    }
+  }
+}
+
+/**
+ * Set sensitive environment variables for Codex on a tmux session via setenv.
+ * Codex (OpenAI CLI) needs OPENAI_API_KEY; we also forward CODEX_* keys.
+ */
+function setCodexEnvVars(tmuxCmd: string, muxName: string): void {
+  const sensitiveVars = ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_HOME'];
+  for (const key of sensitiveVars) {
+    const val = process.env[key];
+    if (val) {
       const escaped = val.replace(/'/g, "'\\''");
       try {
         execSync(`${tmuxCmd} setenv -t '${muxName}' ${key} '${escaped}'`, {
@@ -497,11 +856,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const exports = [
       'export LANG=en_US.UTF-8',
       'export LC_ALL=en_US.UTF-8',
-      'unset COLORTERM',
+      mode === 'codex' ? 'export COLORTERM=truecolor' : 'unset COLORTERM',
+      ...(mode === 'codex' ? ['unset NO_COLOR'] : []),
       'export CODEMAN_MUX=1',
       `export CODEMAN_SESSION_ID=${sessionId}`,
       `export CODEMAN_MUX_NAME=${muxName}`,
       `export CODEMAN_API_URL=${process.env.CODEMAN_API_URL || 'http://localhost:3000'}`,
+      // Path only (not the secret value): hook curl commands cat the file at
+      // execution time, so the COD-54 hook secret stays off the command line.
+      `export CODEMAN_HOOK_SECRET_FILE="${dataPath('hook-secret')}"`,
     ];
     // Only unset CLAUDECODE for Claude sessions
     if (mode === 'claude') exports.splice(2, 0, 'unset CLAUDECODE');
@@ -518,6 +881,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * shell-metachar injection even if upstream schema check is bypassed.
    */
   private applyEnvOverrides(muxName: string, envOverrides?: Record<string, string>): void {
+    // Legacy cleanup: pre-0.7.2 set CLAUDE_CODE_EFFORT_LEVEL via setenv, which persists
+    // on the tmux session and hard-locks /effort switching in every respawned pane.
+    // Effort now flows as a `--settings` soft default (see buildEffortSettingsFlag),
+    // so unconditionally unset the stale var before applying current overrides.
+    try {
+      execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} -u CLAUDE_CODE_EFFORT_LEVEL`, {
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      /* Non-critical — var may not exist */
+    }
     if (!envOverrides) return;
     const VALID_KEY = /^[A-Z_][A-Z0-9_]*$/;
     for (const [key, value] of Object.entries(envOverrides)) {
@@ -551,6 +926,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const dir = resolveOpenCodeDir();
       return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
     }
+    if (mode === 'codex') {
+      const dir = resolveCodexDir();
+      return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
+    }
     return { pathExport: '', dir: null };
   }
 
@@ -563,6 +942,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const tmuxCmd = this.tmux();
     setOpenCodeEnvVars(tmuxCmd, muxName);
     setOpenCodeConfigContent(tmuxCmd, muxName, openCodeConfig);
+  }
+
+  /**
+   * Configure Codex-specific environment on a tmux session.
+   * Sets OPENAI_API_KEY (and related keys) via tmux setenv so secrets don't
+   * appear in the bash command line.
+   */
+  private _configureCodex(muxName: string): void {
+    setCodexEnvVars(this.tmux(), muxName);
   }
 
   /**
@@ -580,8 +968,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       claudeMode,
       allowedTools,
       openCodeConfig,
+      codexConfig,
       resumeSessionId,
       envOverrides,
+      effort,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
 
@@ -627,7 +1017,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       claudeMode,
       allowedTools,
       openCodeConfig,
+      codexConfig,
       resumeSessionId,
+      effort,
     });
 
     const config = niceConfig || DEFAULT_NICE_CONFIG;
@@ -646,12 +1038,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // (Production uses systemd which has a clean env, but dev/test may be nested.)
       const cleanEnv = { ...process.env };
       delete cleanEnv.TMUX;
-      execSync(`${this.tmux()} new-session -ds "${muxName}" -c "${workingDir}"`, {
-        cwd: workingDir,
+      // Create the session on the dedicated socket (${this.tmux()} = `tmux -L <socket>`),
+      // launched in TMUX_LAUNCH_CWD (/tmp) rather than the real workingDir: a FUSE/rclone
+      // mount that isn't ready yet makes `getcwd` fail and breaks the spawn (see #110). The
+      // pane cd's into workingDir below via respawn-pane.
+      execSync(`${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}`, {
+        cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,
         stdio: 'ignore',
         env: cleanEnv,
       });
+      this.resizeWindow(muxName, 120, 40);
 
       // Set remain-on-exit now that the server is running — must be before respawn-pane
       try {
@@ -667,17 +1064,24 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // (not visible in ps output or tmux history, inherited by panes)
       if (mode === 'opencode') {
         this._configureOpenCode(muxName, openCodeConfig);
+      } else if (mode === 'codex') {
+        this._configureCodex(muxName);
       }
 
       // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
       // so secret values stay off the bash command line. Must run before respawn-pane.
       this.applyEnvOverrides(muxName, envOverrides);
 
-      // Replace the shell with the actual command (no echo in terminal)
-      execSync(`${this.tmux()} respawn-pane -k -t "${muxName}" bash -c ${JSON.stringify(fullCmd)}`, {
-        timeout: EXEC_TIMEOUT_MS,
-        stdio: 'ignore',
-      });
+      // Replace the shell with the actual command (no echo in terminal). Keep
+      // pane launch in /tmp, then cd inside bash against the current mount table.
+      const launchCmd = `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      execSync(
+        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        {
+          timeout: EXEC_TIMEOUT_MS,
+          stdio: 'ignore',
+        }
+      );
 
       // Wait for tmux session to be queryable
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
@@ -837,8 +1241,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       claudeMode,
       allowedTools,
       openCodeConfig,
+      codexConfig,
       resumeSessionId,
       envOverrides,
+      effort,
     } = options;
     const session = this.sessions.get(sessionId);
     if (!session) return null;
@@ -858,7 +1264,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       claudeMode,
       allowedTools,
       openCodeConfig,
+      codexConfig,
       resumeSessionId,
+      effort,
     });
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
@@ -868,14 +1276,20 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // For OpenCode: set sensitive env vars via tmux setenv before respawn
       if (mode === 'opencode') {
         this._configureOpenCode(muxName, openCodeConfig);
+      } else if (mode === 'codex') {
+        this._configureCodex(muxName);
       }
 
       // Re-apply user env overrides before respawn so the new shell inherits them.
       this.applyEnvOverrides(muxName, envOverrides);
 
-      await execAsync(`${this.tmux()} respawn-pane -k -t "${muxName}" bash -c ${JSON.stringify(fullCmd)}`, {
-        timeout: EXEC_TIMEOUT_MS,
-      });
+      const launchCmd = `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      await execAsync(
+        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        {
+          timeout: EXEC_TIMEOUT_MS,
+        }
+      );
       // Wait for the respawned process to start
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
       const pid = this.getPanePid(muxName);
@@ -889,6 +1303,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   private sessionExists(muxName: string): boolean {
     if (IS_TEST_MODE) return false;
+    if (!isValidMuxName(muxName)) return false;
 
     try {
       execSync(`${this.tmux()} has-session -t "${muxName}" 2>/dev/null`, {
@@ -1029,13 +1444,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
     }
 
-    // Strategy 3: Kill tmux session by name
-    try {
-      execSync(`${this.tmux()} kill-session -t "${session.muxName}" 2>/dev/null`, {
-        timeout: EXEC_TIMEOUT_MS,
-      });
-    } catch {
-      // Session may already be dead
+    // Strategy 3: Kill tmux session by name (guard the name before it reaches the shell)
+    if (isValidMuxName(session.muxName)) {
+      try {
+        execSync(`${this.tmux()} kill-session -t "${session.muxName}" 2>/dev/null`, {
+          timeout: EXEC_TIMEOUT_MS,
+        });
+      } catch {
+        // Session may already be dead
+      }
     }
 
     // Strategy 4: Direct kill by PID as final fallback
@@ -1135,6 +1552,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     for (const [sessionName, pid] of active) {
       if (!sessionName.startsWith('codeman-') && !sessionName.startsWith('claudeman-')) continue;
+      // Only admit names that pass the safe-name pattern. A foreign process on the
+      // shared `tmux -L codeman` socket could create a `codeman-…` session whose name
+      // contains shell metacharacters; rejecting it here keeps it out of this.sessions
+      // and away from the name-interpolating tmux call sites (M1).
+      if (!isValidMuxName(sessionName)) {
+        console.warn(`[TmuxManager] Skipping discovered tmux session with unsafe name: ${sessionName}`);
+        continue;
+      }
       if (knownMuxNames.has(sessionName)) continue;
 
       const fragment = sessionName.replace(/^(?:codeman|claudeman)-/, '');
@@ -1647,8 +2072,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
-   * Capture the current buffer of a specific pane.
-   * Returns the pane content with ANSI escape codes preserved.
+   * Capture the current visible text and SGR styles of a specific pane.
+   *
+   * `capture-pane -e` is sanitized by `formatPaneSnapshot`: SGR color/style
+   * codes are preserved, while cursor/erase/scroll-region controls are stripped
+   * before rows are repainted at absolute positions in browser xterm.
    */
   capturePaneBuffer(muxName: string, paneTarget: string): string | null {
     if (IS_TEST_MODE) return '';
@@ -1664,12 +2092,63 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const target = paneTarget.startsWith('%') ? `${muxName}.${paneTarget}` : `${muxName}.%${paneTarget}`;
 
     try {
-      return execSync(`${this.tmux()} capture-pane -p -e -t ${shellescape(target)} -S -5000`, {
+      const buffer = execSync(`${this.tmux()} capture-pane -p -e -t ${shellescape(target)}`, {
         encoding: 'utf-8',
         timeout: EXEC_TIMEOUT_MS,
-      });
+      }).replace(/\n+$/g, '');
+      try {
+        const cursor = execSync(
+          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height}'`,
+          {
+            encoding: 'utf-8',
+            timeout: EXEC_TIMEOUT_MS,
+          }
+        ).trim();
+        const [cursorX, cursorY, cols, rows] = cursor.split(/\s+/).map((value) => parseInt(value, 10));
+        if (
+          Number.isFinite(cursorX) &&
+          Number.isFinite(cursorY) &&
+          Number.isFinite(cols) &&
+          Number.isFinite(rows) &&
+          cursorX >= 0 &&
+          cursorY >= 0 &&
+          cols > 0 &&
+          rows > 0
+        ) {
+          return formatPaneSnapshot(buffer.split('\n'), { cols, rows, cursorX, cursorY });
+        }
+      } catch (cursorErr) {
+        console.error('[TmuxManager] Failed to query pane cursor after capture:', cursorErr);
+      }
+      return buffer;
     } catch (err) {
       console.error('[TmuxManager] Failed to capture pane buffer:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Capture the active pane for a tmux session.
+   *
+   * Pane ids are not stable across respawns or restores, so callers should not
+   * assume the first pane remains `%0`.
+   */
+  captureActivePaneBuffer(muxName: string): string | null {
+    if (IS_TEST_MODE) return '';
+    if (!isValidMuxName(muxName)) {
+      console.error('[TmuxManager] Invalid session name in captureActivePaneBuffer:', muxName);
+      return null;
+    }
+
+    try {
+      const output = execSync(`${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_id}:#{pane_active}'`, {
+        encoding: 'utf-8',
+        timeout: EXEC_TIMEOUT_MS,
+      }).trim();
+      const target = resolveActivePaneTarget(output);
+      return target ? this.capturePaneBuffer(muxName, target) : null;
+    } catch (err) {
+      console.error('[TmuxManager] Failed to resolve active pane for capture:', err);
       return null;
     }
   }
@@ -1741,6 +2220,49 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   getAttachArgs(muxName: string): string[] {
     return ['-L', this.tmuxSocket, 'attach-session', '-t', muxName];
+  }
+
+  setManualWindowSize(muxName: string): boolean {
+    if (!isValidMuxName(muxName)) {
+      console.error('[TmuxManager] Invalid session name in setManualWindowSize:', muxName);
+      return false;
+    }
+
+    try {
+      execSync(`${this.tmux()} set-window-option -t ${shellescape(muxName)} window-size manual`, {
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+      return true;
+    } catch (err) {
+      console.error('[TmuxManager] Failed to set manual window size:', err);
+      return false;
+    }
+  }
+
+  resizeWindow(muxName: string, cols: number, rows: number): boolean {
+    if (!isValidMuxName(muxName)) {
+      console.error('[TmuxManager] Invalid session name in resizeWindow:', muxName);
+      return false;
+    }
+    if (!isValidTerminalDimension(cols) || !isValidTerminalDimension(rows)) {
+      console.error('[TmuxManager] Invalid resize dimensions:', { cols, rows });
+      return false;
+    }
+
+    // Fire-and-forget: this runs on the interactive resize path (WS {t:'z'} and
+    // HTTP /resize), so use a non-blocking exec — a slow/hung tmux must not stall
+    // the Fastify event loop while other sessions' input/SSE are served. The sole
+    // caller (Session.resize) ignores the result, and under `window-size manual`
+    // the subsequent ptyProcess.resize is subordinate to this authoritative size.
+    exec(
+      `${this.tmux()} resize-window -t ${shellescape(muxName)} -x ${cols} -y ${rows}`,
+      { timeout: EXEC_TIMEOUT_MS },
+      (err) => {
+        if (err) console.error('[TmuxManager] Failed to resize tmux window:', err);
+      }
+    );
+    return true;
   }
 
   isAvailable(): boolean {

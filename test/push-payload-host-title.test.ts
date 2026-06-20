@@ -47,7 +47,8 @@ interface PushPayload {
 
 function makeServerWithHost(host: string): WebServer {
   // Constructor only assigns fields — no network/disk activity until start().
-  const server = new WebServer(0, false, true, host);
+  // 4th arg is the bind host; the title hostname is the 5th arg.
+  const server = new WebServer(0, false, true, '127.0.0.1', host);
   // Stub push store: one subscription with all events enabled.
   const fakeSub = {
     endpoint: 'https://push.example.com/abc',

@@ -14,6 +14,8 @@ import type {
   ClaudeMode,
   SessionMode,
   OpenCodeConfig,
+  CodexConfig,
+  EffortLevel,
 } from './types.js';
 
 /**
@@ -61,10 +63,13 @@ export interface CreateSessionOptions {
   claudeMode?: ClaudeMode;
   allowedTools?: string;
   openCodeConfig?: OpenCodeConfig;
+  codexConfig?: CodexConfig;
   /** When restoring after reboot, resume a previous Claude conversation by its session ID */
   resumeSessionId?: string;
-  /** Extra env vars exported before launching the CLI (e.g., CLAUDE_CODE_EFFORT_LEVEL). Ephemeral — not written to disk. */
+  /** Extra env vars exported before launching the CLI (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Ephemeral — not written to disk. */
   envOverrides?: Record<string, string>;
+  /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
+  effort?: EffortLevel;
 }
 
 /** Options for respawning a dead pane. */
@@ -77,10 +82,13 @@ export interface RespawnPaneOptions {
   claudeMode?: ClaudeMode;
   allowedTools?: string;
   openCodeConfig?: OpenCodeConfig;
+  codexConfig?: CodexConfig;
   /** Resume a previous Claude conversation when respawning */
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (preserved across respawns). */
   envOverrides?: Record<string, string>;
+  /** Claude CLI effort level (preserved across respawns, injected via `--settings`) */
+  effort?: EffortLevel;
 }
 
 /**
@@ -187,6 +195,12 @@ export interface TerminalMultiplexer extends EventEmitter {
    */
   getAttachArgs(muxName: string): string[];
 
+  /** Pin a mux window so client attaches do not automatically dictate its size. */
+  setManualWindowSize?(muxName: string): boolean;
+
+  /** Explicitly resize a mux window after Codeman accepts a terminal resize. */
+  resizeWindow?(muxName: string, cols: number, rows: number): boolean;
+
   // ========== Availability ==========
 
   /** Check if the multiplexer binary is available on the system */
@@ -200,4 +214,10 @@ export interface TerminalMultiplexer extends EventEmitter {
 
   /** Respawn a dead pane with a fresh command. Returns the new PID or null on failure. */
   respawnPane(options: RespawnPaneOptions): Promise<number | null>;
+
+  /** Capture a pane's current tmux buffer with ANSI escape codes preserved. */
+  capturePaneBuffer?(muxName: string, paneTarget: string): string | null;
+
+  /** Capture the active pane's current tmux buffer with ANSI escape codes preserved. */
+  captureActivePaneBuffer?(muxName: string): string | null;
 }

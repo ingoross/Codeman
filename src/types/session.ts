@@ -8,7 +8,7 @@
  * - SessionConfig — creation-time config (id, workingDir, createdAt)
  * - SessionOutput — captured stdout/stderr/exitCode
  * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error'
- * - SessionMode — 'claude' | 'shell' | 'opencode' (which CLI backend)
+ * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' (which CLI backend)
  * - ClaudeMode — CLI permission mode ('dangerously-skip-permissions' | 'normal' | 'allowedTools')
  * - SessionColor — visual differentiation color
  * - OpenCodeConfig — OpenCode-specific settings (model, autoAllowTools, continueSession)
@@ -25,6 +25,7 @@
  */
 
 import type { RespawnConfig } from './respawn.js';
+import type { AttachmentDetectedType } from './tools.js';
 
 /** Status of a Claude session */
 export type SessionStatus = 'idle' | 'busy' | 'stopped' | 'error';
@@ -38,7 +39,22 @@ export type SessionStatus = 'idle' | 'busy' | 'stopped' | 'error';
 export type ClaudeMode = 'dangerously-skip-permissions' | 'normal' | 'allowedTools';
 
 /** Session mode: which CLI backend a session runs */
-export type SessionMode = 'claude' | 'shell' | 'opencode';
+export type SessionMode = 'claude' | 'shell' | 'opencode' | 'codex';
+
+/**
+ * Valid Claude CLI effort levels (claude >= 2.1.154).
+ * `ultracode` = xhigh effort + standing dynamic-workflow orchestration; it is a
+ * separate `ultracode` settings key rather than an `effortLevel` value.
+ */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
+
+/** Claude CLI effort level for new sessions (soft default, switchable via /effort in-session) */
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Type guard: is the string a valid EffortLevel? */
+export function isEffortLevel(value: string | undefined): value is EffortLevel {
+  return value !== undefined && (EFFORT_LEVELS as readonly string[]).includes(value);
+}
 
 /** OpenCode session configuration */
 export interface OpenCodeConfig {
@@ -52,6 +68,21 @@ export interface OpenCodeConfig {
   forkSession?: boolean;
   /** Custom inline config JSON (passed via OPENCODE_CONFIG_CONTENT) */
   configContent?: string;
+}
+
+/** Codex (OpenAI CLI) browser rendering strategy. Hybrid TUI is the only supported mode. */
+export type CodexRenderMode = 'hybrid';
+
+/** Codex (OpenAI CLI) session configuration */
+export interface CodexConfig {
+  /** Model identifier (e.g., "gpt-5", "o4-mini"). Passed via --model. */
+  model?: string;
+  /** Resume a previous codex conversation by session id (passed via --resume) */
+  resumeSessionId?: string;
+  /** Bypass approval prompts (passes --dangerously-bypass-approvals-and-sandbox) */
+  dangerouslyBypassApprovals?: boolean;
+  /** Browser rendering strategy for Codex sessions. Hybrid TUI is the only supported mode. */
+  renderMode?: CodexRenderMode;
 }
 
 /**
@@ -70,6 +101,40 @@ export interface SessionConfig {
  * Available session colors for visual differentiation
  */
 export type SessionColor = 'default' | 'red' | 'orange' | 'yellow' | 'green' | 'blue' | 'purple' | 'pink';
+
+export type SessionAttachmentHistorySource = 'detected' | 'external';
+
+/**
+ * Session-scoped attachment history entry.
+ *
+ * `externalPath` is server-private. It may be present in the internal persisted
+ * history copy, but API-bound session state must sanitize it before returning
+ * to the browser.
+ */
+export interface SessionAttachmentHistoryItem {
+  /** Stable history identity used for dedupe and list rendering */
+  id: string;
+  /** Codeman session ID this item belongs to */
+  sessionId: string;
+  /** Display filename */
+  fileName: string;
+  /** Lowercase extension without a leading dot */
+  extension: string;
+  /** Viewer category used by the web UI */
+  attachmentType: AttachmentDetectedType;
+  /** File size in bytes */
+  size: number;
+  /** Last modified timestamp in milliseconds, if known */
+  mtimeMs: number;
+  /** Last time this attachment was seen or explicitly published */
+  timestamp: number;
+  /** How the attachment entered the session */
+  source: SessionAttachmentHistorySource;
+  /** Workspace-relative path for detected session files */
+  relativePath?: string;
+  /** Server-private absolute path for explicitly published external files */
+  externalPath?: string;
+}
 
 /**
  * Current state of a session
@@ -103,6 +168,10 @@ export interface SessionState {
   autoCompactThreshold?: number;
   /** Auto-compact prompt */
   autoCompactPrompt?: string;
+  /** Auto-resume on usage limit enabled */
+  autoResumeEnabled?: boolean;
+  /** Pending usage-limit auto-resume fire time (epoch ms), if armed */
+  autoResumeAt?: number;
   /** Image watcher enabled for this session */
   imageWatcherEnabled?: boolean;
   /** Total cost in USD */
@@ -143,8 +212,14 @@ export interface SessionState {
   cliLatestVersion?: string;
   /** OpenCode-specific configuration (only for mode === 'opencode') */
   openCodeConfig?: OpenCodeConfig;
+  /** Codex-specific configuration (only for mode === 'codex') */
+  codexConfig?: CodexConfig;
   /** Claude conversation session ID to resume after reboot (set by restore script) */
   resumeSessionId?: string;
+  /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
+  effort?: EffortLevel;
+  /** Sanitized per-session attachment history. */
+  attachmentHistory?: SessionAttachmentHistoryItem[];
 }
 
 /**

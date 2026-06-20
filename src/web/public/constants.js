@@ -10,7 +10,7 @@
  * @globals {function} scheduleBackground - scheduler.postTask wrapper (background priority)
  * @globals {function} getEventCoords - Unified mouse/touch coordinate extractor
  * @globals {function} escapeHtml - XSS-safe HTML escaping
- * @globals {object} SSE_EVENTS - Centralized SSE event type constants (~73 event types)
+ * @globals {object} SSE_EVENTS - Centralized SSE event type constants (120 event types; must match backend src/web/sse-events.ts)
  * @globals {Array} BUILTIN_RESPAWN_PRESETS - Built-in respawn configuration presets
  *
  * @dependency None (first in load order)
@@ -51,12 +51,14 @@ const GROUPING_TIMEOUT_MS = 5000;           // 5 seconds - notification grouping
 const NOTIFICATION_LIST_CAP = 100;          // Max notifications in list
 const TITLE_FLASH_INTERVAL_MS = 1500;       // Title flash rate
 const BROWSER_NOTIF_RATE_LIMIT_MS = 3000;   // Rate limit for browser notifications
+const MOBILE_RESIZE_RETRY_MS = 30000;       // Small-viewport resize re-send while a desktop sizing claim is hot
 const AUTO_CLOSE_NOTIFICATION_MS = 8000;    // Auto-close browser notifications
 const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more scrollback on tab switch)
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
+const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;
@@ -112,9 +114,24 @@ function evaluateWebGLLongTaskTrip(recent, entries, now, config = WEBGL_FALLBACK
 // Expose for tests. `const` declarations at the top of a non-module script
 // are global lexical bindings but not `window` properties, so explicit
 // assignment is the test-visible API surface.
+// Desktop tab-overflow policy: auto-wrap the session tabs to a second row when
+// they overflow one row (and the user hasn't pinned the manual two-row layout).
+function shouldAutoWrapTabs(input) {
+  if (!input || input.deviceType !== 'desktop') return false;
+  if (input.manualTwoRows) return false;
+  if ((input.tabCount || 0) < 2) return false;
+
+  const scrollWidth = Number(input.scrollWidth) || 0;
+  const clientWidth = Number(input.clientWidth) || 0;
+  return scrollWidth > clientWidth + 1;
+}
+
 if (typeof window !== 'undefined') {
   window.WEBGL_FALLBACK = WEBGL_FALLBACK;
   window.evaluateWebGLLongTaskTrip = evaluateWebGLLongTaskTrip;
+  window.CodemanTabOverflow = {
+    shouldAutoWrapTabs,
+  };
 }
 
 // Scheduler API — prioritize terminal writes over background UI updates.
@@ -241,27 +258,49 @@ const SSE_EVENTS = {
   SESSION_IDLE: 'session:idle',
   SESSION_WORKING: 'session:working',
   SESSION_AUTO_CLEAR: 'session:autoClear',
+  SESSION_AUTO_COMPACT: 'session:autoCompact',
+  SESSION_LIMIT_PAUSE_SCHEDULED: 'session:limitPauseScheduled',
+  SESSION_LIMIT_RESUME: 'session:limitResume',
+  SESSION_LIMIT_RESUME_CANCELLED: 'session:limitResumeCancelled',
   SESSION_CLI_INFO: 'session:cliInfo',
+  SESSION_MESSAGE: 'session:message',
+  SESSION_INTERACTIVE: 'session:interactive',
+  SESSION_RUNNING: 'session:running',
+  SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',
   SCHEDULED_UPDATED: 'scheduled:updated',
   SCHEDULED_COMPLETED: 'scheduled:completed',
   SCHEDULED_STOPPED: 'scheduled:stopped',
+  SCHEDULED_LOG: 'scheduled:log',
+  SCHEDULED_DELETED: 'scheduled:deleted',
 
   // Respawn
   RESPAWN_STARTED: 'respawn:started',
   RESPAWN_STOPPED: 'respawn:stopped',
   RESPAWN_STATE_CHANGED: 'respawn:stateChanged',
   RESPAWN_CYCLE_STARTED: 'respawn:cycleStarted',
+  RESPAWN_CYCLE_COMPLETED: 'respawn:cycleCompleted',
   RESPAWN_BLOCKED: 'respawn:blocked',
-  RESPAWN_AUTO_ACCEPT_SENT: 'respawn:autoAcceptSent',
+  RESPAWN_STEP_SENT: 'respawn:stepSent',
+  RESPAWN_STEP_COMPLETED: 'respawn:stepCompleted',
   RESPAWN_DETECTION_UPDATE: 'respawn:detectionUpdate',
+  RESPAWN_AUTO_ACCEPT_SENT: 'respawn:autoAcceptSent',
+  RESPAWN_AI_CHECK_STARTED: 'respawn:aiCheckStarted',
+  RESPAWN_AI_CHECK_COMPLETED: 'respawn:aiCheckCompleted',
+  RESPAWN_AI_CHECK_FAILED: 'respawn:aiCheckFailed',
+  RESPAWN_AI_CHECK_COOLDOWN: 'respawn:aiCheckCooldown',
+  RESPAWN_PLAN_CHECK_STARTED: 'respawn:planCheckStarted',
+  RESPAWN_PLAN_CHECK_COMPLETED: 'respawn:planCheckCompleted',
+  RESPAWN_PLAN_CHECK_FAILED: 'respawn:planCheckFailed',
   RESPAWN_TIMER_STARTED: 'respawn:timerStarted',
   RESPAWN_TIMER_CANCELLED: 'respawn:timerCancelled',
   RESPAWN_TIMER_COMPLETED: 'respawn:timerCompleted',
-  RESPAWN_ERROR: 'respawn:error',
   RESPAWN_ACTION_LOG: 'respawn:actionLog',
+  RESPAWN_LOG: 'respawn:log',
+  RESPAWN_ERROR: 'respawn:error',
+  RESPAWN_CONFIG_UPDATED: 'respawn:configUpdated',
 
   // Tasks
   TASK_CREATED: 'task:created',
@@ -288,6 +327,12 @@ const SSE_EVENTS = {
   SESSION_BASH_TOOL_END: 'session:bashToolEnd',
   SESSION_BASH_TOOLS_UPDATE: 'session:bashToolsUpdate',
 
+  // Session: Plan
+  SESSION_PLAN_TASK_UPDATE: 'session:planTaskUpdate',
+  SESSION_PLAN_CHECKPOINT: 'session:planCheckpoint',
+  SESSION_PLAN_ROLLBACK: 'session:planRollback',
+  SESSION_PLAN_TASK_ADDED: 'session:planTaskAdded',
+
   // Hooks (Claude Code hook events)
   HOOK_IDLE_PROMPT: 'hook:idle_prompt',
   HOOK_PERMISSION_PROMPT: 'hook:permission_prompt',
@@ -305,8 +350,14 @@ const SSE_EVENTS = {
   SUBAGENT_TOOL_RESULT: 'subagent:tool_result',
   SUBAGENT_COMPLETED: 'subagent:completed',
 
+  // Workflow runs (ultracode / Workflow tool)
+  WORKFLOW_RUN_DISCOVERED: 'workflow:run_discovered',
+  WORKFLOW_RUN_UPDATED: 'workflow:run_updated',
+  WORKFLOW_RUN_REMOVED: 'workflow:run_removed',
+
   // Images
   IMAGE_DETECTED: 'image:detected',
+  ATTACHMENT_DETECTED: 'attachment:detected',
 
   // Tunnel
   TUNNEL_STARTED: 'tunnel:started',
@@ -337,6 +388,18 @@ const SSE_EVENTS = {
   ORCHESTRATOR_TASK_FAILED: 'orchestrator:taskFailed',
   ORCHESTRATOR_COMPLETED: 'orchestrator:completed',
   ORCHESTRATOR_ERROR: 'orchestrator:error',
+
+  // Teams (agent teams)
+  TEAM_CREATED: 'team:created',
+  TEAM_UPDATED: 'team:updated',
+  TEAM_REMOVED: 'team:removed',
+  TEAM_TASK_UPDATED: 'team:taskUpdated',
+
+  // Transcript
+  TRANSCRIPT_COMPLETE: 'transcript:complete',
+  TRANSCRIPT_PLAN_MODE: 'transcript:plan_mode',
+  TRANSCRIPT_TOOL_START: 'transcript:tool_start',
+  TRANSCRIPT_TOOL_END: 'transcript:tool_end',
 
   // Clipboard
   CLIPBOARD_WRITE: 'clipboard:write',

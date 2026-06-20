@@ -1,5 +1,435 @@
 # aicodeman
 
+## 1.1.15
+
+### Patch Changes
+
+- Security: harden all frontend inline `onclick`/`ondblclick` handlers against a stored-XSS double-context bug.
+
+  Many inline handlers interpolated values as `'${escapeHtml(value)}'` — a JavaScript string literal sitting inside an HTML attribute. The browser HTML-decodes the attribute value _before_ parsing the handler source, so `escapeHtml`'s `&#39;` reverts to a literal `'` and a quote-bearing id/name/path/URL breaks out of the JS string into executable code. `escapeHtml` alone is insufficient for this JS-string-within-HTML-attribute context.
+
+  All affected handlers now use `escapeHtml(JSON.stringify(value))`: `JSON.stringify` JS-encodes and quote-wraps the value, then `escapeHtml` handles the HTML-attribute layer, so the value round-trips as a single inert string argument.
+  - ultracode run/agent cards and minimized-tab badges (`ultracode-panel.js`, `ultracode-windows.js`) — PR #132.
+  - Session tabs (click/rename/gear/detach/close), notifications, subagent windows + dropdowns, the agents/tools/log-viewer/image-popup panels, mux-session monitor rows, and case-management buttons (`app.js`, `notification-manager.js`, `subagent-windows.js`, `panels-ui.js`, `session-ui.js`).
+  - Two non-`escapeHtml` variants of the same class: a pre-escaped mux-session id in `panels-ui.js` (`selectSession`/`killMuxSession`) and a fully raw, unescaped `phase.id` in `orchestrator-panel.js` (`orchestratorSkipPhase`/`orchestratorRetryPhase`).
+
+  The most realistic exploitation vector was file paths in the project-insights log-viewer link, since filenames can legally contain a single quote. Purely numeric interpolations and developer-literal handler strings were left unchanged.
+
+## 1.1.14
+
+### Patch Changes
+
+- Ultracode (Workflow-tool) floating windows — agent transcripts in-page, and minimize-to-tab.
+  - **Agent transcripts open in-page, connected, instead of a detached browser popup.** Clicking an agent card (in a run window or the dock panel) now opens the agent's live transcript as its own draggable floating window, tied by a connector line to its parent run window (falling back to the run's session tab if that window has since closed) — the same line idiom the run windows use. Re-clicking a card focuses the existing window; closing it removes the window and its line. (Previously this spawned a separate `window.open` browser popup.)
+  - **The window "−" button now minimizes into the originating session tab**, mirroring the subagent-window idiom. The window genie-animates into its tab and is tracked there; the tab shows an `ULTRA` badge whose hover/click dropdown lists each minimized item (🧬 run windows, 📄 agent transcripts). Click an item to restore its floating window, or dismiss it with ×. A run minimized while still active keeps tracking in the background and its badge auto-clears shortly after the run finishes. Both run windows and agent-transcript windows minimize into the same merged badge.
+  - Removed the old collapse-to-header behavior that the "−" button previously triggered (now superseded by minimize-to-tab).
+
+## 1.1.13
+
+### Patch Changes
+
+- Keep the `/compact` button in the extended (full) mobile keyboard accessory bar; only the simple bar drops it. (1.1.12 had removed it from both.)
+
+## 1.1.12
+
+### Patch Changes
+
+- Remove the `/compact` button from the mobile keyboard accessory bar. It had been reintroduced in 1.1.10; this removes the button from both the simple and full accessory-bar layouts (the underlying command handler is left in place as inert plumbing).
+
+## 1.1.11
+
+### Patch Changes
+
+- Ultracode (Workflow-tool) run visualization — much better live tracking.
+
+  While a run is in flight, the watcher previously showed empty agent slots ("agent N", 0 tokens, raw `wf_…` id as the title) because the detailed completion JSON only lands when the run finishes. The live path now enriches in-flight runs directly from the on-disk transcript tree:
+  - **Real per-agent stats mid-run** — tokens and tool-call counts are parsed from each `agent-<id>.jsonl` transcript (tool counts match the final accounting exactly; token totals land within ~1% of the completion value), with model and a prompt preview. All mtime-cached (transcripts, journal, and script meta) so idle polls do no extra reads.
+  - **Readable window/run title** — workflow name, summary, and phases are derived from the persisted `workflows/scripts/<name>-<runId>.js` instead of showing the raw run id.
+  - **Agent status colors** — done agents show green, working agents show yellow (this also fixes the run/agent status badges, which referenced undefined `--success`/`--warning` CSS variables and were rendering with no color).
+  - **Connector line** — the floating-window → session-tab line now uses the session-tab accent blue (was purple).
+  - **Click a run to open its floating window** — clicking a workflow in the dock panel opens (or focuses) its floating window with the connector line, in addition to the auto-popped windows.
+  - Agents are ordered by journal launch order; concurrent run-detail fetches are de-duplicated.
+
+## 1.1.10
+
+### Patch Changes
+
+- Mobile CJK input, iPad keyboard accessory bar, and terminal touch interaction fixes (PRs #130, #131).
+
+  Mobile / CJK (#130):
+  - Restore reliable real-time CJK (e.g. Pinyin) composition in the always-visible textarea, and refocus input when the terminal is tapped.
+  - Stop clearing the textarea during `compositionstart` — some IMEs include existing text in the composition region, and clearing it mid-composition corrupted input.
+  - iPad-specific fixes: `#cjkInput` positioning, paste-dialog placement, and duplicated voice-dictation output.
+  - Split CJK keyboard positioning by device size (phones vs iPad use different keyboard offsets).
+  - iPad accessory-bar styling/positioning: moved the accessory-bar and paste-overlay base styles out of the `max-width:1023px`-gated mobile stylesheet so iPad landscape (≥1024px) renders them correctly.
+  - Raise the toolbar stacking context while the case-settings popover is open so the popover is no longer hidden behind the toolbar.
+  - Restore the `/compact` button to the keyboard accessory bar (with double-tap confirmation, like `/clear`); the paste dialog now submits pasted text on "Send".
+
+  Terminal touch + forced redraw (#131):
+  - Enable terminal touch interaction on all touch devices and show the stop button on touch devices.
+  - Add an 8px tap threshold so micro-drift is treated as a tap, not a scroll, fixing cases where a tap failed to register.
+  - Tap-to-position the cursor via a synthesized mouse report, gated on the live mouse-tracking mode so it never triggers local text selection when tracking is off; let SGR mouse reports through to the PTY even while the CJK input field owns focus.
+  - Suppress the cursor/momentum side effects of a sub-threshold tap so a jittery tap no longer both positions the cursor and starts a momentum fling.
+  - New opt-in, per-device "Redraw Terminal" header button (`showRedrawButton`, default off) that forces an xterm redraw via a resize jitter to clear occasional rendering glitches; the resize path now accepts a `force` flag (threaded through the session, HTTP, and WebSocket resize routes) that guarantees a SIGWINCH/redraw at the current device's size without bypassing multi-client resize arbitration.
+
+## 1.1.9
+
+### Patch Changes
+
+- Two welcome-screen tunnel changes:
+  - **UI (Daylight Blue skin):** the **Cloudflare Tunnel** button is now purple (was orange/yellow), keeping the three welcome buttons visually distinct — Claude blue, Tunnel purple, OpenCode green.
+  - **Enable a tunnel without `CODEMAN_PASSWORD`, with a warning.** Previously enabling the Cloudflare tunnel with no password set was hard-refused unless you set `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1`. Now you can opt in straight from the browser: clicking the tunnel toggle without a password pops a **security confirm dialog** ("publishes this machine to a public URL with no login — effectively remote code execution; set CODEMAN_PASSWORD instead"), and only on confirm does it enable, sending an explicit per-request `acknowledgeUnauthTunnel:true`. The server logs a loud warning whenever a passwordless public tunnel starts. curl/API/CLI callers are unchanged — still refused unless they set a password, set the env var, or pass `acknowledgeUnauthTunnel:true` — so nothing gets exposed accidentally. The acknowledgment is an action field and is never persisted to settings.json.
+
+## 1.1.8
+
+### Patch Changes
+
+- UI (Daylight Blue skin): give the welcome-screen action buttons distinct colors instead of all reading blue. **Run Claude Code** keeps the blue accent, **Cloudflare Tunnel** now uses Cloudflare's brand orange, and **Run OpenCode** uses an emerald green — so the three are visually distinguishable at a glance. Scoped to the default `daylight-blue` skin only (daylight-green and OG are unchanged), with matching hover/active states and dark ink for contrast. Verified in a real browser: the three buttons compute to blue / orange / green gradients on the welcome overlay.
+
+## 1.1.7
+
+### Patch Changes
+
+- Fix: terminal scroll-up (scrollback) intermittently breaking for **Claude** sessions — most visible on iPhone, where you suddenly "can't scroll up the Claude console."
+
+  Root cause: Claude Code periodically emits alternate-screen switches (`\x1b[?1049h`/`\x1b[?47h`/`\x1b[?1047h`), scrollback-erase (`\x1b[3J`), and mouse-tracking enables — typically when it draws a full-screen UI (pickers/dialogs, the boot welcome). xterm.js obeys these by moving to the scrollback-less alternate buffer (or wiping saved lines / hijacking the wheel), so the conversation history becomes unreachable until Claude returns to its normal view. Codeman already stripped these sequences so history stays scrollable, but the strip was gated to **Codex mode only** — Claude (and the equivalent buffer-replay path) let them through.
+
+  The strip is now shared via a single `isAltScreenStripMode(mode)` predicate (`codex || claude`) applied at BOTH sites that were Codex-only: the live PTY stream (`Session._handleTerminalOutput`, including the split-across-chunks carry reassembly) and the `/terminal` buffer replay used on tab-switch/reconnect. `shell` is deliberately excluded so full-screen TUIs run from a shell (vim/less/htop) keep their alternate screen; `opencode` is also unchanged.
+
+  Verified end-to-end on an isolated instance against a real Claude session: the replayed buffer and live stream now carry zero alt-screen/scrollback-erase/mouse sequences, the terminal stays in the normal buffer with scrollback intact, and touch swipe-up scrolls correctly. Covered by new unit tests (`test/claude-scrollback-strip.test.ts`); the existing Codex strip tests are unchanged.
+
+## 1.1.6
+
+### Patch Changes
+
+- Fix: ultracode floating run windows now pop on a fresh device/browser that loads while a run is already active.
+
+  `ultracodeFloatingWindows` syncs from the server (it's a non-display setting), but on a first-time device the SSE `getLightState` run snapshot can seed the run list BEFORE the async settings load resolves — so the floating-window gate read `false` at that instant and skipped any already-active run, leaving the window un-popped until the next ~10s watcher tick. The app now re-runs `syncAllUltracodeFloatingWindows()` once server settings finish loading (in the `loadAppSettingsFromServer().then()` callback), so an in-flight run pops its window immediately. Idempotent: open windows are left as-is, and if the setting is off any premature windows are torn down. Verified end-to-end against a real in-flight run on an isolated instance — a pristine browser (empty localStorage) seeds the setting from the server and pops the active run's window ~0.4s after first paint.
+
+  Also corrected a stale `@fileoverview` comment in `ultracode-windows.js` that claimed the floating windows are gated on `showUltracodeAgents`; they are gated on the dedicated `ultracodeFloatingWindows` toggle (only the docked "Ultracode Agents" panel uses `showUltracodeAgents`).
+
+## 1.1.5
+
+### Patch Changes
+
+- Fix: the Ultracode Agents panel's (×) Close button now fully hides the panel.
+
+  `closeUltracodeAgentsPanel()` only removed the `open` class, which drops the bottom-docked drawer to its collapsed _peek_ state (the 36px header strip stays visible) rather than closing it — so clicking (×) looked like it did nothing. It now also adds the `hidden` class (`display:none`), mirroring `closeSubagentsPanel()`. It deliberately does NOT flip the `showUltracodeAgents` setting (that also gates the run watcher and floating windows); the header launcher button reopens the panel. Verified in a real browser: after (×) the panel computes `display:none`.
+
+## 1.1.4
+
+### Patch Changes
+
+- Fix: ultracode floating run windows (and the live dock panel) now appear DURING an in-flight Workflow/ultracode run, not only after it finishes.
+
+  The Workflow runtime writes the run-state file `…/workflows/wf_<id>.json` only at completion (always a terminal status); while a run is live, its only on-disk state is the sibling `…/subagents/workflows/wf_<id>/` transcript tree. `workflow-run-watcher` previously scanned only the completion file, so it never observed a run until it was already terminal — and the floating-window auto-pop is gated on an ACTIVE run, so it never fired for a live run (the feature was effectively dead for in-flight runs).
+
+  The watcher now ALSO scans the `subagents/workflows/wf_<id>/` transcript tree and synthesizes a minimal ACTIVE run (status `running`, agent slots keyed by their `agentId` so the agent-card → live-transcript click still works, `lastActivityAt` from the newest agent/journal mtime, per-agent done/running derived from the run journal's `result` events) when no completion file exists yet. When the run finishes, the real `wf_<id>.json` supersedes the synthesized record (same runId), restoring full phase/token detail and the normal finish → 8s-grace auto-close flow. The watcher stays standalone (it never imports subagent-watcher). Verified end-to-end against a real in-flight run; adds unit coverage for live synthesis, agentId preservation, journal-derived state, empty-dir skipping, and completion-file precedence.
+
+## 1.1.3
+
+### Patch Changes
+
+- Ultracode floating run windows + a dedicated toggle to control them.
+  - **New: floating ultracode run windows.** When enabled, each active ultracode / Workflow run pops a small draggable window (like the file browser) connected by a glowing line to its originating session tab — the same connector-line idiom as subagent windows. The tab is resolved by matching the run's `sessionUuid` to a session's `claudeSessionId`. The window mirrors the live agent grid (phases, per-agent model / tokens burned / tool calls / state), auto-closes a few seconds after its run finishes, and remembers windows you explicitly dismiss so they don't re-pop. These windows are **additional to** the existing docked "Ultracode Agents" master-detail panel, which is unchanged.
+  - **New setting "Ultracode Floating Windows"** (App Settings → Display), **default OFF**, independent of the "Ultracode Agents" panel toggle. Either toggle now starts the server-side workflow-run watcher (at boot and on live settings change), so the floating windows work even with the docked panel off.
+  - Internals: new frontend module `ultracode-windows.js` (load order 15.5); ultracode connector lines are appended into the shared `#connectionLines` SVG within the existing batched read/write reflow pass in `subagent-windows.js`; new `ultracodeFloatingWindows` app-settings key in `schemas.ts`; watcher gating in `server.ts` + `system-routes.ts` now ORs both ultracode toggles.
+  - Docs: `CLAUDE.md` brought up to date for the 1.1.2 ultracode/workflow-run subsystem (Agents / Frontend / Types / Config inventories, JS load order, a Key Patterns entry) and the new floating-windows feature.
+
+## 1.1.2
+
+### Patch Changes
+
+- Ultracode/Workflow run visualization + subagent discovery fixes.
+  - **Ultracode / Workflow run visualization** (new, opt-in): App Settings → Display → "Ultracode Agents" (`showUltracodeAgents`, default OFF) adds a master-detail tab that shows ultracode / Workflow-tool runs like Claude Code's "working agents" view — the LEFT pane lists runs and their phases (selectable tasks), the RIGHT pane shows each run's agents with model, live state, tokens burned, and tool calls. Clicking an agent opens its live transcript. Backed by a new standalone workflow-run watcher that reads the per-run state JSON (stripping the heavy embedded script/result/logs so payloads stay small), exposes `GET /api/workflows` and `GET /api/workflows/:runId`, and broadcasts `workflow:run_discovered/updated/removed` SSE events. The header launcher and panel stay hidden until the setting is enabled (the setting is synced across devices, not per-device).
+  - **Subagent tracking discovery fix**: restored subagent tracking after Claude Code changed the on-disk format from `agent-*.jsonl` to `agent-*.meta.json` (background agents were showing 0). Also discovers workflow-nested subagents under `subagents/workflows/<wf>/` and hardens the meta→transcript upgrade path so an agent re-points to its `.jsonl` transcript once it appears.
+  - **File viewer**: opens audio, SVG, and other binary files the same way the attachments viewer does.
+  - **Tooling**: hardened the real-overview screenshot capture script and documented the `deviceScaleFactor` / static-cache gotchas.
+
+## 1.1.1
+
+### Patch Changes
+
+- Six reviewed contributor PRs (all adversarially reviewed and fixed before merge):
+  - **Markdown sanitizer hardened against mutation-XSS (#126).** The denylist `_sanitizeHtml` is replaced with vendored DOMPurify 3.4.8 (authentic, byte-matched to the official dist) wired via a new `sanitize-html.js` allowlist, with a fail-closed escape fallback. The curated allowlist is genuinely enforced (no `USE_PROFILES` override) so non-markdown tags and svg/math/style/script/event-handler/`javascript:` vectors are stripped while legitimate markdown survives.
+  - **Hook-event secret now required unconditionally (#127).** The `/api/hook-event` + `/api/status-telemetry` localhost bypass requires the per-instance hook secret whether or not a managed tunnel is running, closing the own-loopback-reverse-proxy gap. A self-heal refreshes pre-secret hook configs in existing cases on spawn so password-protected installs don't silently 401 their hooks. No-password loopback installs are unaffected.
+  - **`codeman doctor` dependency checker (#125).** New `doctor`/`check-deps` command probes Node, the agent CLIs, tmux, and document converters per environment (linux/darwin/win32/wsl), with grouped or `--json` output and a non-zero exit when a required tool is missing. Requires Node 22+, reports `pdftoppm` (used for PDF/Office thumbnails), and validates `--category`.
+  - **macOS Option / physical-key session shortcuts (#129).** Tab switching matches physical key codes (`e.code`) so Option+1–9 works on macOS layouts that remap Option, plus Option/Alt+`[`/`]` for previous/next session — without leaking escape sequences into the focused terminal.
+  - **Desktop session tabs auto-wrap to a second row on overflow (#128)** instead of horizontal scrolling (off when the manual two-row layout is pinned; mobile/tablet unchanged), re-evaluated on window resize.
+  - **CJK input textarea hidden on the welcome screen (#123)** so it no longer floats over the welcome overlay, and re-shown on session entry; vertical centering fixed.
+
+## 1.1.0
+
+### Minor Changes
+
+- **Plan Usage Limits chip (new).** A header chip now shows your live Claude plan usage — the 5-hour and weekly windows as a percentage — parsed from Claude Code's statusLine telemetry (CLI v2.1.80+). It's opt-in via **App Settings → Display → "Plan Usage Limits"** (default OFF). The toggle is **per-device**: turn it on at your desk without it appearing on your phone. Telemetry collection is decoupled from display, so one device's preference never affects another's, and the last-known value replays instantly on reconnect. Distinct from auto-resume (which reacts to the limit _message_) — this proactively shows the live %.
+
+  **Attachments.** New attachment history drawer to browse files referenced by a session (COD-39), plus document previews and thumbnails on attachment cards (COD-38). The header **Attachments button is now opt-in** (default OFF) via **App Settings → Display → "Attachments Button"**, per-device like the Response Viewer button.
+
+  **Settings & models.** Added Opus 4.6 options to the Claude Model picker. Removed the legacy Token Count / Show Cost header toggles and moved Plan Usage Limits to the top of the Display settings. Slimmed the Skin picker control to match its row.
+
+  **Mobile & header polish.** Restored the response-viewer (eye) button on phones; kept the phone header minimal (settings gear + lifecycle log stay in the toolbar). Added two regression guards so header controls can't silently leak onto the mobile header again — a CI-runnable static policy check plus a real-browser E2E test.
+
+## 1.0.0
+
+### Major Changes
+
+- # Codeman 1.0.0 🎉
+
+  The first stable release of Codeman — and it comes with a fresh new look.
+
+  **New: theme skins.** Codeman now ships a built-in skin switcher (App Settings → Display → Appearance):
+  - **OG Codeman** — the original look, preserved exactly.
+  - **Daylight Green** — a fresh emerald-on-slate theme.
+  - **Daylight Blue** — bright sky-blue on lifted slate (the new default).
+
+  Skins apply instantly, persist per device (with a pre-paint script so there's no flash on load), and re-theme any open terminals live. The system is built on `html[data-skin]` design tokens and self-hosted Manrope (UI) + JetBrains Mono (terminal) fonts — no external CDN, CSP-safe.
+
+  **1.0.0 milestone.** This marks the start of the stable 1.x line: the CLI, documented environment variables, and the `{ success, data }` HTTP/SSE API envelope follow semantic versioning (see `docs/versioning-policy.md`).
+
+  **Thank you to everyone who helped build Codeman.** This release is dedicated to all of our contributors for their work on the project: Ark0N, Aamer Akhter (@aakhter), Tenggan Zhang (@TeigenZhang), zhouyuan / @sunnyzhouy, jaypark, Marco Migozzi, Skúli Arnlaugsson, Aaron Fields, Loïc Sculier, and Noah Waldner (@noahwaldner). 💙
+
+## 0.9.14
+
+### Patch Changes
+
+- Security hardening for the tunnel exposure path, Codex terminal rendering fixes, and a mobile modal fix.
+
+  **Security (PR #115, COD-54/COD-55):**
+  - `/api/hook-event` localhost bypass is now gated while the managed Cloudflare tunnel is running: tunneled traffic arrives with a loopback source IP, so the bypass additionally requires a per-instance shared secret (`X-Codeman-Hook-Secret`, 256-bit, `~/.codeman/hook-secret`, mode 0600). Locally generated hook commands read the secret file at execution time via `$CODEMAN_HOOK_SECRET_FILE` (exported into every managed session's environment), so the value never lands on command lines or in case configs, and running sessions pick up a new secret without respawn. Failed presentations rate-limit in a dedicated per-IP bucket so misfiring legacy hooks can never lock out the Basic-Auth login path. With no tunnel running, behavior is unchanged.
+  - Enabling the Cloudflare tunnel now **refuses with 403** when no `CODEMAN_PASSWORD` is set (a public tunnel URL with no auth is effectively public RCE), unless `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1` explicitly acknowledges the exposure. The settings UI surfaces the refusal as an error toast and reverts the toggle.
+
+  **Codex rendering (PRs #116, #117):**
+  - Alt-screen toggles (`?47/?1047/?1049`), scrollback-erase (`CSI 3 J`), and mouse-tracking enables (`?1000`–`?1007`) are stripped from the Codex byte stream (live + replay), so conversation history survives tab switches and the scroll wheel scrolls the viewport instead of being hijacked. Sequences split across PTY chunk boundaries are reassembled via a small carry before stripping, so a split `?1049h` can no longer trap xterm in the scrollback-less alt buffer.
+  - Smaller 32KB first-frame write budget for Codex sessions keeps dense synchronized redraws from stalling the renderer; a 1.5s grace window after a manual scroll-up suppresses sticky-scroll so high-frequency `• Working (Ns)` status ticks no longer snap the viewport back to the bottom while reading earlier output.
+
+  **Mobile:** session-options modal raised above the fixed mobile/tablet header (z-index 1300 vs 1200) so the close button is reachable on phones; Respawn tab controls regrouped.
+
+  **Docs:** security-architecture.md updated for the secret-gated hook bypass (including the external-proxy caveat) and the tunnel password guard; README documents auto-resume on usage limit.
+
+## 0.9.13
+
+### Patch Changes
+
+- Auto-resume on usage limit ("token pause" control) plus a set of mobile-view fixes for regressions introduced in 0.9.8.
+
+  **Auto-resume on usage limit** — new opt-in checkbox at the top of the session Respawn tab (off by default). When Claude stops because a usage limit was reached, Codeman parses the reset time from the limit message, waits until the limit lifts (plus a 2-minute safety buffer), then dismisses the rate-limit dialog (Esc) and sends "continue" so the session picks its work back up automatically. All Claude Code message formats from 1.0.x through 2.1.x are recognized ("5-hour limit reached ∙ resets 8pm", "Limit reached · resets 1pm (America/Chicago) · /upgrade…", "You've hit your weekly limit · resets Mon 12:00am", weekly date forms, and the raw API `usage limit reached|<epoch>` form). Still-limited responses re-arm the scheduler (5-minute retry loop); a pending schedule persists across Codeman restarts and re-arms on boot; respawn cycles are blocked while a limit pause is active so the cycle's `/clear` cannot wipe the paused conversation. New endpoint `POST /api/sessions/:id/auto-resume`; new SSE events `session:limitPauseScheduled`, `session:limitResume`, `session:limitResumeCancelled`; toast/notification on pause and resume, plus a live "resumes at HH:MM" status line in the modal. The Respawn tab layout was also tidied: compact single-row Update/Kickstart prompt fields and a merged options row.
+
+  **Mobile fixes (0.9.8 regressions)**:
+  - **Activity-based resize arbitration** — a desktop sizing claim now only blocks a phone's resize while that desktop has actually typed within the last 90 seconds. Previously any connected desktop tab (even one abandoned hours ago) silently discarded the phone's resize with no fallback, leaving the phone rendering a desktop-width stream in a narrow terminal: mid-word wraps, tmux dot-fill rows, overdrawn garbled text, and misplaced keyboard echo. Now an idle desktop yields the pane to the phone, and the next desktop keystroke automatically restores the desktop layout ("whoever is actively using the session wins"). Phones also re-send their dimensions every 30 seconds (visible tab only, skipped while the virtual keyboard is open) so attaching under a momentarily-active desktop self-corrects.
+  - **Keyboard accessory bar and toolbar restored on iOS** — the lift offset is measured against the layout viewport (`window.innerHeight`) again instead of the keyboard-shrunken app element; on iOS the offset computed to 0, leaving both bars hidden behind the OS keyboard with a dead black gap above it.
+  - **Removed the mobile header utility ("three dots") toggle** — the header-utilities tray stays collapsed on small viewports.
+
+## 0.9.12
+
+### Patch Changes
+
+- Documentation refresh — README catches up with the Codex run mode, plus a CLAUDE.md correction.
+
+  **README (en + zh-CN)**: Codex is now listed as a third supported AI coding CLI everywhere the docs previously said "Claude Code or OpenCode": the install requirement in Quick Start (now "any combination works", linking to the official Codex CLI docs), the Windows/WSL setup note, the renamed **Multi-CLI** feature bullet (env-prefix gating now reads `CLAUDE_CODE_*` vs `OPENCODE_*` vs `CODEX_*`), the Zod schema-validation security bullet, and the architecture mermaid diagram. The header tagline was also finalized to "Claude Code • OpenCode • Codex — One Dashboard • Any Device" in both languages.
+
+  **CLAUDE.md**: fixed a stale "Local packages" line that claimed the xterm-zerolag-input local-echo overlay had a copy embedded in `app.js` — it is single-source in `packages/xterm-zerolag-input/`, bundled to the gitignored vendor file, and only consumed by `app.js`, matching the existing single-source gotcha.
+
+## 0.9.11
+
+### Patch Changes
+
+- Fix a terminal freeze on hover (catastrophic regex backtracking) and a CSP violation that disabled the terminal's anti-throttling worker.
+
+  **Tab-freezing hover bug**: the terminal link provider's `cmdPattern` (which turns `tail -f /path`-style text into clickable links) used an empty-matchable, unbounded arg group — `(?:[^\s\/]*\s+)*` — that backtracks exponentially on real Claude output, e.g. wrapped `git commit -m "$(cat <<'EOF'` heredoc lines or aligned table rows. Hovering the mouse over such a line hung the page's main thread for minutes ("page unresponsive"). The pattern now uses non-empty tokens with bounded repetition (linear time); all intended command+path link forms still match. New `test/link-provider-regex.test.ts` extracts the shipped patterns from source and pins linear-time behavior on the killer line shapes.
+
+  **Blob worker CSP fix**: `worker-src 'self' blob:` is now always present in the CSP (previously only with `CODEMAN_GESTURE=1`). The terminal's `_safeYield` anti-throttling tick worker is created from a Blob URL and was silently blocked on every install, logging a CSP violation on each page load and disabling the worker leg of the render-yield fallback chain.
+
+## 0.9.10
+
+### Patch Changes
+
+- Self-update now restarts automatically on headless Macs supervised by a system LaunchDaemon.
+
+  New `launchd-daemon` supervisor kind: when Codeman runs under a bootstrapped, KeepAlive system-level LaunchDaemon (`/Library/LaunchDaemons/com.codeman.web.plist` — the right setup for headless Macs, where LaunchAgents never start because there is no GUI login), the updater no longer ends with "Update staged — restart Codeman to apply". It restarts rootlessly: the update script kills the server PID (passed via `--server-pid`) and launchd respawns it on the freshly built `dist/`. Detection is conservative — the daemon must be bootstrapped in the system domain AND have `KeepAlive` enabled.
+
+  Also fixed: a lingering "restart Codeman to apply" status. After a manual restart of a staged update, boot reconciliation now flips `completed-needs-manual-restart` to `completed` once the running version matches the staged target, so the Updates tab stops showing the stale instruction.
+
+## 0.9.9
+
+### Patch Changes
+
+- Codex (OpenAI CLI) run mode, Claude Model picker, and response-viewer button now opt-in.
+
+  **Codex (OpenAI CLI) run mode** (#114): new `codex` session mode alongside Claude Code and OpenCode. Sessions launch the Codex CLI via tmux with secrets injected through `tmux setenv` (`OPENAI_API_KEY`/`CODEX_API_KEY`/`CODEX_HOME` — never on the command line). Supports `--model`, `resume <id>`, and `--dangerously-bypass-approvals-and-sandbox` via the `codexConfig` payload or the new App Settings → Codex CLI tab (`codexDangerouslyBypassApprovals`). Availability surfaced at `GET /api/codex/status` with an install hint when the binary is missing. Frontend gets a "Run CX" run-mode option; Respawn/Ralph options stay Claude-only (session options open on the Summary tab for external-CLI sessions). `CODEX_*` env prefix added to the env-override allowlist.
+
+  **Claude Model picker**: App Settings → Claude CLI gains a "Claude Model" select (`claudeModel` setting) that pins the model for new Claude sessions via the case's `.claude/settings.local.json` — e.g. Fable 5 (1M context), Fable 5, Opus (1M), Opus, Sonnet, Haiku. It takes precedence over the legacy 1M Opus Context toggle. Fable 5 also added to the orchestrator default/phase model dropdowns.
+
+  **Response-viewer (eye) header button is now hidden by default** — existing users who relied on it can re-enable it under App Settings → Display → Response Viewer (`showResponseViewer`, per-device setting). A new Display toggle controls its visibility.
+
+  Also: tests made immune to a set `CODEMAN_GESTURE` env var; CLAUDE.md documents the Codex run mode and the eye-button toggle.
+
+## 0.9.8
+
+### Patch Changes
+
+- Stable HTTP contract, terminal pane-buffer rework, mobile/touch fixes, and fresh-install default cleanups.
+
+  **API / v1 readiness (PR #113)**
+  - Stable HTTP contract: uniform `{success, data}` / `{success: false, error, errorCode}` response envelope across all ~134 handlers, correct HTTP status codes, and a versioned `/api/v1/*` alias of `/api/*`
+  - Post-merge adversarial audit closed 9 contract gaps (envelope/status-code stragglers), incl. `loadQuickStartCases` double-unwrap
+  - Node.js floor raised to >=22; `codeman` bin alias installed alongside `aicodeman`
+  - Security hardening: SSRF guard on the push endpoint, tmux session-name validation, documented tail-file roots
+  - Governance: SECURITY.md and a SemVer versioning policy (docs/versioning-policy.md)
+  - CI now runs the full unit/integration suite (vitest.ci.config.ts) plus a frontend JS syntax gate
+
+  **Terminal (PR #112)**
+  - tmux pane-buffer primitives and session/render reliability fixes for the terminal pipeline, with re-review findings addressed
+
+  **Mobile / touch (PR #111)**
+  - Terminal and layout fixes for touch devices: desktop focus handling, WS resize-claim wiring, CJK setting, ESC passthrough
+  - New: Esc button in the simple (default) keyboard accessory bar, next to paste — sends a real ESC to the session
+
+  **Defaults & UI**
+  - Monitor panel is now disabled by default on fresh installs (desktop previously slid it open at startup; mobile was already off). Opt in via App Settings -> Show Monitor
+  - Fixed the session-tab task badge silently failing to open the Monitor panel when it was hidden by the setting (long-broken on mobile)
+  - Local echo defaults audited and confirmed per-device: off on desktop, on for touch devices, never server-synced
+
+## 0.9.7
+
+### Patch Changes
+
+- Fix installer failure on corrupt puppeteer cache + add Simplified Chinese README.
+  - **Installer / self-update reliability**: The universal installer (`install.sh`) and the in-app self-updater (`scripts/self-update.sh`) now set `PUPPETEER_SKIP_DOWNLOAD=1` before `npm install`. `puppeteer` is a devDependency used only by `scripts/browser-comparison.mjs`; its ~150MB `chrome-headless-shell` download is never needed to build or run Codeman. Previously, a partially-downloaded browser cache (folder present, executable missing) made puppeteer refuse to re-download and abort `npm install`, which failed the entire install/update — most visibly on macOS (`mac_arm`). The download is now skipped on both paths; callers can still opt back in with `PUPPETEER_SKIP_DOWNLOAD=0`.
+  - **Docs**: Added a Simplified Chinese translation of the README (`README.zh-CN.md`) with an English/中文 language switcher in `README.md`. Refreshed the README and documented the v0.9.5 security hardening (Host-header/DNS-rebinding guard, cross-site Origin/CSRF guard, anti-CSWSH WebSocket validation).
+
+## 0.9.6
+
+### Patch Changes
+
+- Self-updater: show live progress during the slow steps so an update no longer looks frozen.
+  - The detached update runner (`scripts/self-update.sh`) now emits a heartbeat every few seconds during `npm install` and `npm run build`, refreshing the update status with the latest output line (full output is still written to the update log).
+  - App Settings → Updates now shows the live status message plus a ticking elapsed-time counter during non-terminal phases, instead of only a static phase label.
+
+  This takes effect when updating _from_ a build that includes it — the detached runner script and the polling UI are both the from-version's copies.
+
+## 0.9.5
+
+### Patch Changes
+
+- Security hardening from the 2026-06-09 adversarial review — close the remote-exploit paths that affected the default (loopback + no-password) configuration. Full report: `docs/reports/security-review-2026-06-09.md`.
+  - **Anti-DNS-rebinding Host allowlist (always on).** A new request guard rejects requests whose `Host` is a custom domain rebound to a loopback/LAN address — previously a website the operator merely visited could DNS-rebind to `127.0.0.1` and drive the entire API (arbitrary command execution, since sessions run `--dangerously-skip-permissions`). The allowlist accepts `localhost`, any bare IP literal, the bind host, `*.ts.net` / `*.trycloudflare.com` / `*.cfargotunnel.com`, the active managed tunnel, and anything in the new `CODEMAN_ALLOWED_HOSTS` env var (comma-separated; `host` or leading-dot `.suffix`).
+  - **Cross-site (CSRF) Origin guard on all state-changing requests.** Forged cross-site requests are rejected; a missing `Origin` is allowed so `curl`/CLI automation and Claude Code hooks keep working. This closes the previously CSRF-triggerable self-update, session create/input, and settings/tunnel-toggle endpoints.
+  - **`text/plain` body parser no longer JSON-parses every request body** (which let a cross-site "simple request" submit JSON with no CORS preflight). The crash-diagnostics beacon now parses its own body.
+  - **WebSocket terminal upgrade now validates `Origin`/`Host`** (blocks cross-site WebSocket hijacking that could inject keystrokes into a running agent).
+  - **Stored-XSS fix:** AI-/transcript-derived fields (tool name, tool detail, tool id, hook text) in the subagent activity panel are now HTML-escaped.
+
+  Operational note: if you front Codeman with a custom reverse-proxy domain, allow it via `CODEMAN_ALLOWED_HOSTS=host,.suffix`. Setting `CODEMAN_PASSWORD` also fully mitigates these via the existing auth hook.
+
+## 0.9.4
+
+### Patch Changes
+
+- In-app self-updater, plus the SSE-registry and security-doc changes since 0.9.3.
+
+  **New: update Codeman from the web UI (App Settings → Updates).** A "Check for updates" button asks the server to query GitHub for the latest tagged release (falling back to `git ls-remote`) and shows its release notes; "Update now" then runs the full `git checkout <tag>` → `npm install` → `npm run build` → restart cycle and streams live progress that survives the service restart (the browser polls a status file across the connection drop).
+  - **Channel:** latest tagged release (e.g. `codeman@0.9.4`), not bleeding-edge master.
+  - **Dirty working trees are auto-stashed** (`git stash`, left for you to `git stash pop`) instead of discarded.
+  - **Cross-platform restart**, detected from the running process: systemd (`systemctl --user restart codeman-web`) on Linux, launchd (`launchctl kickstart`) on macOS, or a printed manual command otherwise.
+  - **Survives its own restart:** the updater runs detached in a transient `systemd-run --user --scope` (Linux) or `setsid` session (macOS), so the restart it triggers cannot kill the build mid-flight.
+  - **Safety:** build failure rolls back to the pre-update commit (never restarts into a half-built `dist/`); the pre-restart status marker is reconciled on boot with an update-id + freshness guard so a normal reboot is not misreported as a completed update; concurrent updates are rejected (409); the runner script is staged outside the repo so `git checkout` cannot corrupt it mid-run; release tags are strictly validated before reaching the shell; `CODEMAN_DISABLE_SELF_UPDATE=1` disables the feature; non-git (npm-global) installs are detected and pointed at `npm i -g aicodeman@latest`.
+  - New endpoints: `GET /api/system/update/check`, `POST /api/system/update`, `GET /api/system/update/status`.
+
+  **Also in this release:**
+  - Sync the frontend `SSE_EVENTS` registry (`constants.js`) with the backend `sse-events.ts` so every broadcast event has a matching frontend entry.
+  - Expand `docs/security-architecture.md` with the trust model, CSP detail, and a source-file map.
+
+## 0.9.3
+
+### Patch Changes
+
+- Installer security notice + clarify gesture control stays opt-in and default-off.
+  - **Installer:** `install.sh` now prints the network-security notice as the final block of both the fresh install (one-line `curl … | bash`) and the update flow, so it stays visible to the user: Codeman binds `127.0.0.1` by default (no password needed), and the safe ways to reach it remotely (`tailscale serve` / tunnel, or `--host 0.0.0.0` + `CODEMAN_PASSWORD`), noting a non-loopback bind without a password still starts but warns loudly.
+  - **Gesture control** is **disabled by default** and is enabled only by the per-user toggle at App Settings → Display → Input → Gesture Control (`gestureControlEnabled`, default `false`). Setting `CODEMAN_GESTURE=1` on the server only makes the feature _available_ (CSP widening + same-origin `/gesture/` assets); it does **not** turn the overlay on. There is no default-on path — the bundle is injected only when a user explicitly enables the setting.
+
+## 0.9.2
+
+### Patch Changes
+
+- Vendor the gesture-control source into the repo for in-tree development.
+
+  The hand-tracking overlay's source (previously the standalone `Ark0N/codeman-gesture-control` repo) now lives at `packages/gesture-control/` as the `codeman-gesture-control` workspace package: the transport-agnostic gesture core (`src/gesture/*` — MediaPipe GestureRecognizer → One-Euro-filtered cursor → pinch state machine), the Codeman consumer entry (`src/codeman/entry.ts`, maps grab/drag/drop onto real session tabs + toolbar buttons), and a standalone vite playground for iterating on gesture feel.
+  - New `npm run build:gesture` (`scripts/build-gesture-bundle.mjs`) esbuild-bundles `entry.ts` into the served `src/web/public/gesture/gesture-codeman.js`; `scripts/build.mjs` now reruns it on every production build so the served bundle always reflects current source. The MediaPipe wasm + model stay runtime-loaded from same-origin `/gesture/` (unchanged).
+  - Added `@mediapipe/tasks-vision@0.10.21` as the package dependency (kept in sync with `fetch-gesture-assets.mjs`). The playground uses vite 7 (no known advisories).
+
+  No change to the shipped app behavior — gesture control remains opt-in (`CODEMAN_GESTURE=1` + the App Settings → Input toggle). This release just makes the overlay developable inside the Codeman repo.
+
+## 0.9.1
+
+### Patch Changes
+
+- Multi-monitor & settings UX fixes.
+  - **Multi-monitor button (remote servers):** the "span displays" button spawns `scripts/span-codeman.sh` server-side, so on a non-macOS Codeman server it can't open a window on your machine. The non-macOS API error now explains this and points to running the script locally on your Mac with the remote server URL; the script header documents the same remote-client workflow.
+  - **App Settings modal:** stop the modal overflowing horizontally on narrow viewports.
+  - **systemd:** sync the `codeman-web.service` template with the deployed unit.
+
+## 0.9.0
+
+### Minor Changes
+
+- Security hardening release: network-bind policy, auth lockout recovery, download/SVG hardening, dependency & supply-chain fixes, tmux launch reliability, and a full security-architecture doc.
+
+  **Network binding (COD-29, #107):**
+  - The web server now defaults to binding `127.0.0.1` (loopback) instead of `0.0.0.0`, so a fresh install is reachable only from the same machine and needs no password. New `--host` / `-H` / `CODEMAN_HOST` flag to choose the bind host.
+  - Binding a non-loopback host **without** `CODEMAN_PASSWORD` no longer refuses to start — it **starts and prints a loud warning** with the three ways to secure it (set `CODEMAN_PASSWORD`, bind loopback + an authenticated tunnel / `tailscale serve`, or acknowledge with `--allow-unauthenticated-network` / `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1`). This keeps Codeman "just working" for new users while making remote exposure a guided, explicit choice. Host classification lives in the new `src/web/network-auth-policy.ts` (handles `127.0.0.0/8`, `::1`, `::ffff:127.*`, bracketed IPv6).
+  - A post-install security note now explains the loopback default and how to expose safely.
+
+  **Authentication (COD-29, #107):**
+  - Auth lockout now recovers gracefully: the per-IP rate-limit (`429`) check runs **after** the cookie/credential checks, so a valid session cookie or correct password is never locked out by a prior attacker's failures from the same IP (important behind a shared-IP tunnel). Wrong credentials are still counted and still hit the limit, and a `Retry-After` header is returned.
+
+  **Downloads & content-type hardening (COD-29, #107):**
+  - New session-scoped `POST /api/download` route: realpath-bounded to the session working dir, a sensitive-path blocklist (`/etc/shadow`, `~/.ssh/`, `.env`, `*credentials*`, …), `isFile()` + 50 MB cap, forced `attachment`.
+  - Workspace `.svg` files are served as `application/octet-stream` + `attachment` + `nosniff` (closes a stored-XSS-via-SVG vector); `nosniff` now applies to all `file-raw` responses.
+
+  **Dependencies & supply chain (COD-28, #106):**
+  - Bumped security-sensitive deps to patched versions (`@fastify/static` 9, `fastify` 5.8, `uuid` 14, `vitest` 4.1, …) and added `overrides` for patched transitives (`picomatch`, `basic-ftp`, `fast-uri`, `flatted`); `npm audit` goes from 7 advisories to 0.
+  - New `npm run check:public-assets` (`scripts/check-public-assets.mjs`): scans `src/web/public/**` for literal NUL bytes and runs `node --check` on every `.js` file, plus a Prettier pass on maintained files. Removed literal NUL placeholders from `app.js`. Added `test/dependency-security.test.ts` and `test/frontend-public-tooling.test.ts`.
+
+  **tmux launch reliability (COD-31, #110):**
+  - New tmux sessions and respawns launch from a stable `/tmp` and `cd` into the workspace inside the pane, avoiding `new-session` crashes when a FUSE/rclone-mounted workspace has a transient mount blip at launch. The `cd "<dir>" && <cmd>` form is fail-safe (the CLI never runs in `/tmp`) and the path is validated + double-quoted.
+
+  **Test stability (COD-30, #108):**
+  - Cleared leaked auth env in the Vitest setup, corrected stale route status-code / SSE-lifecycle expectations to match shipped behavior, updated the mobile keyboard accessory expectations, and measured DOMContentLoaded via browser navigation timing. Also fixed the `WebServer` title tests for the new `host` constructor arg + async `renderIndexHtml`.
+
+  **Docs:**
+  - New `docs/security-architecture.md` documenting the full model (network binding, auth pipeline, the tunnel `req.ip` caveat, file-serving hardening, supply-chain, multi-instance isolation, security headers, and recommended secure setups). CLAUDE.md updated accordingly.
+
+## 0.8.2
+
+### Patch Changes
+
+- Session detach/undock, opt-in gesture-control overlay, multi-monitor spanning, new App-Settings toggles, and asset cache-busting.
+  - **Session detach/undock + instance isolation (#103):** Detach a session into its own solo (popup) window from the tab strip. Adds multi-instance isolation primitives in `src/config/instance.ts` (`getDataDir()`/`dataPath()`/`DEFAULT_TMUX_SOCKET`) keyed off `CODEMAN_INSTANCE`, so a beta can run side-by-side with prod without discovering/attaching to prod's live tmux sessions or clobbering its `state.json`. `CODEMAN_INSTANCE` defaults to the production layout (`~/.codeman`, `-L codeman`, port 3000), so master installs are unaffected. Adds `scripts/run-beta.sh` (`CODEMAN_INSTANCE=beta` + `CODEMAN_PORT=5000`). The legacy `~/.claudeman` migration is now scoped to the default instance only. Hardened detach edge cases. Tests: `test/config/instance.test.ts`.
+  - **Gesture-control overlay (Phase 5, opt-in via `CODEMAN_GESTURE=1`):** Camera hand-tracking overlay (self-hosted MediaPipe — wasm + model fetched at install/build via `scripts/fetch-gesture-assets.mjs` rather than committed). `CODEMAN_GESTURE=1` makes the feature _available_ (CSP widening + `/gesture/` assets + `window.__codemanGestureAvailable`); the per-user **Gesture Control (beta)** toggle (App Settings → Display → Input, default OFF) is the actual on/off and reloads the page to inject/remove the bundle. Dashboard-only (not solo popups). Labeled "(beta)" (#109).
+  - **Multi-monitor button:** Header button (opt-in via App Settings → Display → Header Displays) that POSTs `/api/system/span-displays` to spawn `scripts/span-codeman.sh` — a maximized browser `--app` window sized to the union of all displays, so the gesture layer's floating panels can drag across the physical monitor seam. Tests: `test/routes/system-span-displays.test.ts`.
+  - **New App-Settings toggles (#105):** Gesture control and the multi-monitor button are both opt-in (default OFF), with live show/hide on save.
+  - **Asset cache-busting:** `renderIndexHtml` appends `?v=<mtime>` to every same-origin `.js`/`.css` reference; `index.html` is served `no-cache`, so a normal reload picks up edited modules/styles without a hard refresh. Tests: `test/render-index-html.test.ts`.
+  - **Gesture Control toggle placement:** the toggle now lives inside the existing **Input** settings section (alongside Local Echo / CJK Input / Extended Keyboard Bar) instead of a duplicate "Input" section; only the toggle itself is hidden when `CODEMAN_GESTURE=1` is unset, leaving the rest of the section intact.
+  - **Service env:** `scripts/codeman-web.service` now sets `CODEMAN_GESTURE=1` so the gesture feature is available on the local install (still gated behind the default-OFF per-user toggle).
+  - **Docs:** CLAUDE.md updated for the orchestrator loop, multi-monitor/span-displays, cache-busting, gesture/multi-monitor toggles, and structural-count fixes.
+
+## 0.8.1
+
+### Patch Changes
+
+- Thinking Effort now flows as a soft default the user can override in-session (PR #104, by @TeigenZhang).
+
+  Previously Codeman carried the effort setting as the `CLAUDE_CODE_EFFORT_LEVEL` env var, which Claude Code treats as a hard override — it locked effort for the whole session and rejected in-session `/effort` switching (including switching to `ultracode`). Effort is now injected at spawn time as a CLI soft default that `/effort` can still change freely in either direction:
+  - Regular levels (`low`/`medium`/`high`/`xhigh`/`max`) are passed via `claude --effort <level>` (the settings `effortLevel` key silently drops `max`, so the flag is used instead).
+  - `ultracode` (xhigh effort + standing dynamic-workflow orchestration) is passed via `claude --settings '{"ultracode":true}'`, since the `--effort` flag rejects it.
+
+  Details:
+  - New `effort` field on the create-session, quick-start, and Ralph-loop request schemas; threaded through `Session._effort` to both spawn paths (tmux `buildSpawnCommand` and direct-PTY `buildInteractiveArgs`), persisted in `SessionState.effort`, and restored on reboot recovery.
+  - `buildEffortCliArgs()` is the single, allowlist-validated source for both carriers (injection-safe).
+  - Settings UI adds an "Ultracode (multi-agent workflows)" option to the Thinking Effort dropdown; the frontend no longer emits `CLAUDE_CODE_EFFORT_LEVEL`.
+  - Legacy migration: sessions persisted with the old env var are auto-migrated into the new `effort` field, and the stale tmux env var is unset so respawned panes are no longer locked.
+  - Adds `test/effort-injection.test.ts` (13 cases) covering carrier mapping, injection guards, args building, and constructor migration.
+
 ## 0.8.0
 
 ### Minor Changes

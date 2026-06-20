@@ -22,10 +22,22 @@ Object.assign(CodemanApp.prototype, {
     if (caseSettings?.agentTeams || globalSettings?.agentTeamsEnabled) {
       env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1';
     }
-    if (globalSettings?.thinkingEffort) {
-      env.CLAUDE_CODE_EFFORT_LEVEL = globalSettings.thinkingEffort;
-    }
+    // NOTE: thinkingEffort is intentionally NOT emitted as CLAUDE_CODE_EFFORT_LEVEL —
+    // the env var hard-locks effort and blocks in-session /effort switching (e.g.,
+    // ultracode). It flows as the dedicated `effort` payload field instead, which the
+    // backend injects as a `--settings` soft default. See getEffortSetting().
     return env;
+  },
+
+  /**
+   * Resolve the effort level for new sessions from global settings.
+   * Returns a valid effort string or undefined (= no override, CLI default).
+   * Sent as the `effort` payload field — backend turns it into `claude --settings ...`.
+   */
+  getEffortSetting(globalSettings) {
+    const effort = globalSettings?.thinkingEffort;
+    const valid = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
+    return valid.includes(effort) ? effort : undefined;
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -37,7 +49,7 @@ Object.assign(CodemanApp.prototype, {
       // Load settings to get lastUsedCase (reuse shared promise if provided)
       let lastUsedCase = null;
       try {
-        const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null);
+        const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null).then(env => env?.data ?? null);
         if (settings) {
           lastUsedCase = settings.lastUsedCase || null;
         }
@@ -46,7 +58,7 @@ Object.assign(CodemanApp.prototype, {
       }
 
       const res = await fetch('/api/cases');
-      const cases = await res.json();
+      const cases = (await res.json()).data;
       this.cases = cases;
       console.log('[loadQuickStartCases] Loaded cases:', cases.map(c => c.name), 'lastUsedCase:', lastUsedCase);
 
@@ -113,7 +125,7 @@ Object.assign(CodemanApp.prototype, {
   async updateDirDisplayForCase(caseName) {
     try {
       const res = await fetch(`/api/cases/${caseName}`);
-      const data = await res.json();
+      const data = (await res.json()).data;
       if (data.path) {
         document.getElementById('dirDisplay').textContent = data.path;
         document.getElementById('dirInput').value = data.path;
@@ -139,17 +151,21 @@ Object.assign(CodemanApp.prototype, {
     return this.run();
   },
 
-  /** Run using the selected mode (Claude Code or OpenCode) */
+  /** Run using the selected mode (Claude Code, OpenCode, or Codex) */
   async run() {
     const mode = this._runMode || 'claude';
     if (mode === 'opencode') {
       return this.runOpenCode();
     }
+    if (mode === 'codex') {
+      return this.runCodex();
+    }
     return this.runClaude();
   },
 
-  /** Get/set the run mode, persisted in localStorage */
-  get runMode() { return this._runMode || 'claude'; },
+  // Note: `runMode` is an accessor defined via Object.defineProperty at the bottom of
+  // this file — an object-literal getter here would be flattened to a static value by
+  // Object.assign (it copies values, not accessor descriptors).
 
   setRunMode(mode) {
     this._runMode = mode;
@@ -241,7 +257,7 @@ Object.assign(CodemanApp.prototype, {
       gearBtn.className = `btn-toolbar btn-run-gear mode-${mode}`;
     }
     if (label) {
-      label.textContent = mode === 'opencode' ? 'Run OC' : 'Run';
+      label.textContent = mode === 'opencode' ? 'Run OC' : mode === 'codex' ? 'Run CX' : 'Run';
     }
   },
 
@@ -292,7 +308,7 @@ Object.assign(CodemanApp.prototype, {
     try {
       // Get case path first
       const caseRes = await fetch(`/api/cases/${caseName}`);
-      let caseData = await caseRes.json();
+      let caseData = (await caseRes.json())?.data ?? {};
 
       // Create the case if it doesn't exist
       if (!caseData.path) {
@@ -337,8 +353,11 @@ Object.assign(CodemanApp.prototype, {
       const globalSettings = this.loadAppSettingsFromStorage();
       const envOverrides = this.buildEnvOverrides(caseSettings, globalSettings);
       const hasEnvOverrides = Object.keys(envOverrides).length > 0;
+      const effort = this.getEffortSetting(globalSettings);
+      // Explicit Claude Model choice (App Settings) wins over the legacy 1M Opus
+      // toggles; both flow as `modelOverride` → the case's .claude/settings.local.json
       const useOpus1m = caseSettings.opusContext1m || globalSettings.opusContext1mEnabled;
-      const modelOverride = useOpus1m ? 'opus[1m]' : '';
+      const modelOverride = globalSettings.claudeModel || (useOpus1m ? 'opus[1m]' : '');
 
       // Step 1: Create all sessions in parallel
       this.terminal.writeln(`\x1b[90m Creating ${tabCount} session(s)...\x1b[0m`);
@@ -349,7 +368,15 @@ Object.assign(CodemanApp.prototype, {
           body: JSON.stringify({
             workingDir, name,
             ...(hasEnvOverrides ? { envOverrides } : {}),
+            ...(effort ? { effort } : {}),
             ...(modelOverride !== undefined ? { modelOverride } : {}),
+            // Plan-usage statusLine exporter (App Settings → Display). The server
+            // ADDS our exporter on create when true; when false it intentionally
+            // leaves any existing exporter in place (a per-repo settings.local.json
+            // is shared by sibling sessions, so create-with-false must not yank it
+            // — see the comment in session-routes create). Disabling the setting
+            // removes it via the App Settings toggle path (system-routes), not here.
+            statusLineTelemetry: globalSettings.showPlanUsageLimits === true,
           })
         }).then(r => r.json())
       );
@@ -359,7 +386,7 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        sessionIds.push(result.session.id);
+        sessionIds.push(result.data.session.id);
       }
       firstSessionId = sessionIds[0];
 
@@ -438,7 +465,7 @@ Object.assign(CodemanApp.prototype, {
     try {
       // Get the case path
       const caseRes = await fetch(`/api/cases/${caseName}`);
-      let caseData = await caseRes.json();
+      let caseData = (await caseRes.json())?.data ?? {};
 
       // Create the case if it doesn't exist
       if (!caseData.path) {
@@ -487,7 +514,7 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        sessionIds.push(result.session.id);
+        sessionIds.push(result.data.session.id);
       }
 
       // Step 2: Start all shells in parallel
@@ -531,14 +558,15 @@ Object.assign(CodemanApp.prototype, {
     try {
       // Check if OpenCode is available
       const statusRes = await fetch('/api/opencode/status');
-      const status = await statusRes.json();
+      const status = (await statusRes.json()).data;
       if (!status.available) {
         this.terminal.writeln('\x1b[1;31m OpenCode CLI not found.\x1b[0m');
         this.terminal.writeln('\x1b[90m Install with: curl -fsSL https://opencode.ai/install | bash\x1b[0m');
         return;
       }
 
-      // Quick-start with opencode mode (auto-allow tools by default)
+      // Quick-start with opencode mode (auto-allow tools by default).
+      // No `effort` field — it's Claude-specific (OpenCode has no /effort).
       const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), this.loadAppSettingsFromStorage());
       const res = await fetch('/api/quick-start', {
         method: 'POST',
@@ -555,8 +583,55 @@ Object.assign(CodemanApp.prototype, {
 
       // Switch to the new session (don't pre-set activeSessionId — selectSession
       // early-returns when IDs match, skipping buffer load and sendResize)
-      if (data.sessionId) {
-        await this.selectSession(data.sessionId);
+      if (data.data.sessionId) {
+        await this.selectSession(data.data.sessionId);
+      }
+
+      this.terminal.focus();
+    } catch (err) {
+      this.terminal.writeln(`\x1b[1;31m Error: ${err.message}\x1b[0m`);
+    }
+  },
+
+  async runCodex() {
+    const caseName = document.getElementById('quickStartCase').value || 'testcase';
+
+    this.terminal.clear();
+    this.terminal.writeln(`\x1b[1;32m Starting Codex session in ${caseName}...\x1b[0m`);
+    this.terminal.writeln('');
+    this.terminal.focus();
+
+    try {
+      const statusRes = await fetch('/api/codex/status');
+      const status = (await statusRes.json()).data;
+      if (!status.available) {
+        this.terminal.writeln('\x1b[1;31m Codex CLI not found.\x1b[0m');
+        this.terminal.writeln('\x1b[90m Install with: npm install -g @openai/codex\x1b[0m');
+        return;
+      }
+
+      const globalSettings = this.loadAppSettingsFromStorage();
+      const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), globalSettings);
+      const res = await fetch('/api/quick-start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          caseName,
+          mode: 'codex',
+          codexConfig: {
+            dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,
+            renderMode: 'hybrid',
+          },
+          ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
+        })
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to start Codex');
+
+      // Switch to the new session (don't pre-set activeSessionId — selectSession
+      // early-returns when IDs match, skipping buffer load and sendResize)
+      if (data.data.sessionId) {
+        await this.selectSession(data.data.sessionId);
       }
 
       this.terminal.focus();
@@ -577,7 +652,7 @@ Object.assign(CodemanApp.prototype, {
     this.editingSessionId = sessionId;
 
     // Reset to an appropriate tab — Summary for OpenCode (Respawn/Ralph are Claude-only)
-    this.switchOptionsTab(session.mode === 'opencode' ? 'summary' : 'respawn');
+    this.switchOptionsTab(session.mode === 'opencode' || session.mode === 'codex' ? 'summary' : 'respawn');
 
     // Update respawn status display and buttons
     const respawnStatus = document.getElementById('sessionRespawnStatus');
@@ -606,7 +681,7 @@ Object.assign(CodemanApp.prototype, {
     }
 
     // Hide Claude-specific options for OpenCode sessions
-    const isOpenCode = session.mode === 'opencode';
+    const isOpenCode = session.mode === 'opencode' || session.mode === 'codex';
     const claudeOnlyEls = document.querySelectorAll('[data-claude-only]');
     claudeOnlyEls.forEach(el => { el.style.display = isOpenCode ? 'none' : ''; });
 
@@ -622,6 +697,10 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('modalAutoCompactPrompt').value = session.autoCompactPrompt ?? '';
     document.getElementById('modalAutoClearEnabled').checked = session.autoClearEnabled ?? false;
     document.getElementById('modalAutoClearThreshold').value = session.autoClearThreshold ?? 140000;
+
+    // Populate auto-resume on usage limit (token pause control)
+    document.getElementById('modalAutoResumeEnabled').checked = session.autoResumeEnabled ?? false;
+    this.updateAutoResumeStatus(sessionId);
     document.getElementById('modalImageWatcherEnabled').checked = session.imageWatcherEnabled ?? true;
     document.getElementById('modalFlickerFilterEnabled').checked = session.flickerFilterEnabled ?? false;
 
@@ -722,6 +801,39 @@ Object.assign(CodemanApp.prototype, {
     } catch { /* silent */ }
   },
 
+  async autoSaveAutoResume() {
+    if (!this.editingSessionId) return;
+    const enabled = document.getElementById('modalAutoResumeEnabled').checked;
+    try {
+      await this._apiPost(`/api/sessions/${this.editingSessionId}/auto-resume`, { enabled });
+      const session = this.sessions.get(this.editingSessionId);
+      if (session) {
+        session.autoResumeEnabled = enabled;
+        if (!enabled) session.autoResumeAt = undefined;
+      }
+      this.updateAutoResumeStatus(this.editingSessionId);
+      this.showToast(`Auto-resume on usage limit ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    } catch (err) {
+      this.showToast('Failed to toggle auto-resume: ' + err.message, 'error');
+    }
+  },
+
+  // Show "resumes at HH:MM" in the session options modal while a usage-limit
+  // pause is armed for the session being edited
+  updateAutoResumeStatus(sessionId) {
+    const el = document.getElementById('autoResumeStatus');
+    if (!el || this.editingSessionId !== sessionId) return;
+    const session = this.sessions.get(sessionId);
+    if (session?.autoResumeAt && session.autoResumeAt > Date.now()) {
+      const at = new Date(session.autoResumeAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      el.textContent = `Usage limit pause active — resumes at ${at}`;
+      el.classList.add('active');
+    } else {
+      el.textContent = '';
+      el.classList.remove('active');
+    }
+  },
+
   async toggleSessionImageWatcher() {
     if (!this.editingSessionId) return;
     const enabled = document.getElementById('modalImageWatcherEnabled').checked;
@@ -774,8 +886,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch(`/api/sessions/${sessionId}/respawn/config`);
       const data = await res.json();
-      if (data.success && data.config) {
-        const c = data.config;
+      if (data.success && data.data && data.data.config) {
+        const c = data.data.config;
         document.getElementById('modalRespawnPrompt').value = c.updatePrompt || 'update all the docs and CLAUDE.md';
         document.getElementById('modalRespawnSendClear').checked = c.sendClear ?? true;
         document.getElementById('modalRespawnSendInit').checked = c.sendInit ?? true;
@@ -912,9 +1024,8 @@ Object.assign(CodemanApp.prototype, {
     const tabName = document.querySelector(`.tab-name[data-session-id="${sessionId}"]`);
     if (!tabName) return;
 
-    // If a previous rename somehow leaked (shouldn't happen, but defends against
-    // future code paths that throw before cleanup), abort it before starting fresh.
-    if (this._activeRename) this._activeRename.cancel();
+    // Prevent tab re-renders from destroying the input while renaming
+    this._inlineRenameActive = true;
 
     const currentName = this.getSessionName(session);
     const parsed = parseSessionPrefix(session.name);
@@ -942,14 +1053,14 @@ Object.assign(CodemanApp.prototype, {
     input.focus();
     input.select();
 
-    let settled = false;
     const finishRename = async ({ commit }) => {
-      if (settled) return;
-      settled = true;
+      if (!this._inlineRenameActive) return; // prevent double-fire
+      this._inlineRenameActive = false;
       this._activeRename = null;
 
-      // Aborted (e.g. session was deleted mid-rename): just re-render so any
-      // ghost DOM left behind is replaced with the canonical tab list.
+      // Aborted (e.g. the session was deleted mid-rename, or Escape): re-render
+      // so any ghost DOM is replaced with the canonical tab list, and skip the
+      // API call — a cancel must not fire a stale rename PUT.
       if (!commit) {
         this.renderSessionTabs();
         return;
@@ -1274,11 +1385,11 @@ Object.assign(CodemanApp.prototype, {
             <span class="case-manage-path">${escapeHtml(pathDisplay)}</span>
           </div>
           <div class="case-manage-actions">
-            <button class="case-manage-btn" onclick="app.moveCaseUp('${escapeHtml(c.name)}')"
+            <button class="case-manage-btn" onclick="app.moveCaseUp(${escapeHtml(JSON.stringify(c.name))})"
                     title="Move up" ${isFirst ? 'disabled' : ''}>&#x25B2;</button>
-            <button class="case-manage-btn" onclick="app.moveCaseDown('${escapeHtml(c.name)}')"
+            <button class="case-manage-btn" onclick="app.moveCaseDown(${escapeHtml(JSON.stringify(c.name))})"
                     title="Move down" ${isLast ? 'disabled' : ''}>&#x25BC;</button>
-            <button class="case-manage-btn case-manage-btn-delete" onclick="app.deleteCase('${escapeHtml(c.name)}')"
+            <button class="case-manage-btn case-manage-btn-delete" onclick="app.deleteCase(${escapeHtml(JSON.stringify(c.name))})"
                     title="Delete case">&#x2715;</button>
           </div>
         </div>
@@ -1373,14 +1484,14 @@ Object.assign(CodemanApp.prototype, {
       const isSelected = c.name === currentCase;
       html += `
         <button class="mobile-case-item ${isSelected ? 'selected' : ''}"
-                onclick="app.selectMobileCase('${escapeHtml(c.name)}')">
+                onclick="app.selectMobileCase(${escapeHtml(JSON.stringify(c.name))})">
           <span class="mobile-case-item-icon">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
             </svg>
           </span>
           <span class="mobile-case-item-name">${escapeHtml(c.name)}</span>
-          <span class="mobile-case-item-delete" onclick="event.stopPropagation(); app.deleteCaseMobile('${escapeHtml(c.name)}')" title="Delete">
+          <span class="mobile-case-item-delete" onclick="event.stopPropagation(); app.deleteCaseMobile(${escapeHtml(JSON.stringify(c.name))})" title="Delete">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
             </svg>
@@ -1458,5 +1569,16 @@ Object.assign(CodemanApp.prototype, {
     modal.classList.add('from-mobile');
     // Remove animation class after it plays
     setTimeout(() => modal.classList.remove('from-mobile'), 300);
+  },
+});
+
+Object.defineProperty(CodemanApp.prototype, 'runMode', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    return this._runMode || 'claude';
+  },
+  set(mode) {
+    this._runMode = mode === 'opencode' || mode === 'codex' || mode === 'claude' ? mode : 'claude';
   },
 });

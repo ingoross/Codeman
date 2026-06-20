@@ -12,6 +12,50 @@
  * @loadorder 7 of 15 — loaded after app.js, before respawn-ui.js
  */
 
+(function (global) {
+  const TERMINAL_QUERY_RESPONSE_PATTERN = /^\x1b\[[\?>=]?[\d;]*[cnR]$/;
+  const TERMINAL_OSC_RESPONSE_PATTERN = /^\x1b\][\d;]*[^\x07\x1b]*(?:\x07|\x1b\\)$/;
+  // Grace window after a manual scroll-up gesture during which sticky-scroll is
+  // suppressed, so high-frequency Codex status redraws don't snap the viewport
+  // back to the bottom while the user is inspecting earlier output.
+  const USER_SCROLL_STICKY_SUPPRESS_MS = 1500;
+  // Mobile browsers synthesize trusted mouse events after touchend. During this
+  // short window, only the app's synthetic tap-to-position mouse event should
+  // reach xterm.
+  const TOUCH_COMPAT_MOUSE_SUPPRESS_MS = 450;
+
+  function isTerminalQueryResponse(data) {
+    return TERMINAL_QUERY_RESPONSE_PATTERN.test(data) || TERMINAL_OSC_RESPONSE_PATTERN.test(data);
+  }
+
+  function shouldSuppressTerminalQueryResponse(data) {
+    return isTerminalQueryResponse(data);
+  }
+
+  // Per-skin xterm.js palettes. The 'daylight-blue' object equals the legacy hardcoded
+  // theme, so default behavior is unchanged. Shared at module scope and exported on the
+  // global so both terminal-ui.js (main terminal) and panels-ui.js (teammate terminals,
+  // a separate IIFE) can read the current skin's palette.
+  const CODEMAN_XTERM_THEMES = {
+    og: { background: '#0d0d0d', foreground: '#e0e0e0', cursor: '#e0e0e0', cursorAccent: '#0d0d0d', selection: 'rgba(255,255,255,0.3)', black: '#0d0d0d', red: '#ff6b6b', green: '#51cf66', yellow: '#ffd43b', blue: '#339af0', magenta: '#cc5de8', cyan: '#22b8cf', white: '#e0e0e0', brightBlack: '#495057', brightRed: '#ff8787', brightGreen: '#69db7c', brightYellow: '#ffe066', brightBlue: '#5c7cfa', brightMagenta: '#da77f2', brightCyan: '#66d9e8', brightWhite: '#ffffff' },
+    'daylight-green': { background: '#161b23', foreground: '#dfe6ef', cursor: '#2fd3aa', cursorAccent: '#161b23', selection: 'rgba(47,211,170,0.22)', black: '#161b23', red: '#ff8585', green: '#34d8a0', yellow: '#f0c25a', blue: '#5cc6e8', magenta: '#c79af2', cyan: '#2bcbbb', white: '#dfe6ef', brightBlack: '#5b6675', brightRed: '#ffa0a0', brightGreen: '#5fe6b8', brightYellow: '#ffd884', brightBlue: '#82d4ee', brightMagenta: '#d6b3f7', brightCyan: '#5ee0d4', brightWhite: '#f3f6fa' },
+    'daylight-blue': { background: '#161b23', foreground: '#dfe6ef', cursor: '#38b6f0', cursorAccent: '#161b23', selection: 'rgba(56,182,240,0.22)', black: '#161b23', red: '#ff8585', green: '#34d8a0', yellow: '#f0c25a', blue: '#5cc6e8', magenta: '#c79af2', cyan: '#2bcbbb', white: '#dfe6ef', brightBlack: '#5b6675', brightRed: '#ffa0a0', brightGreen: '#5fe6b8', brightYellow: '#ffd884', brightBlue: '#82d4ee', brightMagenta: '#d6b3f7', brightCyan: '#5ee0d4', brightWhite: '#f3f6fa' },
+  };
+  function currentXtermTheme() {
+    const skin = (typeof document !== 'undefined' && document.documentElement.dataset.skin) || 'daylight-blue';
+    return CODEMAN_XTERM_THEMES[skin] || CODEMAN_XTERM_THEMES['daylight-blue'];
+  }
+
+  global.CodemanTerminalInput = {
+    isTerminalQueryResponse,
+    shouldSuppressTerminalQueryResponse,
+    USER_SCROLL_STICKY_SUPPRESS_MS,
+    TOUCH_COMPAT_MOUSE_SUPPRESS_MS,
+  };
+  global.CODEMAN_XTERM_THEMES = CODEMAN_XTERM_THEMES;
+  global.codemanCurrentXtermTheme = currentXtermTheme;
+})(window);
+
 Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   // Terminal Setup — xterm.js config and input handling
@@ -24,29 +68,7 @@ Object.assign(CodemanApp.prototype, {
     const scrollback = Number.isFinite(stored) && stored > 0 ? Math.max(stored, DEFAULT_SCROLLBACK) : DEFAULT_SCROLLBACK;
 
     this.terminal = new Terminal({
-      theme: {
-        background: '#0d0d0d',
-        foreground: '#e0e0e0',
-        cursor: '#e0e0e0',
-        cursorAccent: '#0d0d0d',
-        selection: 'rgba(255, 255, 255, 0.3)',
-        black: '#0d0d0d',
-        red: '#ff6b6b',
-        green: '#51cf66',
-        yellow: '#ffd43b',
-        blue: '#339af0',
-        magenta: '#cc5de8',
-        cyan: '#22b8cf',
-        white: '#e0e0e0',
-        brightBlack: '#495057',
-        brightRed: '#ff8787',
-        brightGreen: '#69db7c',
-        brightYellow: '#ffe066',
-        brightBlue: '#5c7cfa',
-        brightMagenta: '#da77f2',
-        brightCyan: '#66d9e8',
-        brightWhite: '#ffffff',
-      },
+      theme: { ...window.codemanCurrentXtermTheme() },
       fontFamily: '"Fira Code", "Cascadia Code", "JetBrains Mono", "SF Mono", Monaco, monospace',
       // Use much smaller font on touch devices to fit more columns (prevents wrapping of Claude's status line).
       // Phone gets the smallest size, tablet sits between phone and desktop.
@@ -62,6 +84,23 @@ Object.assign(CodemanApp.prototype, {
     this.fitAddon = new FitAddon.FitAddon();
     this.terminal.loadAddon(this.fitAddon);
 
+    // SerializeAddon: lets us snapshot the xterm rendered state (viewport +
+    // scrollback + colors/attrs) when switching away from a tab and restore
+    // it on switch-back. Needed primarily for codex tabs — codex's TUI drops
+    // earlier conversation from its current frame, so replaying the server
+    // byte buffer on tab-switch shows only the latest (idle) frame. The
+    // snapshot captures what the user was actually looking at.
+    this._xtermSnapshots = new Map(); // Map<sessionId, serialized-string>
+    if (typeof SerializeAddon !== 'undefined') {
+      try {
+        this._serializeAddon = new SerializeAddon.SerializeAddon();
+        this.terminal.loadAddon(this._serializeAddon);
+      } catch (_e) {
+        /* SerializeAddon failed — snapshot/restore disabled, fallback to buffer-fetch */
+        this._serializeAddon = null;
+      }
+    }
+
     if (typeof Unicode11Addon !== 'undefined') {
       try {
         const unicode11Addon = new Unicode11Addon.Unicode11Addon();
@@ -74,6 +113,7 @@ Object.assign(CodemanApp.prototype, {
 
     const container = document.getElementById('terminalContainer');
     this.terminal.open(container);
+    this._installMobileTapMouseGuard();
 
     // Suppress xterm key handling during CJK IME composition.
     // Without this, xterm processes raw keyDown events (e.g., "Process" key)
@@ -81,8 +121,14 @@ Object.assign(CodemanApp.prototype, {
     this.terminal.attachCustomKeyEventHandler((ev) => {
       if (ev.isComposing || ev.keyCode === 229) return false;
 
-      // Let Alt+digit pass through to browser (tab switching)
-      if (ev.altKey && ev.key >= '0' && ev.key <= '9') return false;
+      // Let the app's Alt/Option session-nav shortcuts reach the document keydown handler
+      // (app.js switches tabs by PHYSICAL e.code) instead of xterm injecting ESC<char> into
+      // the PTY. Mirror app.js's gate exactly — same physical codes + modifier guard — so
+      // macOS Option layouts (Option+1 -> "¡", Option+[ -> "“") are suppressed here too and
+      // don't leak an escape sequence into the focused terminal on every tab switch.
+      if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && /^(Digit[1-9]|BracketLeft|BracketRight)$/.test(ev.code || '')) {
+        return false;
+      }
 
       // Ctrl+V / Cmd+V: intercept before xterm sends ^V to PTY.
       // Route through our paste trap which handles both images and text.
@@ -165,7 +211,24 @@ Object.assign(CodemanApp.prototype, {
           // whitespace) -- if so, xterm handled it and we should not double-send.
           // Use a microtask to check after xterm's own handlers have run.
           const data = e.data;
+          const pendingBefore = this._localEchoOverlay?.pendingText || '';
           Promise.resolve().then(() => {
+            if (
+              this._lastTerminalData?.data === data &&
+              performance.now() - this._lastTerminalData.time < 100
+            ) {
+              xtermTextarea.value = '';
+              return;
+            }
+            const pendingAfter = this._localEchoOverlay?.pendingText || '';
+            if (
+              this._localEchoEnabled &&
+              pendingAfter.length > pendingBefore.length &&
+              pendingAfter.endsWith(data)
+            ) {
+              xtermTextarea.value = '';
+              return;
+            }
             // If xterm cleared the textarea, it processed the input -- skip.
             const val = xtermTextarea.value;
             if (!val || (val.trim() === '' && data !== ' ')) return;
@@ -228,15 +291,17 @@ Object.assign(CodemanApp.prototype, {
     }
 
     this._localEchoOverlay = new LocalEchoOverlay(this.terminal);
+    if (MobileDetection.isTouchDevice()) {
+      this.terminal.onCursorMove(() => this._syncMobileHelperTextareaToCursor());
+      this.terminal.onRender(() => this._syncMobileHelperTextareaToCursor());
+    }
 
     // CJK IME input — textarea in index.html, just wire up send
     this._cjkInput = null;
     if (typeof CjkInput !== 'undefined') {
       this._cjkInput = CjkInput.init({
         send: (text) => {
-          if (this.activeSessionId) {
-            this._sendInputAsync(this.activeSessionId, text);
-          }
+          this._handleCjkInput(text);
         },
       });
     }
@@ -275,6 +340,7 @@ Object.assign(CodemanApp.prototype, {
         ev.preventDefault();
         ev.stopPropagation();
         const lines = Math.round(ev.deltaY / 25) || (ev.deltaY > 0 ? 1 : -1);
+        this._noteTerminalUserScroll(lines);
         this.terminal.scrollLines(lines);
       },
       { capture: true, passive: false }
@@ -329,11 +395,14 @@ Object.assign(CodemanApp.prototype, {
       // don't interfere with scrolling panels, modals, or the session list.
       const startedInTerminal = (target) => !!(target && container.contains(target));
 
+      let touchStartY = 0;
+      const TAP_THRESHOLD = 8; // px — ignore micro-drift to distinguish tap from scroll
       document.addEventListener(
         'touchstart',
         (ev) => {
           if (ev.touches.length === 1 && startedInTerminal(ev.target)) {
             touchLastY = ev.touches[0].clientY;
+            touchStartY = touchLastY;
             velocity = 0;
             pixelAccum = 0;
             isTouching = true;
@@ -354,10 +423,19 @@ Object.assign(CodemanApp.prototype, {
         'touchmove',
         (ev) => {
           if (ev.touches.length === 1 && isTouching) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            didScroll = true;
             const touchY = ev.touches[0].clientY;
+            if (!didScroll && Math.abs(touchY - touchStartY) >= TAP_THRESHOLD) {
+              didScroll = true;
+            }
+            // Below the tap threshold, treat the gesture as a potential tap:
+            // don't preventDefault (iOS needs click synthesis to show the
+            // keyboard) and don't accumulate scroll distance or velocity. Without
+            // this guard, sub-threshold micro-drift still scrolls a line and
+            // leaves a non-zero velocity that touchend turns into a momentum
+            // fling, so a jittery tap would both position the cursor AND scroll.
+            if (!didScroll) return;
+            ev.preventDefault();
+            ev.stopPropagation(); // capture phase: stop xterm's own document touch listener (prevents wheel→arrow)
             const delta = touchLastY - touchY; // positive = scroll down
             pixelAccum += delta;
             velocity = delta * 1.2;
@@ -366,6 +444,7 @@ Object.assign(CodemanApp.prototype, {
             const ch = cellHeight();
             const lines = Math.trunc(pixelAccum / ch);
             if (lines !== 0) {
+              this._noteTerminalUserScroll(lines);
               this.terminal.scrollLines(lines);
               pixelAccum -= lines * ch;
             }
@@ -376,17 +455,41 @@ Object.assign(CodemanApp.prototype, {
 
       document.addEventListener(
         'touchend',
-        () => {
+        (ev) => {
           if (!isTouching) return;
           isTouching = false;
           if (!scrollFrame && Math.abs(velocity) > 0.3) {
             scrollFrame = requestAnimationFrame(scrollLoop);
           }
-          // Tap (no scroll): refocus xterm's hidden textarea so keyboard input
-          // routes back to the terminal. Without this, a tap on the terminal area
-          // consumes the touch event but xterm's textarea never regains focus.
           if (!didScroll && this.terminal) {
-            this.terminal.focus();
+            // ── Tap-to-position cursor ──────────────────────────────────
+            // Synthesize a click from the real touch point so the foreground app
+            // moves its cursor to the tapped cell (iOS doesn't reliably do this
+            // itself under touch-action:none). CRITICAL: only when mouse tracking
+            // is ON. xterm disables its local SelectionService while mouse events
+            // are active, so the synthetic click is forwarded to the PTY as an SGR
+            // report (cursor moves). But when tracking is OFF, that same click
+            // drives xterm's LOCAL selection (detail 1/2/3 → char/word/line) — a
+            // tap on CJK text would select & copy it instead of positioning. So
+            // gate strictly on the live mouse-tracking mode.
+            const touch = ev.changedTouches && ev.changedTouches[0];
+            const mouseMode = this.terminal.modes?.mouseTrackingMode;
+            const mouseTrackingOn = !!mouseMode && mouseMode !== 'none';
+            if (touch) {
+              this._suppressTrustedTapMouseEvents();
+            }
+            if (touch && mouseTrackingOn) {
+              this._dispatchSyntheticTerminalClick(touch.clientX, touch.clientY);
+            }
+            this._syncMobileHelperTextareaToCursor();
+            // Route subsequent typing to the right place: keep the CJK input
+            // field focused when Chinese input is on, otherwise the terminal.
+            const cjkInput = document.getElementById('cjkInput');
+            if (cjkInput?.classList.contains('cjk-input-visible')) {
+              cjkInput.focus();
+            } else {
+              this.terminal.focus();
+            }
           }
         },
         { capture: true, passive: true }
@@ -411,6 +514,9 @@ Object.assign(CodemanApp.prototype, {
 
     // Generation counter for chunkedTerminalWrite — aborts stale writes on tab switch
     this._chunkedWriteGen = 0;
+    this._bufferLoadSeq = 0;
+    this._bufferLoadOwner = null;
+    this._lastUserScrollUpAt = null;
 
     // Handle resize with throttling for performance
     this._resizeTimeout = null;
@@ -479,11 +585,30 @@ Object.assign(CodemanApp.prototype, {
               this.terminal.write('\x1b[3J\x1b[H\x1b[2J');
             }
             this._lastResizeDims = { cols, rows };
-            fetch(`/api/sessions/${this.activeSessionId}/resize`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ cols, rows }),
-            }).catch(() => {});
+            // Typed + WS-first like sendResize: the viewport type feeds resize
+            // arbitration (a phone rotating must not bypass a desktop claim),
+            // and a desktop window narrowing past the tablet breakpoint must
+            // send a typed WS frame so its stale desktop claim is released.
+            const viewportType =
+              typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
+                ? MobileDetection.getDeviceType()
+                : 'desktop';
+            let sentViaWs = false;
+            if (this._wsReady && this._wsSessionId === this.activeSessionId) {
+              try {
+                this._ws.send(JSON.stringify({ t: 'z', c: cols, r: rows, v: viewportType }));
+                sentViaWs = true;
+              } catch {
+                // Fall through to HTTP POST
+              }
+            }
+            if (!sentViaWs) {
+              fetch(`/api/sessions/${this.activeSessionId}/resize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cols, rows, viewportType }),
+              }).catch(() => {});
+            }
           }
         }
         // Update subagent connection lines and local echo at new dimensions
@@ -524,14 +649,23 @@ Object.assign(CodemanApp.prototype, {
     // survives tab switches and reconnects.
 
     this.terminal.onData((data) => {
-      // CJK input has focus — block xterm from sending to PTY
-      if (window.cjkActive || document.activeElement?.id === 'cjkInput') return;
+      // Mouse SGR reports (tap-to-position) are NOT IME input — they must reach
+      // the PTY even while the CJK input field owns focus. Without this exception
+      // tapping to move the cursor silently does nothing whenever Chinese input
+      // is on, because cjkActive stays true the whole time the field is visible.
+      const isMouseReport = /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data);
+      // CJK input has focus — block xterm from sending keystrokes to PTY
+      if (!isMouseReport && (window.cjkActive || document.activeElement?.id === 'cjkInput')) return;
       if (this.activeSessionId) {
-        // Filter out terminal query responses that xterm.js generates automatically.
-        // These are responses to DA (Device Attributes), DSR (Device Status Report), etc.
-        // sent by tmux when attaching. Without this filter, they appear as typed text.
-        // Patterns: \x1b[?...c (DA1), \x1b[>...c (DA2), \x1b[...R (CPR), \x1b[...n (DSR)
-        if (/^\x1b\[[\?>=]?[\d;]*[cnR]$/.test(data)) return;
+        // Filter terminal query replies generated by xterm.js itself.
+        // Forwarding them through the WebSocket injects DA/DSR/CPR replies
+        // into the foreground process as typed input (for example "0;276;0c").
+        if (
+          window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data)
+        ) {
+          return;
+        }
+        this._lastTerminalData = { data, time: performance.now() };
 
         // ── Local Echo Mode ──
         // When enabled, keystrokes are buffered locally in the overlay for
@@ -799,7 +933,11 @@ Object.assign(CodemanApp.prototype, {
 
         // Pattern 1: Commands with file paths (tail -f, cat, head, grep pattern, etc.)
         // Handles: tail -f /path, grep pattern /path, cat -n /path
-        const cmdPattern = /(tail|cat|head|less|grep|watch|vim|nano)\s+(?:[^\s\/]*\s+)*(\/[^\s"'<>|;&\n\x00-\x1f]+)/g;
+        // ⚠ The arg group must stay linear-time: `(?:[^\s\/]*\s+)*` (empty-matchable
+        // token, unbounded) backtracks exponentially on lines with a trigger word
+        // followed by multi-space runs (e.g. wrapped heredoc/table output) — froze
+        // the whole tab on hover. Non-empty token + bounded reps is O(n).
+        const cmdPattern = /\b(tail|cat|head|less|grep|watch|vim|nano)\s+(?:[^\s\/]+\s+){0,4}(\/[^\s"'<>|;&\n\x00-\x1f]+)/g;
 
         // Pattern 2: Paths with common extensions
         const extPattern =
@@ -874,6 +1012,9 @@ Object.assign(CodemanApp.prototype, {
       this.loadTunnelStatus();
       this.loadHistorySessions();
     }
+    // Home screen has no input target — hide the CJK textarea (activeSessionId
+    // is null by the time we get here). Guarded: defined on the app object.
+    this._updateCjkInputState?.();
   },
 
   hideWelcome() {
@@ -887,6 +1028,9 @@ Object.assign(CodemanApp.prototype, {
       clearTimeout(this._welcomeQrShrinkTimer);
       qrWrap.classList.remove('expanded');
     }
+    // Entering a session — restore CJK textarea if the user has it enabled
+    // (activeSessionId is already set by selectSession before this call).
+    this._updateCjkInputState?.();
   },
 
   /**
@@ -897,7 +1041,7 @@ Object.assign(CodemanApp.prototype, {
   async _fetchHistorySessions() {
     const res = await fetch('/api/history/sessions');
     const data = await res.json();
-    const sessions = data.sessions || [];
+    const sessions = data.data?.sessions || [];
     if (sessions.length === 0) return [];
 
     const byProject = new Map();
@@ -1075,7 +1219,7 @@ Object.assign(CodemanApp.prototype, {
       // Prefer already-loaded this.cases to avoid an extra request.
       const casesPromise = Array.isArray(this.cases) && this.cases.length > 0
         ? Promise.resolve(this.cases)
-        : fetch('/api/cases').then((r) => (r.ok ? r.json() : [])).catch(() => []);
+        : fetch('/api/cases').then((r) => (r.ok ? r.json() : null)).then((d) => d?.data || []).catch(() => []);
       const [allSessions, cases] = await Promise.all([
         this._fetchHistorySessions(30),
         casesPromise,
@@ -1202,8 +1346,8 @@ Object.assign(CodemanApp.prototype, {
       const url = `/api/history/sessions?projectKey=${encodeURIComponent(projectKey)}&offset=${offset}&limit=${limit}`;
       const res = await fetch(url);
       const data = await res.json();
-      const sessions = data.sessions || [];
-      state.total = typeof data.total === 'number' ? data.total : sessions.length + offset;
+      const sessions = data.data?.sessions || [];
+      state.total = typeof data.data?.total === 'number' ? data.data.total : sessions.length + offset;
 
       if (offset === 0 && sessions.length === 0) {
         const empty = document.createElement('div');
@@ -1273,7 +1417,9 @@ Object.assign(CodemanApp.prototype, {
       // Match by path (not basename) so linked/renamed cases still resolve correctly.
       const matchingCase = (this.cases || []).find((c) => c.path === workingDir);
       const caseName = matchingCase?.name || workingDir.split('/').pop() || '';
-      const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), this.loadAppSettingsFromStorage());
+      const globalSettings = this.loadAppSettingsFromStorage();
+      const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), globalSettings);
+      const effort = this.getEffortSetting(globalSettings);
       const createRes = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1282,12 +1428,13 @@ Object.assign(CodemanApp.prototype, {
           name,
           resumeSessionId: sessionId,
           ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
+          ...(effort ? { effort } : {}),
         }),
       });
       const createData = await createRes.json();
       if (!createData.success) throw new Error(createData.error);
 
-      const newSessionId = createData.session.id;
+      const newSessionId = createData.data.session.id;
 
       // Start interactive
       await fetch(`/api/sessions/${newSessionId}/interactive`, { method: 'POST' });
@@ -1315,6 +1462,22 @@ Object.assign(CodemanApp.prototype, {
     // If viewportY >= baseY, we're showing the latest content (at bottom)
     // Allow 2 lines tolerance for edge cases
     return buffer.viewportY >= buffer.baseY - 2;
+  },
+
+  // Record manual scroll gestures so sticky-scroll can give an upward scroll a
+  // short grace window (see _hasRecentUserScrollUp). A downward scroll that
+  // lands back at the bottom clears the suppression immediately.
+  _noteTerminalUserScroll(lines) {
+    if (lines < 0) {
+      this._lastUserScrollUpAt = performance.now();
+    } else if (this.isTerminalAtBottom()) {
+      this._lastUserScrollUpAt = null;
+    }
+  },
+
+  _hasRecentUserScrollUp() {
+    if (typeof this._lastUserScrollUpAt !== 'number') return false;
+    return performance.now() - this._lastUserScrollUpAt < window.CodemanTerminalInput.USER_SCROLL_STICKY_SUPPRESS_MS;
   },
 
   batchTerminalWrite(data) {
@@ -1452,10 +1615,42 @@ Object.assign(CodemanApp.prototype, {
         this._localEchoOverlay.clear();
         this._localEchoEnabled = false;
       } else {
-        // Claude Code: scan for ❯ prompt character
-        this._localEchoOverlay.setPrompt({ type: 'character', char: '\u276f', offset: 2 });
+        // Codex/Claude-style TUIs usually expose a ❯ prompt. During active
+        // redraws or compact mobile layouts that marker may not be present in
+        // the viewport, while xterm's cursor still marks the editable input
+        // position. Fall back to cursor coordinates so phone typing appears at
+        // the terminal cursor instead of disappearing into pending state.
+        this._localEchoOverlay.setPrompt({
+          type: 'custom',
+          offset: 0,
+          find: (terminal) => {
+            try {
+              const buf = terminal.buffer.active;
+              for (let row = terminal.rows - 1; row >= 0; row--) {
+                const line = buf.getLine(buf.viewportY + row);
+                if (!line) continue;
+                const text = line.translateToString(true);
+                const idx = text.lastIndexOf('\u276f');
+                if (idx >= 0) return { row, col: idx + 2 };
+              }
+              return {
+                row: Math.max(0, Math.min(terminal.rows - 1, buf.cursorY)),
+                col: Math.max(0, Math.min(terminal.cols - 1, buf.cursorX)),
+              };
+            } catch {
+              return null;
+            }
+          },
+        });
       }
     }
+  },
+
+  // CJK textarea already provides visual feedback — bypass local echo
+  // buffering so each composed word reaches the PTY immediately.
+  _handleCjkInput(text) {
+    if (!this.activeSessionId) return;
+    this._sendInputAsync(this.activeSessionId, text);
   },
 
   /**
@@ -1476,8 +1671,16 @@ Object.assign(CodemanApp.prototype, {
 
     // Per-frame byte budget to prevent main thread blocking.
     // Large writes (141KB+) can freeze Chrome for 2+ minutes.
-    const MAX_FRAME_BYTES = 65536; // 64KB budget per frame
+    // Codex's TUI emits dense synchronized redraws during thinking/high-effort
+    // phases, so it gets a smaller first frame to keep per-frame xterm/WebGL
+    // stalls short; other modes keep the larger 64KB budget.
+    const activeSession = this.activeSessionId && this.sessions ? this.sessions.get(this.activeSessionId) : null;
+    const MAX_FRAME_BYTES = activeSession?.mode === 'codex' ? 32768 : 65536;
     let deferred = false;
+    // If the user recently scrolled up, remember the viewport so we can restore
+    // it after the write — Codex status redraws would otherwise jump it.
+    const preserveViewportY =
+      this._hasRecentUserScrollUp() && this.terminal.buffer?.active ? this.terminal.buffer.active.viewportY : null;
 
     if (_joinedLen <= MAX_FRAME_BYTES) {
       this.terminal.write(joined);
@@ -1494,6 +1697,13 @@ Object.assign(CodemanApp.prototype, {
         });
       }
     }
+    if (
+      preserveViewportY !== null &&
+      this.terminal.buffer?.active?.viewportY !== preserveViewportY &&
+      typeof this.terminal.scrollToLine === 'function'
+    ) {
+      this.terminal.scrollToLine(preserveViewportY);
+    }
     const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;
     const _dt = performance.now() - _t0;
     if (_dt > 100 || deferred)
@@ -1501,8 +1711,11 @@ Object.assign(CodemanApp.prototype, {
         `[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame / 1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen / 1024).toFixed(0)}KB)`
       );
 
-    // Sticky scroll: if user was at bottom, keep them there after new output
-    if (this._wasAtBottomBeforeWrite) {
+    // Sticky scroll: if user was at bottom, keep them there after new output.
+    // Give manual scroll-up gestures a short grace window so high-frequency
+    // Codex status ticks do not snap the viewport back while the user is
+    // trying to inspect earlier output.
+    if (this._wasAtBottomBeforeWrite && !this._hasRecentUserScrollUp()) {
       this.terminal.scrollToBottom();
     }
 
@@ -1620,6 +1833,38 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  scrollToLastNonEmptyLine() {
+    if (!this.terminal?.buffer?.active) {
+      this.terminal?.scrollToBottom?.();
+      return;
+    }
+
+    const buffer = this.terminal.buffer.active;
+    const totalLines = buffer.baseY + buffer.length;
+    let lastNonEmptyLine = -1;
+
+    for (let lineIndex = totalLines - 1; lineIndex >= 0; lineIndex--) {
+      const line = buffer.getLine(lineIndex);
+      if (line?.translateToString(true).trim()) {
+        lastNonEmptyLine = lineIndex;
+        break;
+      }
+    }
+
+    if (lastNonEmptyLine >= 0 && typeof this.terminal.scrollToLine === 'function') {
+      let targetLine = Math.max(0, lastNonEmptyLine - this.terminal.rows + 2);
+      const maxTargetLine = Math.max(0, lastNonEmptyLine);
+      while (targetLine < maxTargetLine) {
+        const line = buffer.getLine(targetLine);
+        if (line?.translateToString(true).trim()) break;
+        targetLine++;
+      }
+      this.terminal.scrollToLine(targetLine);
+    } else {
+      this.terminal.scrollToBottom();
+    }
+  },
+
   /**
    * Write large buffer to terminal in chunks to avoid UI jank.
    * Uses _safeYield to spread work across frames; falls back to setTimeout
@@ -1628,21 +1873,18 @@ Object.assign(CodemanApp.prototype, {
    * @param {number} chunkSize - Size of each chunk (default 128KB for smooth 60fps)
    * @returns {Promise<void>} - Resolves when all chunks written
    */
-  chunkedTerminalWrite(buffer, chunkSize = TERMINAL_CHUNK_SIZE) {
+  chunkedTerminalWrite(buffer, chunkSize = TERMINAL_CHUNK_SIZE, loadOwner) {
     // Generation counter: if a newer chunkedTerminalWrite starts (tab switch),
     // older writes abort instead of continuing to push stale data into the terminal.
     const writeGen = ++this._chunkedWriteGen;
+    const bufferLoadOwner = this._beginBufferLoad(loadOwner);
 
     return new Promise((resolve) => {
       if (!buffer || buffer.length === 0) {
-        this._finishBufferLoad();
+        this._finishBufferLoad(bufferLoadOwner);
         resolve();
         return;
       }
-
-      // Block live SSE writes during buffer load to prevent interleaving
-      this._isLoadingBuffer = true;
-      this._loadBufferQueue = [];
 
       // Strip any DEC 2026 markers that might be in the buffer
       // (from historical SSE data that was stored with markers)
@@ -1651,15 +1893,14 @@ Object.assign(CodemanApp.prototype, {
       const finish = () => {
         // Only finish if we're still the active write — a newer write owns buffer load state
         if (this._chunkedWriteGen === writeGen) {
-          this._finishBufferLoad();
+          this._finishBufferLoad(bufferLoadOwner);
         }
         resolve();
       };
 
       // For small buffers, write directly — single-frame render is fast enough
       if (cleanBuffer.length <= chunkSize) {
-        this.terminal.write(cleanBuffer);
-        finish();
+        this.terminal.write(cleanBuffer, finish);
         return;
       }
 
@@ -1717,9 +1958,23 @@ Object.assign(CodemanApp.prototype, {
    * (especially Ink cursor-up redraws), corrupting the terminal display.
    * After unblocking, new SSE/WS events deliver subsequent output normally.
    */
-  _finishBufferLoad() {
+  _beginBufferLoad(owner) {
+    if (this._bufferLoadSeq === undefined) this._bufferLoadSeq = 0;
+    const loadOwner = owner === undefined ? `buffer-${++this._bufferLoadSeq}` : owner;
+    this._bufferLoadOwner = loadOwner;
+    this._isLoadingBuffer = true;
+    this._loadBufferQueue = [];
+    return loadOwner;
+  },
+
+  _finishBufferLoad(owner) {
+    if (owner !== undefined && this._bufferLoadOwner !== owner) {
+      return false;
+    }
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._bufferLoadOwner = null;
+    return true;
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -1749,9 +2004,10 @@ Object.assign(CodemanApp.prototype, {
     }
 
     try {
-      // Send resize to restore proper dimensions (with minimum enforcement).
-      // The PTY's SIGWINCH on real dim change is enough for Ink to redraw.
-      await this.sendResize(this.activeSessionId);
+      // Force resize even when dimensions match the server's last known state —
+      // another device may have changed the PTY size since this client last sent,
+      // and force guarantees a SIGWINCH → Ink redraw at the current device's size.
+      await this.sendResize(this.activeSessionId, { force: true });
 
       this.showToast(`Terminal restored to ${dims.cols}x${dims.rows}`, 'success');
     } catch (err) {
@@ -1789,6 +2045,79 @@ Object.assign(CodemanApp.prototype, {
     } catch (err) {
       this.showToast('Failed to copy', 'error');
     }
+  },
+
+  _syncMobileHelperTextareaToCursor() {
+    if (!MobileDetection.isTouchDevice() || !this.terminal?.element) return;
+    try {
+      const xtermEl = this.terminal.element;
+      const cursor = this.terminal.element.querySelector('.xterm-cursor');
+      const screen = this.terminal.element.querySelector('.xterm-screen');
+      if (!(xtermEl instanceof HTMLElement) || !(cursor instanceof HTMLElement) || !(screen instanceof HTMLElement)) return;
+      const cursorRect = cursor.getBoundingClientRect();
+      const screenRect = screen.getBoundingClientRect();
+      if (!cursorRect.width && !cursorRect.height) return;
+      const left = Math.max(0, Math.round(cursorRect.left - screenRect.left));
+      const top = Math.max(0, Math.round(cursorRect.top - screenRect.top));
+      xtermEl.style.setProperty('--xterm-helper-left', `${left}px`);
+      xtermEl.style.setProperty('--xterm-helper-top', `${top}px`);
+    } catch {}
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Synthetic tap → mouse report
+  // ═══════════════════════════════════════════════════════════════
+  // Dispatch a mousedown+mouseup pair at viewport coords (clientX/clientY) to
+  // xterm's root element. xterm's mouse-reporting handler reads the event's
+  // client coords, maps them to a terminal cell relative to .xterm-screen, and
+  // — when the foreground app has mouse tracking active (DECSET 1000/1002/1006,
+  // which Claude's input enables) — encodes an SGR mouse report to the PTY.
+  // That is the same path a real desktop click takes; on touch devices the
+  // browser's own compatibility-event synthesis is unreliable (and suppressed
+  // by touch-action:none), so we drive it explicitly. With mouse tracking off
+  // it degrades to a harmless zero-length click (no drag → no text selection).
+  _dispatchSyntheticTerminalClick(clientX, clientY) {
+    const el = this.terminal?.element;
+    if (!el || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
+    // xterm registers its mouseup listener on document during mousedown, so a
+    // bubbling mouseup reaches it; dispatch both to the root element in order.
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX,
+      clientY,
+      screenX: clientX,
+      screenY: clientY,
+      button: 0,
+      detail: 1,
+    };
+    try {
+      el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+      el.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 }));
+    } catch {
+      /* MouseEvent constructor unavailable — tap-to-position simply no-ops */
+    }
+  },
+
+  _installMobileTapMouseGuard() {
+    const el = this.terminal?.element;
+    if (!el || el._codemanTapMouseGuardInstalled) return;
+    if (typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice && !MobileDetection.isTouchDevice()) return;
+    el._codemanTapMouseGuardInstalled = true;
+    const suppressTrustedCompatMouse = (ev) => {
+      const suppressUntil = this._trustedTapMouseSuppressUntil || 0;
+      if (!ev.isTrusted || performance.now() > suppressUntil) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+    };
+    el.addEventListener('mousedown', suppressTrustedCompatMouse, true);
+    el.addEventListener('mouseup', suppressTrustedCompatMouse, true);
+  },
+
+  _suppressTrustedTapMouseEvents() {
+    const ms = window.CodemanTerminalInput?.TOUCH_COMPAT_MOUSE_SUPPRESS_MS || 450;
+    this._trustedTapMouseSuppressUntil = performance.now() + ms;
   },
 
   increaseFontSize() {
@@ -1840,32 +2169,52 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Send resize to a session with minimum dimension enforcement.
    * @param {string} sessionId
-   * @returns {Promise<void>}
+   * @param {{ forceHttp?: boolean, force?: boolean }} [options]
+   * @returns {Promise<boolean>} Whether dimensions changed from the last send
    */
-  async sendResize(sessionId) {
+  async sendResize(sessionId, options = {}) {
     // Fit terminal to container before reading dimensions — ensures local
     // terminal size matches what we report to the server PTY.
     if (this.fitAddon) this.fitAddon.fit();
     const dims = this.getTerminalDimensions();
-    if (!dims) return;
+    if (!dims) return false;
+    // Did the dimensions actually change since the last resize we sent? Callers
+    // use this to skip work (e.g. the post-resize TUI-redraw settle) when no
+    // real SIGWINCH was triggered — switching tabs at the same browser size is
+    // a no-op on the server and needs no redraw grace.
+    const prev = this._lastResizeDims;
+    const changed = !prev || prev.cols !== dims.cols || prev.rows !== dims.rows;
     // Update _lastResizeDims so the throttledResize handler won't redundantly
     // clear the terminal for the same dimensions (which would blank the screen
     // without a subsequent Ink redraw to repaint it).
     this._lastResizeDims = { cols: dims.cols, rows: dims.rows };
+    const viewportType =
+      typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
+        ? MobileDetection.getDeviceType()
+        : window.innerWidth < 430
+          ? 'mobile'
+          : window.innerWidth < 768
+            ? 'tablet'
+            : 'desktop';
     // Fast path: WebSocket resize
-    if (this._wsReady && this._wsSessionId === sessionId) {
+    if (!options.forceHttp && this._wsReady && this._wsSessionId === sessionId) {
       try {
-        this._ws.send(JSON.stringify({ t: 'z', c: dims.cols, r: dims.rows }));
-        return;
+        const msg = { t: 'z', c: dims.cols, r: dims.rows, v: viewportType };
+        if (options.force) msg.f = true;
+        this._ws.send(JSON.stringify(msg));
+        return changed;
       } catch {
         // Fall through to HTTP POST
       }
     }
+    const body = { ...dims, viewportType };
+    if (options.force) body.force = true;
     await fetch(`/api/sessions/${sessionId}/resize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(dims),
+      body: JSON.stringify(body),
     });
+    return changed;
   },
 
   /**
@@ -1874,12 +2223,11 @@ Object.assign(CodemanApp.prototype, {
    * @returns {Promise<void>}
    */
   async sendInput(input) {
-    if (!this.activeSessionId) return;
-    await fetch(`/api/sessions/${this.activeSessionId}/input`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input, useMux: true }),
-    });
+    if (!this.activeSessionId || !input) return;
+    // Route through the durable, exactly-once delivery layer (useMux for the
+    // POST fallback) so voice / keyboard-accessory / paste input also survives a
+    // dropped link instead of being lost in a single best-effort fetch.
+    this._sendInputAsync(this.activeSessionId, input, { useMux: true });
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -1908,5 +2256,28 @@ Object.assign(CodemanApp.prototype, {
       const value = input.value.trim();
       document.getElementById('dirDisplay').textContent = value || 'No directory';
     }, 100);
+  },
+
+  // Re-theme all live xterm terminals (main + teammate) to the given skin's palette.
+  // Uses the xterm v5+ live setter (full object assignment triggers a repaint for both
+  // DOM and WebGL renderers) plus a belt-and-suspenders refresh().
+  applyTerminalSkin(skin) {
+    const theme = { ...(window.CODEMAN_XTERM_THEMES[skin] || window.CODEMAN_XTERM_THEMES['daylight-blue']) };
+    if (this.terminal) {
+      this.terminal.options.theme = theme;
+      try {
+        this.terminal.refresh(0, this.terminal.rows - 1);
+      } catch {}
+    }
+    if (this.teammateTerminals) {
+      for (const [, entry] of this.teammateTerminals) {
+        if (entry && entry.terminal) {
+          entry.terminal.options.theme = { ...theme };
+          try {
+            entry.terminal.refresh(0, entry.terminal.rows - 1);
+          } catch {}
+        }
+      }
+    }
   },
 });

@@ -66,3 +66,5 @@ export * from './teams.js';
 export * from './push.js';
 export * from './plan.js';
 export * from './orchestrator.js';
+export * from './update.js';
+export * from './workflow-run.js';

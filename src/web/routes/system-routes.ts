@@ -6,12 +6,15 @@
 
 import { FastifyInstance } from 'fastify';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { homedir, totalmem, freemem, loadavg, cpus } from 'node:os';
-import { execSync } from 'node:child_process';
+import { totalmem, freemem, loadavg, cpus } from 'node:os';
+import { execSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { dataPath } from '../../config/instance.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type NiceConfig } from '../../types.js';
+import { isUnauthenticatedNetworkAcknowledged } from '../network-auth-policy.js';
 import {
   ConfigUpdateSchema,
   SettingsUpdateSchema,
@@ -23,6 +26,8 @@ import {
 } from '../schemas.js';
 import { subagentWatcher } from '../../subagent-watcher.js';
 import { imageWatcher } from '../../image-watcher.js';
+import { workflowRunWatcher } from '../../workflow-run-watcher.js';
+import { applyStatusLineConfig } from '../../hooks-config.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import {
   findSessionOrFail,
@@ -33,6 +38,7 @@ import {
   SETTINGS_PATH,
 } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
+import { getInstallInfo, checkForUpdate, startUpdate, getUpdateStatusForApi } from '../self-update.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort } from '../ports/index.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
 import { QR_AUTH_FAILURE_MAX } from '../../config/tunnel-config.js';
@@ -41,7 +47,7 @@ import { AUTH_SESSION_TTL_MS } from '../../config/auth-config.js';
 // Maximum screenshot upload size (10MB)
 const MAX_SCREENSHOT_SIZE = 10 * 1024 * 1024;
 // Screenshots directory
-const SCREENSHOTS_DIR = join(homedir(), '.codeman', 'screenshots');
+const SCREENSHOTS_DIR = dataPath('screenshots');
 
 /** Cached CPU count — doesn't change at runtime */
 const CPU_COUNT = cpus().length;
@@ -121,12 +127,24 @@ function getSystemStats(): {
   }
 }
 
+/**
+ * Build the URL the spanning browser window should open, pinned to localhost.
+ * Takes only a digits-only port from the (untrusted) Host header so nothing
+ * attacker-controllable reaches the launched browser; falls back to the default
+ * port when the header is absent/odd. Exported for unit testing.
+ */
+export function resolveSpanUrl(hostHeader: string | undefined, fallbackPort = '3000'): string {
+  const hostPort = String(hostHeader ?? '').split(':')[1] ?? '';
+  const port = /^\d+$/.test(hostPort) ? hostPort : fallbackPort;
+  return `http://localhost:${port}`;
+}
+
 export function registerSystemRoutes(
   app: FastifyInstance,
   ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort
 ): void {
-  const windowStatesPath = join(homedir(), '.codeman', 'subagent-window-states.json');
-  const parentMapPath = join(homedir(), '.codeman', 'subagent-parents.json');
+  const windowStatesPath = dataPath('subagent-window-states.json');
+  const parentMapPath = dataPath('subagent-parents.json');
 
   // ═══════════════════════════════════════════════════════════════
   // System Status & Health
@@ -252,7 +270,7 @@ export function registerSystemRoutes(
 
   app.post('/api/tunnel/qr/regenerate', async () => {
     ctx.tunnelManager.regenerateQrToken();
-    return { success: true };
+    return {};
   });
 
   // ========== Auth Session Revocation ==========
@@ -265,7 +283,80 @@ export function registerSystemRoutes(
       // Revoke all sessions (nuclear option)
       ctx.authSessions?.clear();
     }
-    return { success: true };
+    return {};
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Multi-monitor: span Codeman across all displays
+  // ═══════════════════════════════════════════════════════════════
+
+  // Spawn scripts/span-codeman.sh, which opens a fresh, maximized browser --app
+  // window sized to the union of all displays — so in-page floating session
+  // panels can be dragged across the physical monitor seam. macOS only; needs
+  // the one-time "Displays have separate Spaces" OFF prerequisite (see script).
+  app.post('/api/system/span-displays', async (req, reply) => {
+    // macOS only: the launcher uses osascript + Finder desktop bounds and Chrome
+    // --app geometry flags. Fail clearly elsewhere instead of spawning a bash
+    // that errors out invisibly (the toast would otherwise lie "Opening…").
+    if (process.platform !== 'darwin') {
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ApiErrorCode.INVALID_INPUT,
+            'Multi-monitor spanning runs on the Codeman server, which is not macOS. ' +
+              'If your monitors are on a remote Mac, run scripts/span-codeman.sh locally on that Mac with this server URL — see the script header for details.'
+          )
+        );
+    }
+    // Resolve the bundled launcher relative to this module (works from src/ and dist/).
+    const scriptPath = join(dirname(fileURLToPath(import.meta.url)), '../../../scripts/span-codeman.sh');
+    if (!existsSync(scriptPath)) {
+      return reply.code(500).send(createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'span-codeman.sh not found'));
+    }
+    // Point the spanning window at THIS server (localhost + sanitized port).
+    const url = resolveSpanUrl(req.headers.host);
+    try {
+      const child = spawn('bash', [scriptPath, url], { detached: true, stdio: 'ignore' });
+      child.on('error', (err) => app.log.error({ err }, 'span-displays launch failed'));
+      child.unref();
+      return { url };
+    } catch (err) {
+      return reply.code(500).send(createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err)));
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Self-Update (App Settings → Updates)
+  // ═══════════════════════════════════════════════════════════════
+
+  // Install info + whether a newer release exists. Manual, user-triggered.
+  app.get('/api/system/update/check', async () => {
+    const check = await checkForUpdate();
+    const info = getInstallInfo();
+    return { ...info, ...check };
+  });
+
+  // Poll target for update progress — survives the restart the update triggers.
+  app.get('/api/system/update/status', async () => getUpdateStatusForApi());
+
+  // Kick off a detached update to the latest release. Returns immediately; the
+  // browser then polls /api/system/update/status across the service restart.
+  app.post('/api/system/update', async (_req, reply) => {
+    const result = await startUpdate();
+    if (result.ok) {
+      return { updateId: result.updateId, toTag: result.toTag, toVersion: result.toVersion };
+    }
+    const map = {
+      'in-flight': { http: 409, api: ApiErrorCode.ALREADY_EXISTS },
+      'up-to-date': { http: 409, api: ApiErrorCode.ALREADY_EXISTS },
+      'not-git': { http: 400, api: ApiErrorCode.INVALID_INPUT },
+      disabled: { http: 403, api: ApiErrorCode.INVALID_INPUT },
+      'bad-tag': { http: 400, api: ApiErrorCode.INVALID_INPUT },
+      error: { http: 500, api: ApiErrorCode.INTERNAL_ERROR },
+    } as const;
+    const m = map[result.code];
+    return reply.code(m.http).send(createErrorResponse(m.api, result.message));
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -282,6 +373,14 @@ export function registerSystemRoutes(
     };
   });
 
+  app.get('/api/codex/status', async () => {
+    const { isCodexAvailable, resolveCodexDir } = await import('../../utils/codex-cli-resolver.js');
+    return {
+      available: isCodexAvailable(),
+      path: resolveCodexDir(),
+    };
+  });
+
   // ═══════════════════════════════════════════════════════════════
   // State & Lifecycle (cleanup, lifecycle log, stats)
   // ═══════════════════════════════════════════════════════════════
@@ -295,7 +394,7 @@ export function registerSystemRoutes(
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
     }
-    return { success: true, cleanedSessions: result.count };
+    return { cleanedSessions: result.count };
   });
 
   app.get('/api/session-lifecycle', async (req) => {
@@ -312,7 +411,7 @@ export function registerSystemRoutes(
       since: query.since ? Number(query.since) : undefined,
       limit: query.limit ? Math.min(Number(query.limit), 1000) : 200,
     });
-    return { success: true, entries };
+    return { entries };
   });
 
   // ========== Stats ==========
@@ -332,7 +431,6 @@ export function registerSystemRoutes(
   app.get('/api/stats', async () => {
     const activeSessionTokens = collectActiveTokens();
     return {
-      success: true,
       stats: ctx.store.getAggregateStats(activeSessionTokens),
       raw: ctx.store.getGlobalStats(),
     };
@@ -341,7 +439,6 @@ export function registerSystemRoutes(
   app.get('/api/token-stats', async () => {
     const activeSessionTokens = collectActiveTokens();
     return {
-      success: true,
       daily: ctx.store.getDailyStats(30),
       totals: ctx.store.getAggregateStats(activeSessionTokens),
     };
@@ -354,13 +451,13 @@ export function registerSystemRoutes(
   // ========== Config ==========
 
   app.get('/api/config', async () => {
-    return { success: true, config: ctx.store.getConfig() };
+    return { config: ctx.store.getConfig() };
   });
 
   app.put('/api/config', async (req) => {
     const configData = parseBody(ConfigUpdateSchema, req.body, 'Invalid config');
     ctx.store.setConfig(configData as Partial<ReturnType<typeof ctx.store.getConfig>>);
-    return { success: true, config: ctx.store.getConfig() };
+    return { config: ctx.store.getConfig() };
   });
 
   // ========== Debug/Memory ==========
@@ -433,6 +530,40 @@ export function registerSystemRoutes(
   app.put('/api/settings', async (req) => {
     const settings = parseBody(SettingsUpdateSchema, req.body, 'Invalid settings') as Record<string, unknown>;
 
+    // COD-55: enabling the Cloudflare tunnel publishes the whole app (full terminal
+    // control = effectively RCE) to a public *.trycloudflare.com URL. Because the
+    // tunnel binds to loopback, server.ts's non-loopback bind guard never trips, and
+    // with no CODEMAN_PASSWORD the auth middleware is inactive — so the tunnel URL is
+    // unauthenticated. Refuse to start a tunnel unless auth is configured OR exposure
+    // is acknowledged: either the CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK env var, or an
+    // explicit per-request `acknowledgeUnauthTunnel:true` (the UI sends this after a
+    // confirm dialog). This keeps curl/API/CLI callers protected by default while
+    // letting an operator opt in from the browser without setting the env var.
+    // Guard runs BEFORE persisting so a refused tunnelEnabled:true is not saved.
+    if (settings.tunnelEnabled === true && !ctx.tunnelManager.isRunning()) {
+      const acknowledged = isUnauthenticatedNetworkAcknowledged() || settings.acknowledgeUnauthTunnel === true;
+      if (!acknowledged) {
+        const msg =
+          'Refusing to start the Cloudflare tunnel without authentication: it would publish ' +
+          'full terminal control to a public URL with no password. Set CODEMAN_PASSWORD to ' +
+          'require login, set CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1, or resend with ' +
+          'acknowledgeUnauthTunnel:true to acknowledge an unauthenticated public tunnel.';
+        throw Object.assign(new Error(msg), {
+          statusCode: 403,
+          body: createErrorResponse(ApiErrorCode.OPERATION_FAILED, msg),
+        });
+      }
+      // Loud warning whenever a public tunnel is started with no password — whether
+      // acknowledged via env var or the per-request UI confirmation.
+      if (!process.env.CODEMAN_PASSWORD) {
+        console.warn(
+          '⚠️  [tunnel] Starting an UNAUTHENTICATED public Cloudflare tunnel — no CODEMAN_PASSWORD set. ' +
+            'Anyone with the tunnel URL gets full terminal control (effectively RCE). ' +
+            'Set CODEMAN_PASSWORD to require login.'
+        );
+      }
+    }
+
     try {
       const dir = dirname(SETTINGS_PATH);
       if (!existsSync(dir)) {
@@ -444,11 +575,23 @@ export function registerSystemRoutes(
       } catch {
         /* ignore */
       }
-      const merged = { ...existing, ...settings };
+      // statusLineTelemetry and acknowledgeUnauthTunnel are ACTION fields (not stored
+      // settings) — strip them before persisting so settings.json stays clean.
+      const { statusLineTelemetry, acknowledgeUnauthTunnel, ...settingsToStore } = settings;
+      const merged = { ...existing, ...settingsToStore };
       await fs.writeFile(SETTINGS_PATH, JSON.stringify(merged, null, 2));
 
       // Handle subagent tracking toggle dynamically
       toggleService((settings.subagentTrackingEnabled as boolean) ?? true, subagentWatcher, 'Subagent watcher');
+
+      // Handle ultracode/workflow run watcher toggle dynamically (default OFF).
+      // Either the docked panel OR the floating windows keep the watcher running.
+      toggleService(
+        ((settings.showUltracodeAgents as boolean) ?? false) ||
+          ((settings.ultracodeFloatingWindows as boolean) ?? false),
+        workflowRunWatcher,
+        'Workflow run watcher'
+      );
 
       // Handle image watcher toggle dynamically
       toggleService((settings.imageWatcherEnabled as boolean) ?? false, imageWatcher, 'Image watcher', () => {
@@ -459,6 +602,22 @@ export function registerSystemRoutes(
           }
         }
       });
+
+      // Plan-usage chip: its DISPLAY is per-device (client-side, see settings-ui.js).
+      // Telemetry COLLECTION is server-side and enable-sticky — when a client turns
+      // the chip ON it sends statusLineTelemetry:true and we (re)inject our exporter
+      // into every ACTIVE Claude session's working dir so the live % starts flowing
+      // immediately (no new session needed). We deliberately never auto-REMOVE here:
+      // the exporter is benign/print-through and a per-repo settings.local.json is
+      // shared by sibling sessions, so one device's "off" must not yank the exporter
+      // another device's chip depends on. Each dir handled once.
+      if (statusLineTelemetry === true) {
+        const dirs = new Set<string>();
+        for (const session of ctx.sessions.values()) {
+          if (session.mode === 'claude' && session.workingDir) dirs.add(session.workingDir);
+        }
+        await Promise.all([...dirs].map((dir) => applyStatusLineConfig(dir, true).catch(() => {})));
+      }
 
       // Handle tunnel toggle dynamically
       if ('tunnelEnabled' in settings) {
@@ -476,7 +635,7 @@ export function registerSystemRoutes(
         }
       }
 
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
@@ -509,7 +668,7 @@ export function registerSystemRoutes(
       }
       await fs.writeFile(SETTINGS_PATH, JSON.stringify(existingSettings, null, 2));
 
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
@@ -521,7 +680,6 @@ export function registerSystemRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
     return {
-      success: true,
       nice: session.niceConfig,
     };
   });
@@ -537,7 +695,6 @@ export function registerSystemRoutes(
     ctx.broadcast(SseEvent.SessionUpdated, { session: ctx.getSessionStateWithRespawn(session) });
 
     return {
-      success: true,
       nice: session.niceConfig,
       note: 'Nice priority only affects newly created mux sessions, not currently running ones.',
     };
@@ -561,7 +718,7 @@ export function registerSystemRoutes(
         mkdirSync(dir, { recursive: true });
       }
       await fs.writeFile(windowStatesPath, JSON.stringify(states, null, 2));
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
@@ -581,10 +738,31 @@ export function registerSystemRoutes(
         mkdirSync(dir, { recursive: true });
       }
       await fs.writeFile(parentMapPath, JSON.stringify(parentMap, null, 2));
-      return { success: true };
+      return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
+  });
+
+  // ========== Workflow Run Monitoring (ultracode) ==========
+
+  // LEFT-pane list: lightweight run summaries (no agents[]).
+  app.get('/api/workflows', async (req) => {
+    const { minutes } = req.query as { minutes?: string };
+    const runs = minutes
+      ? workflowRunWatcher.getRecentRunSummaries(parseInt(minutes, 10))
+      : workflowRunWatcher.getAllRunSummaries();
+    return { success: true, data: runs };
+  });
+
+  // RIGHT-pane detail: full run incl. agents[] (tokens/toolCalls/state per agent).
+  app.get('/api/workflows/:runId', async (req) => {
+    const { runId } = req.params as { runId: string };
+    const run = workflowRunWatcher.getRun(runId);
+    if (!run) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `Workflow run ${runId} not found`);
+    }
+    return { success: true, data: run };
   });
 
   // ========== Subagent Monitoring ==========
@@ -740,7 +918,7 @@ export function registerSystemRoutes(
     const filepath = join(SCREENSHOTS_DIR, filename);
     await fs.writeFile(filepath, filePart.data);
 
-    return { success: true, path: filepath, filename };
+    return { path: filepath, filename };
   });
 
   app.get('/api/screenshots', async () => {

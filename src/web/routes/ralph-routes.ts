@@ -9,13 +9,14 @@ import { join, dirname, resolve, relative, isAbsolute } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type ApiResponse } from '../../types.js';
-import { Session } from '../../session.js';
+import { Session, isExternalCliMode } from '../../session.js';
 import { RespawnController } from '../../respawn-controller.js';
 import { RalphConfigSchema, FixPlanImportSchema, RalphPromptWriteSchema, RalphLoopStartSchema } from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
 import { autoConfigureRalph, CASES_DIR, SETTINGS_PATH, findSessionOrFail, parseBody } from '../route-helpers.js';
 import { writeHooksConfig, stripCaseEnvKeys } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
+import { buildRalphLoopPrompt } from '../../prompts/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 import { MAX_CONCURRENT_SESSIONS } from '../../config/map-limits.js';
@@ -44,9 +45,12 @@ export function registerRalphRoutes(
     };
     const session = findSessionOrFail(ctx, id);
 
-    // Ralph tracker is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Ralph tracker is not supported for opencode sessions');
+    // Ralph tracker is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        `Ralph tracker is not supported for ${session.mode} sessions`
+      );
     }
 
     // Handle reset first (before other config)
@@ -101,7 +105,7 @@ export function registerRalphRoutes(
       state: session.ralphLoopState,
     });
 
-    return { success: true };
+    return {};
   });
 
   // Reset circuit breaker for Ralph tracker
@@ -110,7 +114,7 @@ export function registerRalphRoutes(
     const session = findSessionOrFail(ctx, id);
 
     session.ralphTracker.resetCircuitBreaker();
-    return { success: true };
+    return {};
   });
 
   // Get Ralph status block and circuit breaker state
@@ -268,8 +272,16 @@ export function registerRalphRoutes(
       );
     }
 
-    const { caseName, taskDescription, completionPhrase, maxIterations, enableRespawn, planItems, envOverrides } =
-      parseBody(RalphLoopStartSchema, req.body);
+    const {
+      caseName,
+      taskDescription,
+      completionPhrase,
+      maxIterations,
+      enableRespawn,
+      planItems,
+      envOverrides,
+      effort,
+    } = parseBody(RalphLoopStartSchema, req.body);
 
     const casePath = join(CASES_DIR, caseName);
 
@@ -315,6 +327,7 @@ export function registerRalphRoutes(
       claudeMode: rlClaudeModeConfig.claudeMode,
       allowedTools: rlClaudeModeConfig.allowedTools,
       envOverrides,
+      effort,
     });
 
     // Configure Ralph tracker
@@ -370,37 +383,12 @@ export function registerRalphRoutes(
       writeFileSync(fixPlanPath, planContent, 'utf-8');
     }
 
-    // Build full prompt
-    const hasPlan = enabledItems.length > 0;
-    let fullPrompt = taskDescription + '\n\n---\n\n';
-    if (hasPlan) {
-      fullPrompt += '## Task Plan\n\n';
-      fullPrompt += 'A task plan has been written to `@fix_plan.md`. Use this to track progress:\n';
-      fullPrompt += '- Reference the plan at the start of each iteration\n';
-      fullPrompt += '- Update task checkboxes as you complete items\n';
-      fullPrompt += '- Work through items in priority order (P0 > P1 > P2)\n\n';
-    }
-    fullPrompt += '## Iteration Protocol\n\n';
-    fullPrompt += 'This is an autonomous loop. Files from previous iterations persist. On each iteration:\n';
-    fullPrompt += '1. Check what work has already been done\n';
-    fullPrompt += '2. Make incremental progress toward completion\n';
-    fullPrompt += '3. Commit meaningful changes with descriptive messages\n\n';
-    fullPrompt += '## Verification\n\n';
-    fullPrompt += 'After each significant change:\n';
-    fullPrompt += '- Run tests to verify (npm test, pytest, etc.)\n';
-    fullPrompt += '- Check for type/lint errors if applicable\n';
-    fullPrompt += '- If tests fail, read the error, fix it, and retry\n\n';
-    fullPrompt += '## Completion Criteria\n\n';
-    fullPrompt += `Output \`<promise>${completionPhrase}</promise>\` when ALL of the following are true:\n`;
-    fullPrompt += '- All requirements from the task description are implemented\n';
-    fullPrompt += '- All tests pass\n';
-    fullPrompt += '- Changes are committed\n\n';
-    fullPrompt += '## If Stuck\n\n';
-    fullPrompt += 'If you encounter the same error for 3+ iterations:\n';
-    fullPrompt += "1. Document what you've tried\n";
-    fullPrompt += '2. Identify the specific blocker\n';
-    fullPrompt += '3. Try an alternative approach\n';
-    fullPrompt += '4. If truly blocked, output `<promise>BLOCKED</promise>` with an explanation\n';
+    // Build full prompt (includes the RALPH_STATUS contract)
+    const fullPrompt = buildRalphLoopPrompt({
+      taskDescription,
+      completionPhrase,
+      hasPlan: enabledItems.length > 0,
+    });
 
     // Write prompt to file
     const promptPath = join(casePath, '@ralph_prompt.md');

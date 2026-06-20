@@ -39,6 +39,16 @@ export class MockSession extends EventEmitter {
     return true;
   }
 
+  /** Exactly-once input dedup — mirrors Session.shouldApplyInput so route tests
+   *  exercising the reliable-delivery path behave like production. */
+  private _appliedInputSeq = new Map<string, number>();
+  shouldApplyInput(clientId: string, seq: number): boolean {
+    const last = this._appliedInputSeq.get(clientId);
+    if (last !== undefined && seq <= last) return false;
+    this._appliedInputSeq.set(clientId, seq);
+    return true;
+  }
+
   /** Get the last written data */
   get lastWrite(): string | undefined {
     return this.writeBuffer[this.writeBuffer.length - 1];
@@ -222,6 +232,15 @@ export class MockSession extends EventEmitter {
     };
   }
 
+  /** Auto-resume on usage limit (token pause control) */
+  autoResumeEnabled: boolean = false;
+  autoResumeAt: number | null = null;
+  isLimitPaused: boolean = false;
+  setAutoResume = vi.fn((enabled: boolean) => {
+    this.autoResumeEnabled = enabled;
+    if (!enabled) this.autoResumeAt = null;
+  });
+
   /** Check if session is busy */
   isBusy = vi.fn(() => false);
 
@@ -235,6 +254,11 @@ export class MockSession extends EventEmitter {
 
   /** Stub for resize */
   resize = vi.fn();
+
+  /** Stubs for the desktop sizing claims used by resize arbitration */
+  claimDesktopSizing = vi.fn();
+  releaseDesktopSizing = vi.fn();
+  noteDesktopActivity = vi.fn();
 
   /** Stub for runPrompt */
   runPrompt = vi.fn(async () => {});

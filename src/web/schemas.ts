@@ -8,7 +8,7 @@
  */
 
 import { z } from 'zod';
-import { SAFE_PATH_PATTERN } from '../utils/index.js';
+import { SAFE_PATH_PATTERN, isSafePushEndpoint } from '../utils/index.js';
 
 // ========== Path Validation ==========
 
@@ -46,7 +46,7 @@ const safePathSchema = z.string().max(1000).refine(isValidWorkingDir, {
 // ========== Env Var Allowlist ==========
 
 /** Allowlisted env var key prefixes */
-const ALLOWED_ENV_PREFIXES = ['CLAUDE_CODE_', 'OPENCODE_'];
+const ALLOWED_ENV_PREFIXES = ['CLAUDE_CODE_', 'OPENCODE_', 'CODEX_'];
 
 /** Env var keys that are always blocked (security-sensitive) */
 const BLOCKED_ENV_KEYS = new Set([
@@ -76,9 +76,18 @@ const safeEnvOverridesSchema = z
     },
     {
       message:
-        'envOverrides contains blocked or disallowed env var keys. Only CLAUDE_CODE_* and OPENCODE_* keys are allowed.',
+        'envOverrides contains blocked or disallowed env var keys. Only CLAUDE_CODE_*, OPENCODE_*, and CODEX_* keys are allowed.',
     }
   );
+
+// ========== Effort Level ==========
+
+/**
+ * Claude CLI effort level for new sessions. Injected as a `--settings` soft default
+ * (NOT the CLAUDE_CODE_EFFORT_LEVEL env var, which would hard-lock the session and
+ * block in-session `/effort` switching). `ultracode` enables dynamic workflow orchestration.
+ */
+const effortLevelSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']).optional();
 
 // ========== Session Routes ==========
 
@@ -119,14 +128,40 @@ const OpenCodeConfigSchema = z
   })
   .optional();
 
+/** Schema for Codex (OpenAI CLI)-specific configuration */
+const CodexConfigSchema = z
+  .object({
+    model: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9._\-/]+$/)
+      .optional(),
+    resumeSessionId: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9_-]+$/)
+      .optional(),
+    dangerouslyBypassApprovals: z.boolean().optional(),
+    renderMode: z
+      .enum(['scrollback', 'hybrid'])
+      .optional()
+      .transform(() => 'hybrid' as const),
+  })
+  .optional();
+
 export const CreateSessionSchema = z.object({
   workingDir: safePathSchema.optional(),
-  mode: z.enum(['claude', 'shell', 'opencode']).optional(),
+  mode: z.enum(['claude', 'shell', 'opencode', 'codex']).optional(),
   name: z.string().max(100).optional(),
   envOverrides: safeEnvOverridesSchema,
+  /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
+  effort: effortLevelSchema,
   /** Model override to write to .claude/settings.local.json (e.g., "opus[1m]"). Empty string clears. */
   modelOverride: z.string().max(50).optional(),
+  /** Inject the plan-usage statusLine exporter into the case (App Settings → Display → "Plan Usage Limits"). Claude-only. */
+  statusLineTelemetry: z.boolean().optional(),
   openCodeConfig: OpenCodeConfigSchema,
+  codexConfig: CodexConfigSchema,
   /** Resume a previous Claude conversation by its session ID (used for reboot recovery) */
   resumeSessionId: z
     .string()
@@ -150,6 +185,53 @@ export const RunPromptSchema = z.object({
 export const ResizeSchema = z.object({
   cols: z.number().int().min(1).max(500),
   rows: z.number().int().min(1).max(200),
+  viewportType: z.enum(['mobile', 'tablet', 'desktop']).optional(),
+  force: z.boolean().optional(),
+});
+
+/**
+ * Schema for POST /api/status-telemetry
+ * Claude Code statusline payload forwarded by the Codeman-managed statusLine
+ * exporter (see hooks-config.generateStatusLineCommand). Validates only the
+ * subset Codeman displays; unknown keys (session_id, transcript_path, cwd, …)
+ * are stripped by z.object. Auth-exempt like /api/hook-event.
+ */
+// NOTE: every modeled field is `.nullish()` (not `.optional()`) on purpose.
+// Claude's statusline blob is officially shipped but undocumented in exact
+// shape, and `z.optional()` REJECTS an explicit `null` (accepts only
+// `undefined`) — a single stray `null` (e.g. `cost:{total_cost_usd:null}`)
+// would 400 the ENTIRE POST before the deliberately-tolerant parser
+// (usage-telemetry.ts, which only acts on `typeof === 'number'/'string'`) ever
+// runs, silently killing the chip's data feed. `.nullish()` keeps the schema
+// gate as forgiving as the parser it guards.
+const RateLimitWindowSchema = z
+  .object({
+    used_percentage: z.number().nullish(),
+    resets_at: z.number().nullish(),
+  })
+  .nullish();
+
+export const StatusTelemetrySchema = z.object({
+  sessionId: z.string().min(1).max(100),
+  data: z
+    .object({
+      rate_limits: z
+        .object({
+          five_hour: RateLimitWindowSchema,
+          seven_day: RateLimitWindowSchema,
+        })
+        .nullish(),
+      context_window: z
+        .object({
+          used_percentage: z.number().nullish(),
+          total_input_tokens: z.number().nullish(),
+          total_output_tokens: z.number().nullish(),
+        })
+        .nullish(),
+      cost: z.object({ total_cost_usd: z.number().nullish() }).nullish(),
+      model: z.object({ display_name: z.string().max(100).nullish() }).nullish(),
+    })
+    .nullish(),
 });
 
 // ========== Case Routes ==========
@@ -176,9 +258,12 @@ export const QuickStartSchema = z.object({
     .string()
     .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.')
     .optional(),
-  mode: z.enum(['claude', 'shell', 'opencode']).optional(),
+  mode: z.enum(['claude', 'shell', 'opencode', 'codex']).optional(),
   openCodeConfig: OpenCodeConfigSchema,
+  codexConfig: CodexConfigSchema,
   envOverrides: safeEnvOverridesSchema,
+  /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
+  effort: effortLevelSchema,
 });
 
 // ========== Hook Events ==========
@@ -264,10 +349,21 @@ export const SettingsUpdateSchema = z
     ralphTrackerEnabled: z.boolean().optional(),
     subagentTrackingEnabled: z.boolean().optional(),
     subagentActiveTabOnly: z.boolean().optional(),
+    /** Ultracode/Workflow run visualization (default OFF). Gates workflowRunWatcher + the master-detail tab. SYNCED. */
+    showUltracodeAgents: z.boolean().optional(),
+    /** Floating ultracode run windows w/ tab connector lines (default OFF). Also starts workflowRunWatcher. SYNCED. */
+    ultracodeFloatingWindows: z.boolean().optional(),
     imageWatcherEnabled: z.boolean().optional(),
     tunnelEnabled: z.boolean().optional(),
+    // Action field (NOT persisted): explicit per-request acknowledgment that the
+    // operator accepts exposing an UNAUTHENTICATED public tunnel (no CODEMAN_PASSWORD).
+    // Lets the UI enable a tunnel after a confirm dialog without the
+    // CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK env var. Stripped before persisting.
+    acknowledgeUnauthTunnel: z.boolean().optional(),
     tabTwoRows: z.boolean().optional(),
     agentTeamsEnabled: z.boolean().optional(),
+    /** Model for new Claude sessions (e.g. "claude-fable-5[1m]", "opus[1m]"); takes precedence over opusContext1mEnabled */
+    claudeModel: z.string().max(50).optional(),
     opusContext1mEnabled: z.boolean().optional(),
     thinkingEffort: z.string().max(20).optional(),
     // UI visibility
@@ -276,13 +372,27 @@ export const SettingsUpdateSchema = z
     showTokenCount: z.boolean().optional(),
     showCost: z.boolean().optional(),
     showLifecycleLog: z.boolean().optional(),
+    showResponseViewer: z.boolean().optional(),
     showMonitor: z.boolean().optional(),
     showProjectInsights: z.boolean().optional(),
     showFileBrowser: z.boolean().optional(),
     showSubagents: z.boolean().optional(),
+    showMultiMonitorButton: z.boolean().optional(),
+    showPlanUsageLimits: z.boolean().optional(),
+    // Action field (NOT persisted as a setting): when true, (re)injects the
+    // plan-usage statusLine exporter into active Claude sessions so live usage %
+    // starts flowing. Sent on ENABLE only — the chip's DISPLAY is per-device
+    // (client-side), but telemetry COLLECTION is server-side, so the per-device
+    // toggle signals it out-of-band here rather than via showPlanUsageLimits.
+    statusLineTelemetry: z.boolean().optional(),
+    showRedrawButton: z.boolean().optional(),
+    // Input
+    gestureControlEnabled: z.boolean().optional(),
     // Claude CLI settings
     claudeMode: z.string().max(50).optional(),
     allowedTools: z.string().max(2000).optional(),
+    // Codex CLI settings
+    codexDangerouslyBypassApprovals: z.boolean().optional(),
     // CPU priority
     nice: z
       .object({
@@ -359,6 +469,15 @@ export const SettingsUpdateSchema = z
 export const SessionInputWithLimitSchema = z.object({
   input: z.string().max(100000), // 100KB max input
   useMux: z.boolean().optional(),
+  // Reliable-delivery dedup (optional; absent for curl/legacy clients). The web
+  // client tags each input with a stable clientId + a monotonic per-session seq
+  // and redelivers anything it hasn't seen ACKed (e.g. a frame silently dropped
+  // by a half-open WebSocket on a flaky link). The server applies each (clientId,
+  // seq) at-most-once via Session.shouldApplyInput so a redelivery can't type the
+  // prompt twice. `.optional()` (not `.nullish()`) — the client omits them when
+  // unset rather than sending null. See docs/reliable-input-delivery.md.
+  seq: z.number().int().nonnegative().optional(),
+  clientId: z.string().max(128).optional(),
 });
 
 // ========== Session Mutation Routes ==========
@@ -403,6 +522,11 @@ export const AutoCompactSchema = z.object({
   enabled: z.boolean(),
   threshold: z.number().int().min(0).max(1000000).optional(),
   prompt: z.string().max(10000).optional(),
+});
+
+/** POST /api/sessions/:id/auto-resume */
+export const AutoResumeSchema = z.object({
+  enabled: z.boolean(),
 });
 
 /** POST /api/sessions/:id/image-watcher */
@@ -515,7 +639,11 @@ export const RespawnEnableSchema = z.object({
 
 /** POST /api/push/subscribe */
 export const PushSubscribeSchema = z.object({
-  endpoint: z.string().url().max(2000),
+  endpoint: z
+    .string()
+    .url()
+    .max(2000)
+    .refine(isSafePushEndpoint, { message: 'endpoint must be an https URL to a public (non-internal) host' }),
   keys: z.object({
     p256dh: z.string().min(1).max(500),
     auth: z.string().min(1).max(500),
@@ -543,6 +671,8 @@ export const RalphLoopStartSchema = z.object({
   maxIterations: z.number().int().min(0).max(1000).nullable().default(10),
   enableRespawn: z.boolean().default(false),
   envOverrides: safeEnvOverridesSchema,
+  /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
+  effort: effortLevelSchema,
   planItems: z
     .array(
       z.object({

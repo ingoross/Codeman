@@ -36,6 +36,13 @@ html.mobile-init .file-browser-panel {
   html {
     touch-action: manipulation;
   }
+
+  /* No "open in new window" (detach) on phones/tablets — popped-out browser
+     windows aren't usable there. !important beats the hover/detached reveal
+     rules in styles.css */
+  .session-tab .tab-detach {
+    display: none !important;
+  }
 }
 
 /* ============================================================================
@@ -55,7 +62,9 @@ html.mobile-init .file-browser-panel {
     padding-right: calc(0.5rem + var(--safe-area-right));
     background: #0a0a0a;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    z-index: 200;
+    contain: none;
+    overflow: visible;
+    z-index: 1200;
   }
 
   /* iOS safe area adjustment for fixed header - header extends into notch area */
@@ -90,8 +99,17 @@ html.mobile-init .file-browser-panel {
     display: none !important;
   }
 
+  /* Inline, always-visible header utilities (eye / multimonitor). The
+     position:fixed collapsible tray (02fa3f3) had its expand toggle reverted on
+     master but left this container permanently `mobile-collapsed` → the response
+     viewer eye became unreachable on phones. Restored to the simple inline flow. */
   .header-right {
     gap: 0.35rem;
+  }
+
+  .btn-icon-header:not(.btn-sm) {
+    width: 44px;
+    height: 44px;
   }
 
   /* Compact session tabs — .tabs-two-rows override needed to match
@@ -167,6 +185,12 @@ html.mobile-init .file-browser-panel {
   }
 
   /* ---- Settings Modal: Tablet Optimizations ---- */
+
+  /* Modals must stack above the fixed tablet header (z-index 1200) so the
+     modal header with the close button stays visible */
+  .modal {
+    z-index: 1300;
+  }
 
   .modal-tabs {
     overflow-x: auto;
@@ -321,7 +345,8 @@ html.mobile-init .file-browser-panel {
     overflow: hidden;
     background: #0a0a0a;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    z-index: 200;
+    contain: none;
+    z-index: 1200;
   }
 
   /* iOS safe area adjustment for fixed header - header extends into notch area */
@@ -371,7 +396,9 @@ html.mobile-init .file-browser-panel {
     height: 12px;
   }
 
-  /* Hide header settings gear and lifecycle log on mobile - settings moved to toolbar */
+  /* Hide header settings gear and lifecycle log on mobile - settings moved to toolbar.
+     (The attachments button is opt-in / default-hidden everywhere via its own
+     --hidden marker, so it needs no mobile-specific rule here.) */
   .btn-icon-header.btn-settings,
   .btn-icon-header.btn-lifecycle-log {
     display: none !important;
@@ -407,7 +434,18 @@ html.mobile-init .file-browser-panel {
     background: rgba(239, 68, 68, 0.25);
     border-color: rgba(239, 68, 68, 0.6);
     color: #ef4444;
-    animation: voice-pulse 1.2s ease-in-out infinite;
+    animation: mobile-voice-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes mobile-voice-pulse {
+    0%, 100% {
+      box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.35);
+      background: rgba(239, 68, 68, 0.2);
+    }
+    50% {
+      box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.75);
+      background: rgba(239, 68, 68, 0.35);
+    }
   }
 
   /* Mobile app settings gear in toolbar - far right */
@@ -453,7 +491,8 @@ html.mobile-init .file-browser-panel {
     top: 0;
     left: 0;
     right: 0;
-    bottom: 0;
+    bottom: auto;
+    height: var(--app-height, 100dvh);
   }
 
   /* Ultra-compact session tabs — .tabs-two-rows override needed to match
@@ -510,10 +549,10 @@ html.mobile-init .file-browser-panel {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.5rem;
+    font-size: 0.65rem;
     line-height: 1;
-    width: 12px;
-    height: 12px;
+    width: 32px;
+    height: 32px;
     margin-left: auto;
     opacity: 0.6;
   }
@@ -577,6 +616,10 @@ html.mobile-init .file-browser-panel {
   .toolbar-center {
     display: flex !important;
     align-items: center;
+  }
+
+  .toolbar-center .btn-toolbar.btn-voice {
+    display: none !important;
   }
 
   .toolbar-right {
@@ -781,9 +824,17 @@ html.mobile-init .file-browser-panel {
 
   .btn-toolbar.btn-shell {
     flex: 0 0 auto;
-    min-width: fit-content;
+    min-width: 54px;
+    width: 54px;
     white-space: nowrap;
-    padding: 0 10px !important;
+    padding: 0 8px !important;
+    overflow: hidden;
+    font-size: 0 !important;
+  }
+
+  .btn-toolbar.btn-shell::after {
+    content: "Shell";
+    font-size: 0.65rem;
   }
 
   /* Mobile case button - visible on mobile.
@@ -828,6 +879,24 @@ html.mobile-init .file-browser-panel {
   .btn-case-settings-mobile:active {
     background: rgba(255, 255, 255, 0.1);
     color: #fff;
+  }
+
+  @media (max-width: 374px) {
+    .toolbar {
+      padding: 0 2px;
+    }
+
+    .toolbar-left,
+    .toolbar-left .toolbar-group,
+    .toolbar-left .toolbar-group:first-child {
+      gap: 2px;
+    }
+  }
+
+  @media (max-width: 430px) {
+    .btn-case-settings-mobile {
+      display: none !important;
+    }
   }
 
   /* Mobile case settings popover */
@@ -981,86 +1050,7 @@ html.mobile-init .file-browser-panel {
   }
 
   /* Paste overlay for iOS clipboard access */
-  .paste-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    z-index: 10000;
-    display: flex;
-    align-items: flex-end;
-    justify-content: center;
-    padding-bottom: env(safe-area-inset-bottom, 12px);
-  }
-
-  .paste-dialog {
-    background: var(--bg-secondary, #1e1e2e);
-    border: 1px solid var(--border-color, #444);
-    border-radius: 12px;
-    padding: 12px;
-    width: calc(100% - 24px);
-    max-width: 400px;
-    margin-bottom: 8px;
-  }
-
-  .paste-textarea {
-    width: 100%;
-    min-height: 60px;
-    max-height: 120px;
-    background: var(--bg-primary, #0d0d14);
-    color: var(--text-primary, #e0e0e0);
-    border: 1px solid var(--border-color, #444);
-    border-radius: 8px;
-    padding: 8px;
-    font-family: inherit;
-    font-size: 16px;
-    resize: none;
-    box-sizing: border-box;
-  }
-
-  .paste-textarea:focus {
-    outline: none;
-    border-color: var(--accent-color, #7aa2f7);
-  }
-
-  .paste-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 10px;
-  }
-
-  .paste-cancel, .paste-new, .paste-send, .paste-image {
-    padding: 8px 18px;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    cursor: pointer;
-  }
-
-  /* Image attach button — left-aligned, accent outline */
-  .paste-image {
-    margin-right: auto;
-    background: var(--bg-tertiary, #333);
-    color: var(--accent-color, #7aa2f7);
-    border: 1px solid var(--accent-color, #7aa2f7);
-  }
-
-  .paste-cancel {
-    background: var(--bg-tertiary, #333);
-    color: var(--text-secondary, #aaa);
-  }
-
-  .paste-new {
-    background: var(--bg-tertiary, #333);
-    color: var(--accent-color, #7aa2f7);
-    border: 1px solid var(--accent-color, #7aa2f7);
-  }
-
-  .paste-send {
-    background: var(--accent-color, #7aa2f7);
-    color: #fff;
-    font-weight: 600;
-  }
+  /* Paste overlay base styles moved to styles.css (always loaded — covers iPad landscape) */
 
   /* LEGACY: Hide old toolbar select (no longer used on mobile) */
   .toolbar-select {
@@ -1104,6 +1094,13 @@ html.mobile-init .file-browser-panel {
     border-radius: 8px 8px 0 0;
     bottom: calc(44px + 2rem + var(--safe-area-bottom));
     max-height: 35vh;
+  }
+
+  /* Modals must stack above the fixed mobile header (z-index 1200), or the
+     modal header with the close button is buried underneath it and the
+     full-screen modal cannot be dismissed */
+  .modal {
+    z-index: 1300;
   }
 
   /* Full-screen modals on phones */
@@ -1228,6 +1225,16 @@ html.mobile-init .file-browser-panel {
     font-size: 0.85rem;
   }
 
+  .history-show-more {
+    display: block;
+    margin-bottom: 0.75rem;
+  }
+
+  .welcome-ralph-link {
+    display: block;
+    margin: 0.75rem auto 0;
+  }
+
   .welcome-hint {
     font-size: 0.7rem;
     margin-top: 0.75rem;
@@ -1345,43 +1352,38 @@ html.mobile-init .file-browser-panel {
     border-radius: 5px;
   }
 
-  /* Duration preset buttons — single row, all 7 items */
+  /* Duration preset buttons — one compact row */
   .duration-presets {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.25rem;
+    gap: 0.2rem;
   }
 
   .duration-preset-btn {
-    min-height: 28px;
-    padding: 0.2rem 0.4rem;
-    font-size: 0.65rem;
-    border-radius: 5px;
+    min-height: 24px;
+    padding: 0.1rem 0.4rem;
+    font-size: 0.6rem;
+    border-radius: 4px;
     text-align: center;
     flex: 1 1 auto;
     min-width: 0;
   }
 
-  /* Custom duration — inline with other presets */
   .duration-custom {
-    flex-wrap: wrap;
-    gap: 0.25rem;
-    flex: 1 1 100%;
-  }
-
-  .duration-custom .duration-preset-btn {
-    flex: 0 0 auto;
-    min-width: 50px;
+    display: flex;
+    gap: 0.2rem;
+    align-items: center;
   }
 
   .duration-custom-input.visible {
-    flex: 1;
+    flex: 0 1 auto;
   }
 
   .duration-custom-input input {
-    width: 100%;
-    min-height: 28px;
+    width: 64px;
+    min-height: 24px;
     font-size: 16px; /* Prevents iOS zoom */
+    padding: 0.1rem 0.3rem;
   }
 
   /* Preset selector row — compact inline */
@@ -1439,6 +1441,16 @@ html.mobile-init .file-browser-panel {
   #sessionOptionsModal .checkbox-inline input[type="checkbox"] {
     width: 18px;
     height: 18px;
+  }
+
+  /* Respawn-loop box title matches the auto-resume title; its cycle-step
+     checkboxes match the step labels */
+  #sessionOptionsModal .respawn-loop-title {
+    font-size: 0.75rem;
+  }
+
+  #sessionOptionsModal .respawn-loop-box .checkbox-inline {
+    font-size: 0.65rem;
   }
 
   /* Respawn options row — stack if needed */
@@ -2011,111 +2023,10 @@ html.mobile-init .file-browser-panel {
 }
 
 
-/* ============================================================================
-   Keyboard Accessory Bar — all mobile/tablet sizes
-   Visual styles extracted from phone breakpoint so they apply on iPad too.
-   Phone-specific positioning (position: fixed) remains in @media (max-width: 480px).
-   ============================================================================ */
-.keyboard-accessory-bar {
-  display: none;
-  height: 44px;
-  background: #1a1a1a;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 6px 8px;
-  gap: 8px;
-  align-items: center;
-  overflow-x: auto;
-  overflow-y: hidden;
-  -webkit-overflow-scrolling: touch;
-  z-index: 51;
-}
-
-.keyboard-accessory-bar.visible {
-  display: flex;
-}
-
-.accessory-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  padding: 6px 12px;
-  background: #2a2a2a;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 6px;
-  color: #e5e5e5;
-  font-size: 0.65rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-}
-
-.accessory-btn.confirming {
-  background: #6b4f00;
-  border-color: #b8860b;
-  color: #ffd54f;
-}
-
-.accessory-btn:active {
-  background: #3a3a3a;
-}
-
-.accessory-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
-.accessory-btn-arrow {
-  padding: 6px 10px;
-  background: #1e3a5f;
-  border-color: rgba(59, 130, 246, 0.3);
-  color: #93c5fd;
-}
-
-.accessory-btn-arrow:active {
-  background: #2563eb;
-}
-
-.accessory-btn.accessory-btn-enter {
-  margin-left: auto !important;
-  padding: 0 16px !important;
-  min-width: 64px !important;
-  width: auto !important;
-  height: 32px !important;
-  min-height: 32px !important;
-  background: #16a34a !important;
-  border: 1.5px solid rgba(34, 197, 94, 0.6) !important;
-  color: #fff !important;
-  font-size: 1.15rem !important;
-  font-weight: 700 !important;
-  border-radius: 8px !important;
-  line-height: 1 !important;
-  flex-shrink: 0 !important;
-  box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35);
-}
-
-.accessory-btn.accessory-btn-enter:active {
-  background: #15803d !important;
-  transform: scale(0.95);
-}
-
-.accessory-btn-dismiss {
-  padding: 8px 14px;
-  background: #2a2a2a;
-  border: 1.5px solid rgba(255, 255, 255, 0.25);
-  border-radius: 6px;
-  color: #e5e5e5;
-}
-
-.accessory-btn-dismiss svg {
-  width: 22px;
-  height: 22px;
-  stroke-width: 3;
-}
-
-.accessory-btn-dismiss:active {
-  background: #3a3a3a;
-}
+/* Keyboard accessory bar base styles moved to styles.css (always loaded —
+   covers iPad landscape where mobile.css doesn't load). The prominent green
+   .accessory-btn-enter (fork customization) also lives in styles.css now.
+   Phone-specific overrides remain in @media (max-width: 430px) above. */
 
 /* ============================================================================
    Tablet/iPad Keyboard Handling (>= 768px touch devices)
@@ -2200,5 +2111,49 @@ html.mobile-init .file-browser-panel {
   .subagent-dropdown-trigger:active + .subagent-dropdown-menu,
   .subagent-dropdown-trigger:focus + .subagent-dropdown-menu {
     display: block;
+  }
+}
+
+@media (max-width: 430px) {
+  /* Attachment history (COD-18): full-screen sheet on phones */
+  .attachment-history-drawer {
+    top: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    border-left: none;
+    border-radius: 0;
+    padding-top: var(--safe-area-top);
+    padding-left: var(--safe-area-left);
+    padding-right: var(--safe-area-right);
+    padding-bottom: var(--safe-area-bottom);
+  }
+
+  .attachment-history-header {
+    padding: 12px;
+  }
+
+  .attachment-history-list {
+    padding: 6px;
+  }
+
+  .attachment-history-item {
+    grid-template-columns: 104px minmax(0, 1fr);
+    gap: 8px;
+    padding: 8px 6px;
+  }
+
+  .attachment-history-thumb {
+    width: 104px;
+  }
+
+  .attachment-history-actions {
+    gap: 4px;
+  }
+
+  .attachment-history-actions button {
+    padding: 4px 7px;
   }
 }
