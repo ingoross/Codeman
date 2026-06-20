@@ -972,16 +972,27 @@ export function registerSessionRoutes(
     // overlap. `captureActivePaneBuffer` is a no-op ('') under test mode and
     // returns null when unavailable, in which case we fall back to history.
     const muxName = session.muxName;
-    const liveMuxBuffer =
-      muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
-        ? ctx.mux.captureActivePaneBuffer(muxName)
-        : null;
-    const rawBuffer =
-      liveMuxBuffer !== null && liveMuxBuffer.length > 0
-        ? session.terminalBufferLength > 0
-          ? `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
-          : liveMuxBuffer
-        : session.terminalBuffer;
+    // Claude/shell run with tmux alternate-screen OFF, so the accumulated byte
+    // stream IS the clean, scrollable history once stripInkRedrawBloat() cleans the
+    // Ink redraw debris (0.8.0 fork behavior). The tmux pane snapshot must NOT be
+    // used for these modes: capturing the alt-screen-off main buffer replays as
+    // garbled, overlapping redraw frames. The snapshot path is only for TUI modes
+    // (codex/opencode) that repaint a single frame.
+    let rawBuffer: string;
+    if (session.mode === 'claude' || session.mode === 'shell') {
+      rawBuffer = session.terminalBuffer;
+    } else {
+      const liveMuxBuffer =
+        muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
+          ? ctx.mux.captureActivePaneBuffer(muxName)
+          : null;
+      rawBuffer =
+        liveMuxBuffer !== null && liveMuxBuffer.length > 0
+          ? session.terminalBufferLength > 0
+            ? `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
+            : liveMuxBuffer
+          : session.terminalBuffer;
+    }
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
     const fullSize = rawBuffer.length;
     let truncated = false;
