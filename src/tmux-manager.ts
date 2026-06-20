@@ -2154,39 +2154,6 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
-   * Capture the active pane's FULL scrollback history (all lines + current screen)
-   * as a plain stream of rendered lines with SGR colors. Unlike capturePaneBuffer
-   * this does NOT repaint a single frame via formatPaneSnapshot — `capture-pane -e`
-   * over the whole history yields clean SGR+newline text (no cursor/scroll/erase
-   * sequences), which replays directly as xterm scrollback. Used by the /terminal
-   * replay for main-buffer modes (claude/shell, alternate-screen OFF) so the full
-   * conversation scrollback survives a server restart (when the byte buffer is empty).
-   */
-  captureActivePaneHistory(muxName: string): string | null {
-    if (IS_TEST_MODE) return '';
-    if (!isValidMuxName(muxName)) {
-      console.error('[TmuxManager] Invalid session name in captureActivePaneHistory:', muxName);
-      return null;
-    }
-    try {
-      const panes = execSync(`${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_id}:#{pane_active}'`, {
-        encoding: 'utf-8',
-        timeout: EXEC_TIMEOUT_MS,
-      }).trim();
-      const paneTarget = resolveActivePaneTarget(panes);
-      if (!paneTarget) return null;
-      const target = paneTarget.startsWith('%') ? `${muxName}.${paneTarget}` : `${muxName}.%${paneTarget}`;
-      return execSync(`${this.tmux()} capture-pane -p -e -S - -t ${shellescape(target)}`, {
-        encoding: 'utf-8',
-        timeout: EXEC_TIMEOUT_MS,
-      }).replace(/\n+$/g, '');
-    } catch (err) {
-      console.error('[TmuxManager] Failed to capture full pane history:', err);
-      return null;
-    }
-  }
-
-  /**
    * Start piping pane output to a file using tmux pipe-pane.
    * Only pipes output direction (-O) to avoid echoing input.
    */

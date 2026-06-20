@@ -972,27 +972,15 @@ export function registerSessionRoutes(
     // overlap. `captureActivePaneBuffer` is a no-op ('') under test mode and
     // returns null when unavailable, in which case we fall back to history.
     const muxName = session.muxName;
-    // Claude/shell run with tmux alternate-screen OFF, so the ENTIRE conversation
-    // lives in tmux scrollback. `capture-pane -e` over the whole history yields clean
-    // SGR+newline text (no cursor/scroll/erase sequences) that replays directly as
-    // xterm scrollback — restoring full scrollback even after a server restart, when
-    // the in-memory byte buffer (session.terminalBuffer) is empty. It is already
-    // rendered, so it must NOT go through stripInkRedrawBloat (that's for raw byte
-    // streams). The pane snapshot path below is only for TUI modes (codex/opencode)
-    // that repaint a single frame.
+    // Claude/shell run with tmux alternate-screen OFF, so the accumulated byte
+    // stream IS the clean, scrollable history once stripInkRedrawBloat() cleans the
+    // Ink redraw debris (0.8.0 fork behavior). The tmux pane snapshot must NOT be
+    // used for these modes: capturing the alt-screen-off main buffer replays as
+    // garbled, overlapping redraw frames. The snapshot path is only for TUI modes
+    // (codex/opencode) that repaint a single frame.
     let rawBuffer: string;
-    let alreadyRendered = false;
     if (session.mode === 'claude' || session.mode === 'shell') {
-      const history =
-        muxName && typeof ctx.mux.captureActivePaneHistory === 'function'
-          ? ctx.mux.captureActivePaneHistory(muxName)
-          : null;
-      if (history !== null && history.length > 0) {
-        rawBuffer = history;
-        alreadyRendered = true;
-      } else {
-        rawBuffer = session.terminalBuffer;
-      }
+      rawBuffer = session.terminalBuffer;
     } else {
       const liveMuxBuffer =
         muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
@@ -1014,7 +1002,7 @@ export function registerSessionRoutes(
     // During long thinking phases, Ink rewrites the same rows thousands of times
     // (500KB+). Without stripping, tail mode returns only spinner frames and
     // the terminal appears empty when switching tabs.
-    let strippedBuffer = alreadyRendered ? rawBuffer : stripInkRedrawBloat(rawBuffer);
+    let strippedBuffer = stripInkRedrawBloat(rawBuffer);
 
     // Strip alt-screen toggles and scrollback-erase from Codex/Claude byte
     // streams. xterm.js obeys them by switching to its scrollback-less alt
