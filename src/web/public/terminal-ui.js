@@ -3299,6 +3299,11 @@ Object.assign(CodemanApp.prototype, {
     // This is critical: interleaving causes cursor position chaos with Ink redraws.
     if (this._isLoadingBuffer) {
       if (this._loadBufferQueue) this._loadBufferQueue.push(data);
+      // Unless the caller asks for a flush, this data is DISCARDED when the load
+      // finishes (see _finishBufferLoad) — remember the overlap so the display
+      // can be repaired once the stream goes quiet, instead of keeping a hole
+      // that only the next tab switch would close.
+      this._loadOverlapBytes = (this._loadOverlapBytes || 0) + data.length;
       return;
     }
 
@@ -3890,8 +3895,10 @@ Object.assign(CodemanApp.prototype, {
       return false;
     }
     const queued = this._loadBufferQueue;
+    const overlapBytes = this._loadOverlapBytes || 0;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._loadOverlapBytes = 0;
     this._bufferLoadOwner = null;
     // COD-144: replay (rather than discard) queued live events when the load
     // painted nothing — the queued prompt is the only content a new session has.
@@ -3899,8 +3906,44 @@ Object.assign(CodemanApp.prototype, {
       for (const data of queued) {
         this.batchTerminalWrite(data);
       }
+      return true;
     }
+    // Output arrived, and was discarded, while the buffer was loading: the
+    // display now ends before "now". Close the gap once the stream is quiet.
+    if (overlapBytes > 0) this._scheduleGapRecovery();
     return true;
+  },
+
+  /**
+   * Reload the terminal buffer once output has been QUIET for a moment.
+   *
+   * Repairs the scrollback gaps this client creates itself: output queued
+   * during a buffer load and then discarded (`_finishBufferLoad`), and frames
+   * dropped by the 128KB render-queue cap (`_onSessionTerminal`). Both leave
+   * the terminal showing a prefix of what the session actually printed, with
+   * nothing to fix it until the user switches tabs — the "missing lines".
+   *
+   * Every new output event RE-ARMS the timer (see `_onSessionTerminal`), so the
+   * reload lands in a pause rather than mid-burst, where it would only re-open
+   * the gap. While a load is in flight the recovery waits instead of dropping,
+   * which is what the plain early return used to do.
+   */
+  _scheduleGapRecovery() {
+    if (!this.activeSessionId) return;
+    if (this._gapRecoveryTimer) clearTimeout(this._gapRecoveryTimer);
+    // Quiet first, and never more often than the floor.
+    const sinceLast = Date.now() - (this._gapRecoveryAt || 0);
+    const delay = Math.max(GAP_RECOVERY_QUIET_MS, GAP_RECOVERY_MIN_INTERVAL_MS - sinceLast);
+    this._gapRecoveryTimer = setTimeout(() => {
+      this._gapRecoveryTimer = null;
+      // A load still running would queue-and-discard again: wait it out.
+      if (this._isLoadingBuffer) {
+        this._scheduleGapRecovery();
+        return;
+      }
+      this._gapRecoveryAt = Date.now();
+      void this._onSessionNeedsRefresh();
+    }, delay);
   },
 
   // ═══════════════════════════════════════════════════════════════

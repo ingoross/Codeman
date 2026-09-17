@@ -116,6 +116,15 @@ const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more s
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
+// Gap recovery (_scheduleGapRecovery): how long output has to stay QUIET before
+// the reload that closes a scrollback gap runs. A reload landing mid-burst
+// re-opens the very gap it is closing, because its own write window queues and
+// discards live output — so every new frame pushes the timer out again.
+const GAP_RECOVERY_QUIET_MS = 1500;
+// Floor between two gap-recovery reloads. A reload can leave a small overlap of
+// its own, which arms the next one; the floor turns a possible self-feeding
+// chain into at most one reload per window.
+const GAP_RECOVERY_MIN_INTERVAL_MS = 5000;
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;
