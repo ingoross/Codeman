@@ -278,6 +278,10 @@ Object.assign(CodemanApp.prototype, {
       const res = await fetch('/api/cases');
       const cases = (await res.json()).data;
       this.cases = cases;
+      // The case (project) tab row is derived from this list, so it can only be
+      // right once the list has arrived — and it arrives after the first tab
+      // render on a cold load. Re-render the row and re-run the filter pass.
+      this.renderCaseTabs?.();
       console.log('[loadQuickStartCases] Loaded cases:', cases.map(c => c.name), 'lastUsedCase:', lastUsedCase);
 
       const select = document.getElementById('quickStartCase');

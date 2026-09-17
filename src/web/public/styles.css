@@ -540,6 +540,129 @@ body {
   filter: brightness(1.1);
 }
 
+/* ===== Case (project) tabs — the row above the session strip ============
+   Two levels in one header column: cases on top, sessions below. The column
+   owns the header's horizontal budget so both rows scroll inside the same
+   width, and it survives every session-list layout — the case row stays in the
+   header when #sessionTabs is re-parented into the sidebar or the tab rail. */
+.tabs-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.case-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.1rem 0.25rem 0;
+  /* Performance: isolate layout recalculations, same as the session strip */
+  contain: layout;
+}
+
+/* Fewer than two cases is not a choice — _renderCaseTabsImmediate() empties the
+   row and sets [hidden]. Both are spelled out because `display: flex` above
+   outranks the UA's `[hidden]` rule, and an empty row must never cost a header
+   line even if some other path clears it. */
+.case-tabs:empty,
+.case-tabs[hidden] {
+  display: none;
+}
+
+.case-tabs::-webkit-scrollbar {
+  height: 0;
+  width: 4px;
+}
+
+.case-tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.case-tabs::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.case-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.15rem 0.45rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--btn-radius) var(--btn-radius) 0 0;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition-smooth), border-color var(--transition-smooth),
+    color var(--transition-smooth);
+}
+
+.case-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.case-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.case-tab.active {
+  background: var(--bg-hover);
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.case-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.case-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.1);
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+
+/* One of this case's sessions is asking for a human — same signal the session
+   tab carries, aggregated one level up so a collapsed case still shows it. */
+.case-tab-alert {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  flex-shrink: 0;
+}
+
+/* The case filter hides rows with the SAME class the sidebar filter box uses
+   (applySidebarFilter is one pass over both), so it needs its own scope for the
+   same reason that one is scoped to the sidebar layout: a class that leaked
+   must never hide a session while nothing on screen can bring it back. Here the
+   gate is a selected case tab, and the row that selected it is right above the
+   list. Unscoped by layout on purpose — the case row filters the header strip,
+   the sidebar and the vertical rail alike. */
+html[data-case-filter='on'] .session-tab.tab-filtered-out {
+  display: none !important;
+}
+
 /* Session Tabs */
 .session-tabs {
   display: flex;
@@ -2561,6 +2684,7 @@ html:not(.tabs-show-detach) .session-tab:not(.detached):not(.tab-show-detach) .t
 
 /* ===== Solo (detached single-session) window chrome ===================== */
 body.solo-mode .session-tabs,
+body.solo-mode .case-tabs,
 body.solo-mode .session-tabs-host,
 body.solo-mode .session-sidebar,
 body.solo-mode .btn-sidebar-toggle,

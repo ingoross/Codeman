@@ -130,12 +130,21 @@
         </button>
       </div>
 
-      <!-- Session Tabs. In sidebar layout THIS VERY #sessionTabs element is
-           re-parented into #sessionSidebarList by applySessionListLayout() and
-           this host is hidden — it is never cloned or rebuilt, because
-           app.$('sessionTabs') caches it by object identity and never invalidates. -->
-      <div class="session-tabs-host" id="sessionTabsHost">
-        <div class="session-tabs" id="sessionTabs" role="tablist" aria-label="Session tabs" aria-orientation="horizontal">
+      <!-- Two-level tab navigation: the case (project) row sits ABOVE the session
+           strip and is a FILTER over it — it never renders sessions itself.
+           #caseTabs deliberately lives OUTSIDE #sessionTabsHost: the host is
+           hidden in sidebar layout and emptied in vertical-rail layout, but the
+           case row has to keep filtering whichever list is on screen. -->
+      <div class="tabs-column">
+        <div class="case-tabs" id="caseTabs" role="tablist" aria-label="Case tabs" aria-orientation="horizontal">
+        </div>
+        <!-- Session Tabs. In sidebar layout THIS VERY #sessionTabs element is
+             re-parented into #sessionSidebarList by applySessionListLayout() and
+             this host is hidden — it is never cloned or rebuilt, because
+             app.$('sessionTabs') caches it by object identity and never invalidates. -->
+        <div class="session-tabs-host" id="sessionTabsHost">
+          <div class="session-tabs" id="sessionTabs" role="tablist" aria-label="Session tabs" aria-orientation="horizontal">
+          </div>
         </div>
       </div>
 

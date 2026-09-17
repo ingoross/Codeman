@@ -346,6 +346,17 @@ html.mobile-init .file-browser-panel {
     --header-height: 44px;
   }
 
+  /* No case (project) row on a phone. The header is fixed and already down to
+     44px of chrome, and the question the row answers — which project am I in —
+     is what the phone overview home screen (mobile-overview.js) is FOR: it
+     groups the same sessions by case with room to read them. `_caseTabsAvailable()`
+     makes the same call in JS, so a remembered case can never filter a phone's
+     session strip; this is the second lock, and the one that also covers a
+     desktop window dragged down below 600px before the next render. */
+  .case-tabs {
+    display: none;
+  }
+
   /* Phone brand collapses to a single "C" home button: hide the wordmark,
      keep the tap target */
   .header-brand {
