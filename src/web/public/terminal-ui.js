@@ -310,6 +310,7 @@ Object.assign(CodemanApp.prototype, {
 
     const container = document.getElementById('terminalContainer');
     this.terminal.open(container);
+    this._quietHelperTextarea(container);
     this._installMobileTapMouseGuard();
     this._installShiftDragSelection();
     this._installTouchSelectionFocusGuard();
@@ -373,7 +374,10 @@ Object.assign(CodemanApp.prototype, {
           void this.copyTerminalSelection(selection);
           return false;
         }
-        if (ev.shiftKey) {
+        // The explicit copy chords (Ctrl+Shift+C, Ctrl+Insert) never fall
+        // through: neither doubles as the interrupt, so swallowing them on an
+        // empty selection costs nothing, while forwarding one would.
+        if (ev.shiftKey || ev.key === 'Insert') {
           ev.preventDefault();
           return false;
         }
@@ -4207,6 +4211,31 @@ Object.assign(CodemanApp.prototype, {
     if (last !== undefined && now - last < 10_000) return;
     this._autoCopyNotifiedAt = now;
     this.showToast(message, type);
+  },
+
+  /**
+   * Tell the on-screen keyboard that xterm's hidden input is not prose.
+   *
+   * xterm creates `.xterm-helper-textarea` as a plain `<textarea>` with none of
+   * these attributes, so a virtual keyboard treats a terminal like a message
+   * box: Gboard shows its suggestion strip, "corrects" words on the way in and
+   * capitalises the first letter of every command. Those guesses land in the
+   * PTY, which is the one place a guess is never wanted — `ls` arriving as
+   * `Ls`, a flag silently rewritten. Honoring the hints is up to the IME, but
+   * every mainstream one does.
+   *
+   * `data-gramm` keeps Grammarly's overlay off an element the user cannot see.
+   *
+   * @param {Element} container - The terminal container xterm was opened into.
+   */
+  _quietHelperTextarea(container) {
+    const helper = container?.querySelector?.('.xterm-helper-textarea');
+    if (!helper) return;
+    helper.setAttribute('autocomplete', 'off');
+    helper.setAttribute('autocorrect', 'off');
+    helper.setAttribute('autocapitalize', 'none');
+    helper.setAttribute('spellcheck', 'false');
+    helper.setAttribute('data-gramm', 'false');
   },
 
   _syncMobileHelperTextareaToCursor() {

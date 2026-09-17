@@ -364,9 +364,13 @@ const DEFAULT_SHORTCUTS = [
     // Bindings match on `key`, not `code`: xterm decides which byte to emit from the
     // PRODUCED character, so intercepting a physical KeyC that doesn't produce "c"
     // would diverge from the chord that actually sends ^C.
+    // Ctrl+Insert is the one copy chord no browser and no window manager takes
+    // for itself: Firefox reserves Ctrl+Shift+C for its devtools, so on Firefox
+    // the explicit chord never reaches the page at all.
     bindings: [
       { modifiers: ['ctrl'], key: 'c' },
       { modifiers: ['ctrl', 'shift'], key: 'C' },
+      { modifiers: ['ctrl'], key: 'Insert' },
     ],
     // Dispatched by shouldCopyTerminalSelectionFromShortcut() in terminal-ui.js and
     // deliberately absent from SHORTCUT_ACTIONS: the generic capture loop always
