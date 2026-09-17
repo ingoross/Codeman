@@ -364,9 +364,13 @@ const DEFAULT_SHORTCUTS = [
     // Bindings match on `key`, not `code`: xterm decides which byte to emit from the
     // PRODUCED character, so intercepting a physical KeyC that doesn't produce "c"
     // would diverge from the chord that actually sends ^C.
+    // Ctrl+Insert is the one copy chord no browser and no window manager takes
+    // for itself: Firefox reserves Ctrl+Shift+C for its devtools, so on Firefox
+    // the explicit chord never reaches the page at all.
     bindings: [
       { modifiers: ['ctrl'], key: 'c' },
       { modifiers: ['ctrl', 'shift'], key: 'C' },
+      { modifiers: ['ctrl'], key: 'Insert' },
     ],
     // Dispatched by shouldCopyTerminalSelectionFromShortcut() in terminal-ui.js and
     // deliberately absent from SHORTCUT_ACTIONS: the generic capture loop always
@@ -689,6 +693,10 @@ class CodemanApp {
     this._loadBufferQueue = null;  // queued SSE events during buffer load
     this._bufferLoadSeq = 0;
     this._bufferLoadOwner = null;
+    this._loadOverlapBytes = 0;    // bytes discarded during a load — arms the gap recovery
+    this._gapRecoveryTimer = null; // quiet-period reload that closes those gaps
+    this._gapRecoveryAt = 0;
+    this._gapRecoveryDeferred = false; // recovery is waiting for a selection to clear
     // Single-flight token for terminal buffer recovery. The identity check also
     // lets a session switch invalidate an older fetch without blocking the new tab.
     this._terminalRefreshOwner = null;
@@ -1910,6 +1918,11 @@ class CodemanApp {
     if (data.id === this.activeSessionId) {
       if (data.data.length > 32768) _crashDiag.log(`TERMINAL: ${(data.data.length/1024).toFixed(0)}KB`);
 
+      // A pending gap-recovery reload waits for a QUIET period — every frame
+      // pushes it out, because a reload that lands mid-burst re-opens the gap
+      // it is closing (its own write window queues and discards live output).
+      if (this._gapRecoveryTimer) this._scheduleGapRecovery();
+
       // Hard cap all app-owned render queues plus the one xterm chunk currently
       // parsing. Check the incoming frame too; otherwise a single large frame can
       // jump over the cap. Dropped data is recovered from the canonical buffer.
@@ -1918,14 +1931,12 @@ class CodemanApp {
         + (this._loadBufferQueue?.reduce((s, w) => s + w.length, 0) || 0)
         + (this._terminalWriteInFlightBytes || 0);
       if (queued + data.data.length > 131072) { // 128KB — drop to prevent accumulation
-        // Schedule a self-recovery once the
-        // queue drains (debounced to avoid hammering the API during sustained bursts).
-        if (!this._clientDropRecoveryTimer) {
-          this._clientDropRecoveryTimer = setTimeout(() => {
-            this._clientDropRecoveryTimer = null;
-            this._onSessionNeedsRefresh();
-          }, 2000);
-        }
+        // Schedule a self-recovery for once the burst subsides. The old fixed
+        // 2s timer armed only ONCE per burst, so it regularly fired while the
+        // session was still streaming; worse, _onSessionNeedsRefresh dropped it
+        // outright when a buffer load happened to be in flight, and the dropped
+        // output then stayed missing for good.
+        this._scheduleGapRecovery();
         return;
       }
 
@@ -2481,9 +2492,24 @@ class CodemanApp {
     const sessionId = this.activeSessionId;
     if (event?.id && event.id !== sessionId) return;
     if (!sessionId || !this.terminal) return;
-    // Skip if buffer load already in progress — avoids competing clear+rewrite cycles
-    if (this._isLoadingBuffer) return;
+    // A buffer load is in progress: competing clear+rewrite cycles would fight
+    // each other, so RETRY once it is done rather than dropping the refresh —
+    // a dropped one leaves the gap it was sent to close.
+    if (this._isLoadingBuffer) {
+      this._scheduleGapRecovery();
+      return;
+    }
     if (this._terminalRefreshOwner?.sessionId === sessionId) return;
+    // A refresh REPLACES the buffer, and xterm drops the selection with it. This
+    // one is server-triggered, so the user did not ask for it and must not lose
+    // the text they are in the middle of highlighting (or dragging over — xterm
+    // keeps the selection live during the drag). Wait for the selection to go,
+    // which xterm does on the next keypress or click; _onTerminalSelectionCleared
+    // re-arms the recovery then, so the gap still heals.
+    if (this.terminal.hasSelection?.()) {
+      this._gapRecoveryDeferred = true;
+      return;
+    }
     const refreshOwner = { sessionId };
     this._terminalRefreshOwner = refreshOwner;
     try {
@@ -2507,6 +2533,12 @@ class CodemanApp {
       // history into the terminal the user is now looking at. The window is two
       // fetches wide in the fallback case, so this guard is not optional.
       if (this.activeSessionId !== sessionId || this._terminalRefreshOwner !== refreshOwner) return;
+      // The user can have started selecting during the fetch — same rule as the
+      // guard above, checked again now that the destructive write is imminent.
+      if (this.terminal.hasSelection?.()) {
+        this._gapRecoveryDeferred = true;
+        return;
+      }
       if (data.terminalBuffer) {
         // This refresh is SERVER-triggered, so a user quietly reading scrollback
         // did not ask for it and must not be dragged to the bottom by it (#259).
@@ -3664,7 +3696,9 @@ class CodemanApp {
     this.flickerFilterActive = false;
     // Clear pending terminal writes
     this._clearTimer('syncWaitTimeout');
-    this._clearTimer('_clientDropRecoveryTimer');
+    this._clearTimer('_gapRecoveryTimer');
+    this._loadOverlapBytes = 0;
+    this._gapRecoveryDeferred = false;
     this.pendingWrites = [];
     this.writeFrameScheduled = false;
     // Release the one-chunk-in-flight gate with the rest of the write queue.
@@ -5674,7 +5708,11 @@ class CodemanApp {
     this._tabCompletionRetries = 0;
     this._tabCompletionBaseText = null;
     this._clearTimer('_tabCompletionFallback');
-    this._clearTimer('_clientDropRecoveryTimer');
+    // The overlap belongs to the session being left; a recovery armed for it
+    // must not reload the one being opened.
+    this._clearTimer('_gapRecoveryTimer');
+    this._loadOverlapBytes = 0;
+    this._gapRecoveryDeferred = false;
     this._terminalRefreshOwner = null;
 
     // Clean up pending terminal writes to prevent old session data from appearing in new session

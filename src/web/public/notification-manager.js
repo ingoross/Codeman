@@ -63,6 +63,18 @@ class NotificationManager {
         this.onTabVisible();
       }
     });
+    // Window focus counts as "the tab is back": a second browser window on the
+    // same desktop becomes the one you are looking at WITHOUT visibilitychange
+    // firing (both windows stay visible). All clients of a session share one
+    // PTY, so the other window — or a phone — may have resized it in the
+    // meantime, and this window has to re-assert its own size to get a readable
+    // frame back. document.hidden still gates it, so a focus event delivered to
+    // a genuinely hidden tab is ignored.
+    window.addEventListener('focus', () => {
+      if (document.hidden) return;
+      this.isTabVisible = true;
+      this.onTabVisible();
+    });
   }
 
   _usesMobilePreferences() {
@@ -512,9 +524,13 @@ class NotificationManager {
     }
     // Re-fit terminal and send resize to PTY so this client's dimensions win.
     // Fixes broken layout when switching between desktop and mobile on the same session.
+    // Deliberately NOT forced: this now runs on every window focus, and forcing
+    // would jiggle the pane (see Session.resize) every time the user alt-tabs
+    // back. A pane another client actually resized differs from this client's
+    // size, so the plain post already moves it and the CLI redraws.
     if (this.app?.fitAddon && this.app?.activeSessionId) {
       this.app.fitAddon.fit();
-      this.app.sendResize(this.app.activeSessionId);
+      this.app.sendResize(this.app.activeSessionId)?.catch?.(() => {});
     }
   }
 

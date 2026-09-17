@@ -18,6 +18,7 @@ import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
 const APP_SOURCE = readFileSync(resolve(import.meta.dirname, '../src/web/public/app.js'), 'utf8');
+const TERMINAL_UI_SOURCE = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
 
 type Shortcut = {
   id: string;
@@ -66,6 +67,7 @@ const DEFAULT_REGISTRY: Shortcut[] = [
     bindings: [
       { modifiers: ['ctrl'], key: 'c' },
       { modifiers: ['ctrl', 'shift'], key: 'C' },
+      { modifiers: ['ctrl'], key: 'Insert' },
     ],
   },
 ];
@@ -84,12 +86,19 @@ function keydown(over: Record<string, unknown> = {}) {
 }
 
 describe('terminal smart-copy gate', () => {
-  it('matches the default Ctrl+C and Ctrl+Shift+C chords', () => {
+  it('matches the default Ctrl+C, Ctrl+Shift+C and Ctrl+Insert chords', () => {
     const app = loadTerminalHarness(DEFAULT_REGISTRY);
     expect(app.shouldCopyTerminalSelectionFromShortcut(keydown())).toBe(true);
     expect(app.shouldCopyTerminalSelectionFromShortcut(keydown({ key: 'C', shiftKey: true }))).toBe(true);
     // Cmd+C on macOS: the registry treats ctrl/meta as interchangeable.
     expect(app.shouldCopyTerminalSelectionFromShortcut(keydown({ ctrlKey: false, metaKey: true }))).toBe(true);
+    // Firefox keeps Ctrl+Shift+C for its devtools, so Ctrl+Insert is the chord
+    // that actually reaches the page there.
+    expect(app.shouldCopyTerminalSelectionFromShortcut(keydown({ key: 'Insert', code: 'Insert' }))).toBe(true);
+    // Shift+Insert is paste everywhere and must stay out of this.
+    expect(
+      app.shouldCopyTerminalSelectionFromShortcut(keydown({ key: 'Insert', code: 'Insert', shiftKey: true }))
+    ).toBe(false);
   });
 
   it('ignores plain typing and unrelated chords', () => {
@@ -131,6 +140,18 @@ describe('smart-copy wiring invariants', () => {
   it('registers copy-selection in the shortcut registry', () => {
     expect(APP_SOURCE).toContain("id: 'copy-selection'");
     expect(APP_SOURCE).toContain("action: 'copyTerminalSelection'");
+    expect(APP_SOURCE).toContain("{ modifiers: ['ctrl'], key: 'Insert' }");
+  });
+
+  it('swallows the explicit chords on an empty selection, but never Ctrl+C', () => {
+    const handler = TERMINAL_UI_SOURCE.slice(
+      TERMINAL_UI_SOURCE.indexOf('this.shouldCopyTerminalSelectionFromShortcut?.(ev)'),
+      TERMINAL_UI_SOURCE.indexOf('shouldToggleSessionSidebarFromShortcut')
+    );
+    // Ctrl+Insert cannot double as the interrupt, so it joins Ctrl+Shift+C on
+    // the side that is swallowed rather than forwarded to the PTY.
+    expect(handler).toContain("if (ev.shiftKey || ev.key === 'Insert') {");
+    expect(handler).toContain('return true;');
   });
 
   it('keeps copyTerminalSelection OUT of SHORTCUT_ACTIONS', () => {

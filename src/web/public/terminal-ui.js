@@ -310,6 +310,7 @@ Object.assign(CodemanApp.prototype, {
 
     const container = document.getElementById('terminalContainer');
     this.terminal.open(container);
+    this._quietHelperTextarea(container);
     this._installMobileTapMouseGuard();
     this._installShiftDragSelection();
     this._installTouchSelectionFocusGuard();
@@ -373,7 +374,10 @@ Object.assign(CodemanApp.prototype, {
           void this.copyTerminalSelection(selection);
           return false;
         }
-        if (ev.shiftKey) {
+        // The explicit copy chords (Ctrl+Shift+C, Ctrl+Insert) never fall
+        // through: neither doubles as the interrupt, so swallowing them on an
+        // empty selection costs nothing, while forwarding one would.
+        if (ev.shiftKey || ev.key === 'Insert') {
           ev.preventDefault();
           return false;
         }
@@ -596,6 +600,7 @@ Object.assign(CodemanApp.prototype, {
         // selection on any keypress, so without this a keystroke would leave a
         // stale flush armed for the next unrelated mouseup.
         this._autoCopyPending = false;
+        this._onTerminalSelectionCleared();
         return;
       }
       // Auto Copy arms here and fires at the END of the gesture (below). This
@@ -3299,6 +3304,11 @@ Object.assign(CodemanApp.prototype, {
     // This is critical: interleaving causes cursor position chaos with Ink redraws.
     if (this._isLoadingBuffer) {
       if (this._loadBufferQueue) this._loadBufferQueue.push(data);
+      // Unless the caller asks for a flush, this data is DISCARDED when the load
+      // finishes (see _finishBufferLoad) — remember the overlap so the display
+      // can be repaired once the stream goes quiet, instead of keeping a hole
+      // that only the next tab switch would close.
+      this._loadOverlapBytes = (this._loadOverlapBytes || 0) + data.length;
       return;
     }
 
@@ -3890,8 +3900,10 @@ Object.assign(CodemanApp.prototype, {
       return false;
     }
     const queued = this._loadBufferQueue;
+    const overlapBytes = this._loadOverlapBytes || 0;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._loadOverlapBytes = 0;
     this._bufferLoadOwner = null;
     // COD-144: replay (rather than discard) queued live events when the load
     // painted nothing — the queued prompt is the only content a new session has.
@@ -3899,8 +3911,58 @@ Object.assign(CodemanApp.prototype, {
       for (const data of queued) {
         this.batchTerminalWrite(data);
       }
+      return true;
     }
+    // Output arrived, and was discarded, while the buffer was loading: the
+    // display now ends before "now". Close the gap once the stream is quiet.
+    if (overlapBytes > 0) this._scheduleGapRecovery();
     return true;
+  },
+
+  /**
+   * Reload the terminal buffer once output has been QUIET for a moment.
+   *
+   * Repairs the scrollback gaps this client creates itself: output queued
+   * during a buffer load and then discarded (`_finishBufferLoad`), and frames
+   * dropped by the 128KB render-queue cap (`_onSessionTerminal`). Both leave
+   * the terminal showing a prefix of what the session actually printed, with
+   * nothing to fix it until the user switches tabs — the "missing lines".
+   *
+   * Every new output event RE-ARMS the timer (see `_onSessionTerminal`), so the
+   * reload lands in a pause rather than mid-burst, where it would only re-open
+   * the gap. While a load is in flight the recovery waits instead of dropping,
+   * which is what the plain early return used to do.
+   */
+  _scheduleGapRecovery() {
+    if (!this.activeSessionId) return;
+    if (this._gapRecoveryTimer) clearTimeout(this._gapRecoveryTimer);
+    // Quiet first, and never more often than the floor.
+    const sinceLast = Date.now() - (this._gapRecoveryAt || 0);
+    const delay = Math.max(GAP_RECOVERY_QUIET_MS, GAP_RECOVERY_MIN_INTERVAL_MS - sinceLast);
+    this._gapRecoveryTimer = setTimeout(() => {
+      this._gapRecoveryTimer = null;
+      // A load still running would queue-and-discard again: wait it out.
+      if (this._isLoadingBuffer) {
+        this._scheduleGapRecovery();
+        return;
+      }
+      this._gapRecoveryAt = Date.now();
+      void this._onSessionNeedsRefresh();
+    }, delay);
+  },
+
+  /**
+   * The selection is gone, so a recovery reload that stood aside for it may run.
+   *
+   * `_onSessionNeedsRefresh` defers rather than reschedules while text is
+   * highlighted: a poll would keep a timer alive for as long as the user leaves
+   * a selection standing, and xterm tells us the moment it goes (any keypress,
+   * any click, a session switch).
+   */
+  _onTerminalSelectionCleared() {
+    if (!this._gapRecoveryDeferred) return;
+    this._gapRecoveryDeferred = false;
+    this._scheduleGapRecovery();
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -4149,6 +4211,31 @@ Object.assign(CodemanApp.prototype, {
     if (last !== undefined && now - last < 10_000) return;
     this._autoCopyNotifiedAt = now;
     this.showToast(message, type);
+  },
+
+  /**
+   * Tell the on-screen keyboard that xterm's hidden input is not prose.
+   *
+   * xterm creates `.xterm-helper-textarea` as a plain `<textarea>` with none of
+   * these attributes, so a virtual keyboard treats a terminal like a message
+   * box: Gboard shows its suggestion strip, "corrects" words on the way in and
+   * capitalises the first letter of every command. Those guesses land in the
+   * PTY, which is the one place a guess is never wanted — `ls` arriving as
+   * `Ls`, a flag silently rewritten. Honoring the hints is up to the IME, but
+   * every mainstream one does.
+   *
+   * `data-gramm` keeps Grammarly's overlay off an element the user cannot see.
+   *
+   * @param {Element} container - The terminal container xterm was opened into.
+   */
+  _quietHelperTextarea(container) {
+    const helper = container?.querySelector?.('.xterm-helper-textarea');
+    if (!helper) return;
+    helper.setAttribute('autocomplete', 'off');
+    helper.setAttribute('autocorrect', 'off');
+    helper.setAttribute('autocapitalize', 'none');
+    helper.setAttribute('spellcheck', 'false');
+    helper.setAttribute('data-gramm', 'false');
   },
 
   _syncMobileHelperTextareaToCursor() {
