@@ -483,6 +483,49 @@ const DEFAULT_SHORTCUTS = [
 
 
 // ═══════════════════════════════════════════════════════════════
+// Per-window UI state
+//
+// Which session you are looking at, and which case row is selected, are facts
+// about a WINDOW, not about the browser profile. localStorage is shared by
+// every tab and window of the same origin, so two windows side by side — the
+// point of opening a second one — kept overwriting each other's choice: the
+// second window's selectSession() wrote the key, the first one read it back on
+// its next reconnect and jumped to the other window's session.
+//
+// sessionStorage is per window (and survives reload and restore-after-crash,
+// unlike an in-memory value), so it owns the live state. localStorage stays
+// written as the SEED a brand-new window starts from, which is exactly the
+// behaviour that shipped before: a fresh window has no sessionStorage yet, so
+// it still restores the last session picked anywhere. Nothing about the restore
+// order changes for a single window.
+//
+// Each accessor guards its two stores separately: sessionStorage can be
+// unavailable (Safari private mode, disabled site data, a vm-loaded test)
+// while localStorage works, and the reverse, and neither may take the other
+// down with it.
+// ═══════════════════════════════════════════════════════════════
+
+/** This window's value for `key`, falling back to the cross-window seed. */
+function readWindowState(key) {
+  let value = null;
+  try { value = sessionStorage.getItem(key); } catch { /* no sessionStorage */ }
+  if (value !== null && value !== undefined) return value;
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+/** Set this window's value AND the seed new windows will start from. */
+function writeWindowState(key, value) {
+  try { sessionStorage.setItem(key, value); } catch { /* no sessionStorage */ }
+  try { localStorage.setItem(key, value); } catch { /* no localStorage */ }
+}
+
+/** Forget `key` in both stores — a seed nothing can restore is worse than none. */
+function clearWindowState(key) {
+  try { sessionStorage.removeItem(key); } catch { /* no sessionStorage */ }
+  try { localStorage.removeItem(key); } catch { /* no localStorage */ }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // CodemanApp Class — constructor and global state
 // ═══════════════════════════════════════════════════════════════
 
@@ -519,7 +562,7 @@ class CodemanApp {
     // bucket for sessions outside every case, otherwise a CaseInfo.name.
     this.activeCaseTab = CASE_TAB_ALL;
     try {
-      const savedCaseTab = localStorage.getItem('codeman-active-case');
+      const savedCaseTab = readWindowState('codeman-active-case');
       if (typeof savedCaseTab === 'string') this.activeCaseTab = savedCaseTab;
     } catch { /* storage unavailable — start unfiltered */ }
     this.currentRun = null;
@@ -1909,7 +1952,7 @@ class CodemanApp {
     // when the thing you were looking at was taken away.
     if (this.activeSessionId === data.id && !this._closingSessions.has(data.id)) {
       this.activeSessionId = null;
-      try { localStorage.removeItem('codeman-active-session'); } catch {}
+      clearWindowState('codeman-active-session');
       this.terminal.clear();
       this.showWelcome();
     }
@@ -3980,10 +4023,12 @@ class CodemanApp {
     if (this.sessionOrder.length === 0) {
       this.activeSessionId = null;
     } else {
-      // Priority: current active > localStorage > first session
+      // Priority: current active > this window's last session > the
+      // cross-window seed (readWindowState falls back to it, which is what a
+      // brand-new window restores from) > first session.
       let restoreId = previousActiveId;
       if (!restoreId || !this.sessions.has(restoreId)) {
-        try { restoreId = localStorage.getItem('codeman-active-session'); } catch {}
+        restoreId = readWindowState('codeman-active-session');
       }
       if (keepTerminal && restoreId === previousActiveId && this.sessions.has(restoreId)) {
         // Reconnect onto the session already on screen. renderSessionTabs() ran
@@ -4847,9 +4892,14 @@ class CodemanApp {
     this.applySidebarFilter(this._sidebarFilter);
   }
 
-  /** Where the active case tab lives. Overridden per window in a later step. */
+  /**
+   * The selected case is per window (writeWindowState), like the active
+   * session: two windows open side by side are almost always two DIFFERENT
+   * projects, and a shared key made the second one pull the first one's row out
+   * from under it on the next reconnect.
+   */
   _persistActiveCaseTab(value) {
-    try { localStorage.setItem('codeman-active-case', value); } catch { /* storage unavailable */ }
+    writeWindowState('codeman-active-case', value);
   }
 
   /**
@@ -6358,7 +6408,7 @@ class CodemanApp {
     // replay paths refresh it when their fetch lands; without this the previous
     // session's notice stays on screen until then (#258).
     this._renderHistoryTruncationBanner();
-    try { localStorage.setItem('codeman-active-session', sessionId); } catch {}
+    writeWindowState('codeman-active-session', sessionId);
     // Follow the session's case, so the routes that reach PAST the filter —
     // Alt+N and Ctrl+Shift+[/] walk the whole strip order, the palette lists
     // every session, a hook alert jumps to its own tab — move the case row with
@@ -6924,7 +6974,7 @@ class CodemanApp {
 
       if (wasActive) {
         this.activeSessionId = null;
-        try { localStorage.removeItem('codeman-active-session'); } catch {}
+        clearWindowState('codeman-active-session');
         // Next tab in the user's own order, skipping ids the cleanup has not
         // caught up with yet: sessionOrder can transiently hold a dead id
         // (delete racing the order sync), which is the same reason Alt+N
@@ -7029,7 +7079,7 @@ class CodemanApp {
   goHome() {
     // Deselect active session and show welcome screen
     this.activeSessionId = null;
-    try { localStorage.removeItem('codeman-active-session'); } catch {}
+    clearWindowState('codeman-active-session');
     this.terminal.clear();
     this.showWelcome();
     this.renderSessionTabs();
@@ -7088,7 +7138,7 @@ class CodemanApp {
         }
       } catch {}
       this.activeSessionId = null;
-      try { localStorage.removeItem('codeman-active-session'); } catch {}
+      clearWindowState('codeman-active-session');
       this.respawnStatus = {};
       this.respawnCountdownTimers = {};
       this.respawnActionLogs = {};
