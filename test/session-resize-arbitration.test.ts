@@ -113,13 +113,63 @@ describe('Session resize arbitration', () => {
     expect(resize).toHaveBeenCalledWith(100, 30);
   });
 
-  it('applies forced resizes even when the dimensions did not change', () => {
-    const session = new Session({ workingDir: '/tmp', mode: 'shell' });
-    const resize = attachFakePty(session, 120, 40);
+  describe('forced resize at unchanged dimensions (guaranteed repaint)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
 
-    session.resize(120, 40, { force: true });
+    it('steps one row away and back, so SIGWINCH is actually delivered', () => {
+      vi.useFakeTimers();
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      const resize = attachFakePty(session, 120, 40);
 
-    expect(resize).toHaveBeenCalledWith(120, 40);
+      session.resize(120, 40, { force: true });
+
+      // Re-posting 120x40 onto a 120x40 pane moves nothing, so nothing redraws.
+      expect(resize).toHaveBeenNthCalledWith(1, 120, 39);
+      vi.advanceTimersByTime(200);
+      expect(resize).toHaveBeenNthCalledWith(2, 120, 40);
+      expect(resize).toHaveBeenCalledTimes(2);
+    });
+
+    it('steps UP at the row floor, where stepping down would repeat the size', () => {
+      vi.useFakeTimers();
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      const resize = attachFakePty(session, 80, 10);
+
+      session.resize(80, 10, { force: true });
+
+      expect(resize).toHaveBeenNthCalledWith(1, 80, 11);
+      vi.advanceTimersByTime(200);
+      expect(resize).toHaveBeenNthCalledWith(2, 80, 10);
+    });
+
+    it('stands down when another client resizes during the probe', () => {
+      vi.useFakeTimers();
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      const resize = attachFakePty(session, 120, 40);
+
+      session.resize(120, 40, { force: true });
+      expect(resize).toHaveBeenNthCalledWith(1, 120, 39);
+      // A phone takes the pane while the probe size stands.
+      session.resize(60, 24, { viewportType: 'mobile' });
+      vi.advanceTimersByTime(200);
+
+      expect(resize).toHaveBeenCalledTimes(2);
+      expect(resize).toHaveBeenLastCalledWith(60, 24);
+    });
+
+    it('is a plain single resize when the dimensions really did change', () => {
+      vi.useFakeTimers();
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      const resize = attachFakePty(session, 120, 40);
+
+      session.resize(160, 48, { force: true });
+      vi.advanceTimersByTime(200);
+
+      expect(resize).toHaveBeenCalledTimes(1);
+      expect(resize).toHaveBeenCalledWith(160, 48);
+    });
   });
 
   describe('idle-desktop override (whoever is active wins)', () => {

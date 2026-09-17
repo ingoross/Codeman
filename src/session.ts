@@ -1790,6 +1790,14 @@ export class Session extends EventEmitter {
       throw spawnErr;
     }
 
+    // Record what the pane is ACTUALLY at, rather than leaving the fields at the
+    // 120x40 spawn default. resize() skips a post whose dimensions already match
+    // these, so after a Codeman restart onto a restored pane of some other size,
+    // a client that happens to be 120x40 had its resize dropped as a no-op and
+    // went on drawing against a pane it did not fit.
+    this._ptyCols = ptyCols;
+    this._ptyRows = ptyRows;
+
     return { isRestored };
   }
 
@@ -3720,9 +3728,28 @@ export class Session extends EventEmitter {
     return false;
   }
 
-  /** Current PTY dimensions — used to skip no-op resizes that trigger Ink redraws */
+  /**
+   * Current PTY dimensions — used to skip no-op resizes that trigger Ink redraws.
+   * Seeded from the real tmux window size when the PTY is attached, NOT left at
+   * the spawn default: a restored pane can be any size, and a client whose own
+   * size happened to match the default would otherwise have its resize skipped
+   * as a no-op and keep rendering against the size the previous client left.
+   */
   private _ptyCols = 120;
   private _ptyRows = 40;
+
+  /** Bumped by every size actually written through to the PTY (see _applyPtySize). */
+  private _ptySizeSeq = 0;
+
+  /**
+   * Rows the forced-resize probe steps through. The probe must DIFFER from the
+   * target, so at the floor it steps up instead of down — `rows - 1` clamped to
+   * the minimum would post the same size twice and trigger nothing at all.
+   */
+  private static readonly RESIZE_PROBE_MIN_ROWS = 10;
+
+  /** How long the probe size stands before the real size is restored. */
+  private static readonly RESIZE_PROBE_SETTLE_MS = 120;
 
   /**
    * Live WebSocket connections that have announced a desktop viewport for this
@@ -3813,15 +3840,46 @@ export class Session extends EventEmitter {
       }
       this._mobileSizeOverride = true;
     }
+    if (!this.ptyProcess) return;
     const dimsChanged = cols !== this._ptyCols || rows !== this._ptyRows;
-    if (this.ptyProcess && (dimsChanged || options.force)) {
-      this._ptyCols = cols;
-      this._ptyRows = rows;
-      if (!IS_TEST_MODE && this._mux && this._muxSession) {
-        this._mux.resizeWindow?.(this._muxSession.muxName, cols, rows);
-      }
-      this.ptyProcess.resize(cols, rows);
+    if (dimsChanged) {
+      this._applyPtySize(cols, rows);
+      return;
     }
+    if (!options.force) return;
+    // A forced resize whose dimensions already match has to REPAINT, and that is
+    // exactly what re-posting the same size cannot do: SIGWINCH — from the
+    // kernel's TIOCSWINSZ and from tmux's own resize-window alike — is delivered
+    // only when the size actually MOVES. So the caller asked for a redraw and
+    // got a silent no-op, which is how a restored window could sit there showing
+    // a stale frame. Step one row away and come straight back: the second post
+    // is then guaranteed to change the height, so the CLI redraws its screen.
+    const probeRows = rows > Session.RESIZE_PROBE_MIN_ROWS ? rows - 1 : rows + 1;
+    const token = this._applyPtySize(cols, probeRows);
+    const restore = setTimeout(() => {
+      // Another client (or this one) resized in the meantime — that size wins,
+      // and re-posting ours would fight it.
+      if (token !== this._ptySizeSeq || !this.ptyProcess) return;
+      this._applyPtySize(cols, rows);
+    }, Session.RESIZE_PROBE_SETTLE_MS);
+    restore.unref?.();
+  }
+
+  /**
+   * Write a size through to tmux and the PTY, and record it.
+   *
+   * @returns The sequence number of this write. A later write bumps it, which is
+   *   how the forced-resize probe above notices that someone else has taken over
+   *   the pane size and stands down instead of stomping it.
+   */
+  private _applyPtySize(cols: number, rows: number): number {
+    this._ptyCols = cols;
+    this._ptyRows = rows;
+    if (!IS_TEST_MODE && this._mux && this._muxSession) {
+      this._mux.resizeWindow?.(this._muxSession.muxName, cols, rows);
+    }
+    this.ptyProcess?.resize(cols, rows);
+    return ++this._ptySizeSeq;
   }
 
   // Legacy method for compatibility with session-manager
