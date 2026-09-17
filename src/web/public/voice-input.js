@@ -12,6 +12,7 @@
  * - DeepgramProvider — Direct browser-to-Deepgram WebSocket connection for speech-to-text.
  *   Captures audio via MediaRecorder, streams chunks every 250ms, handles KeepAlive pings,
  *   auto-detects MIME type (opus/webm/mp4), and supports custom key terms for dev vocabulary.
+ *   Stops gracefully: recorder flush -> CloseStream -> bounded wait for the tail.
  *
  * - VoiceInput — High-level voice input controller. Toggle mode: tap mic to start, tap
  *   again to stop. Auto-stops after 3s silence. Shows floating preview overlay with recording
@@ -54,12 +55,23 @@ const DeepgramProvider = {
   _onResult: null,
   _onError: null,
   _onEnd: null,
+  _draining: false,
+  _drainResolve: null,
+  _session: 0,
+
+  /** How long to wait for Deepgram's tail after CloseStream before giving up. */
+  DRAIN_MS: 2000,
 
   /**
    * Start streaming audio to Deepgram.
    * @param {object} opts - { apiKey, language, keyterms[], onResult(text, isFinal), onError(msg), onEnd(), onStream(stream) }
    */
   async start(opts) {
+    // A drain from the previous recording may still be in flight; bumping the
+    // session makes its teardown let go of this one's socket and callbacks.
+    this._session++;
+    this._draining = false;
+    this._drainResolve = null;
     this._onResult = opts.onResult;
     this._onError = opts.onError;
     this._onEnd = opts.onEnd;
@@ -156,6 +168,9 @@ const DeepgramProvider = {
             this._onResult?.(transcript, isFinal);
             this._resetSilenceTimeout();
           }
+        } else if (data.type === 'Metadata') {
+          // Deepgram's "that was everything" after CloseStream — ends the drain.
+          this._drainResolve?.();
         }
       } catch (_e) {
         // Ignore parse errors for non-JSON messages
@@ -169,6 +184,12 @@ const DeepgramProvider = {
     this._ws.onclose = (event) => {
       clearInterval(this._keepAliveInterval);
       this._keepAliveInterval = null;
+      // A close during the drain is Deepgram acknowledging CloseStream — the
+      // stop() that started the drain owns the teardown from here.
+      if (this._draining) {
+        this._drainResolve?.();
+        return;
+      }
       if (event.code === 1008) {
         this._onError?.('Authentication failed. Check your Deepgram API key in Settings > Voice.');
       } else if (event.code === 1006) {
@@ -215,29 +236,93 @@ const DeepgramProvider = {
   },
 
   _resetSilenceTimeout() {
+    if (this._draining) return;
     clearTimeout(this._silenceTimeout);
     this._silenceTimeout = setTimeout(() => {
       this.stop();
     }, 8000);
   },
 
-  stop() {
+  /**
+   * Graceful stop: drain the tail, then hang up. Closing the socket straight away
+   * loses the last utterance twice over — MediaRecorder hands over its final chunk
+   * asynchronously, and Deepgram only transcribes what it still has buffered once
+   * it sees CloseStream. So: flush the recorder, send CloseStream, keep listening
+   * for a bounded moment, and only then tear down and fire onEnd.
+   */
+  async stop() {
+    if (this._draining) return;
+    this._draining = true;
+    const session = this._session;
+    const ws = this._ws;
     clearTimeout(this._silenceTimeout);
     this._silenceTimeout = null;
     clearInterval(this._keepAliveInterval);
     this._keepAliveInterval = null;
+
+    await this._flushRecorder();
     this._stopRecording();
-    // Detach WS handlers before closing to prevent stale onclose from
-    // killing a subsequent recording that starts before the close completes
-    if (this._ws) {
-      this._ws.onclose = null;
-      this._ws.onmessage = null;
-      this._ws.onerror = null;
-      if (this._ws.readyState === WebSocket.OPEN) {
-        try { this._ws.close(1000); } catch (_e) { /* ignore */ }
-      }
-      this._ws = null;
+
+    if (ws?.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'CloseStream' })); } catch (_e) { /* ignore */ }
+      await this._awaitDrain();
     }
+    this._teardown(session, ws);
+  },
+
+  /** Resolve once MediaRecorder has emitted its last chunk (or after a safety wait). */
+  _flushRecorder() {
+    return new Promise((resolve) => {
+      const recorder = this._mediaRecorder;
+      if (!recorder || recorder.state === 'inactive') {
+        resolve();
+        return;
+      }
+      let timer = null;
+      const done = () => { clearTimeout(timer); resolve(); };
+      timer = setTimeout(done, 500);
+      recorder.onstop = done;
+      try {
+        recorder.stop();
+      } catch (_e) {
+        done();
+      }
+    });
+  },
+
+  /** Resolve once Deepgram says it is done (Metadata or close), or after DRAIN_MS. */
+  _awaitDrain() {
+    return new Promise((resolve) => {
+      let timer = null;
+      const done = () => {
+        clearTimeout(timer);
+        this._drainResolve = null;
+        resolve();
+      };
+      timer = setTimeout(done, this.DRAIN_MS);
+      this._drainResolve = done;
+    });
+  },
+
+  /**
+   * Close the drained socket and hand back to VoiceInput. Handlers are detached
+   * before closing so a stale onclose cannot kill a recording that started while
+   * we drained — and if one did start, it owns `this._*` now, so only the socket
+   * this stop() was given gets touched.
+   */
+  _teardown(session, ws) {
+    if (ws) {
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try { ws.close(1000); } catch (_e) { /* ignore */ }
+      }
+    }
+    if (session !== this._session) return;
+    this._draining = false;
+    this._drainResolve = null;
+    this._ws = null;
     // Save onEnd before nulling — must notify VoiceInput when silence timeout
     // triggers stop internally (VoiceInput.onEnd guards with isRecording check)
     const onEnd = this._onEnd;
@@ -247,8 +332,28 @@ const DeepgramProvider = {
     onEnd?.();
   },
 
+  /** Hard stop for the error and unload paths: drop everything, no drain, no onEnd. */
   _cleanup() {
-    this.stop();
+    this._session++;
+    this._draining = false;
+    this._drainResolve = null;
+    clearTimeout(this._silenceTimeout);
+    this._silenceTimeout = null;
+    clearInterval(this._keepAliveInterval);
+    this._keepAliveInterval = null;
+    this._stopRecording();
+    if (this._ws) {
+      this._ws.onclose = null;
+      this._ws.onmessage = null;
+      this._ws.onerror = null;
+      if (this._ws.readyState === WebSocket.OPEN) {
+        try { this._ws.close(1000); } catch (_e) { /* ignore */ }
+      }
+      this._ws = null;
+    }
+    this._onResult = null;
+    this._onError = null;
+    this._onEnd = null;
     this._mediaRecorder = null;
     this._stream = null;
     this._selectedMime = null;
@@ -554,6 +659,7 @@ const VoiceInput = {
   _analyserSource: null, // MediaStreamSource for level meter
   _audioContext: null, // AudioContext for level meter
   _levelAnimFrame: null, // rAF handle for level meter
+  _draining: false, // Deepgram is draining its tail; the flush is still pending
 
   init() {
     this._initRecognition();
@@ -668,6 +774,9 @@ const VoiceInput = {
       return;
     }
     this._retryCount = 0;
+    // A Deepgram drain from the previous recording still owns the accumulator —
+    // flush it before this recording resets it.
+    if (this._draining) this._flushDeepgram();
 
     const provider = this._resolveProvider();
     if (provider === 'claude') {
@@ -767,17 +876,19 @@ const VoiceInput = {
         this._startLevelMeter(stream);
       },
       onResult: (text, isFinal) => {
-        if (!this.isRecording) return;
+        // During the drain the recording is over, but the tail still counts.
+        if (!this.isRecording && !this._draining) return;
         this._hasReceivedResult = true;
-        this._resetSilenceTimeout();
         if (isFinal) {
           // Accumulate final text and keep listening for more speech
           this._accumulatedFinal += (this._accumulatedFinal ? ' ' : '') + text;
-          this._showPreview(this._accumulatedFinal, 'deepgram');
-        } else {
-          const display = this._accumulatedFinal + (this._accumulatedFinal ? ' ' : '') + text;
-          this._showPreview(display, 'deepgram');
         }
+        if (!this.isRecording) return; // draining: the preview is already gone
+        this._resetSilenceTimeout();
+        const display = isFinal
+          ? this._accumulatedFinal
+          : this._accumulatedFinal + (this._accumulatedFinal ? ' ' : '') + text;
+        this._showPreview(display, 'deepgram');
       },
       onError: (msg) => {
         const wasRecording = this.isRecording;
@@ -785,8 +896,10 @@ const VoiceInput = {
         if (wasRecording) app.showToast(msg, 'error');
       },
       onEnd: () => {
-        // stop() flushes the accumulated Deepgram text exactly once.
+        // The socket is down for good — drained, timed out, or dropped on its
+        // own. Either way this is the one place the transcript is flushed.
         if (this.isRecording) this.stop();
+        this._flushDeepgram();
       }
     });
 
@@ -851,18 +964,16 @@ const VoiceInput = {
     this._updateButtons('idle');
     this._hidePreview();
 
-    // Deepgram listens continuously (fork): finals accumulate until the user
-    // stops or silence times out, so flush them here. Every other provider
-    // inserts its own final before calling stop(), so it must not flush again.
-    if (this._activeProvider === 'deepgram' && this._accumulatedFinal) {
-      this._insertText(this._accumulatedFinal);
-      this._accumulatedFinal = '';
-    }
-
     if (this._activeProvider === 'claude') {
       // Finalize, don't hang up: the last transcript arrives after the audio does.
       ClaudeVoiceProvider.stop();
     } else if (this._activeProvider === 'deepgram') {
+      // Deepgram listens continuously (fork): finals accumulate until the user
+      // stops or silence times out, and the tail of the last utterance only
+      // arrives once CloseStream has gone out. So the flush waits for the drain
+      // and happens exactly once in _flushDeepgram(), driven by the provider's
+      // onEnd. Every other provider inserts its own final before calling stop().
+      this._draining = true;
       DeepgramProvider.stop();
     } else if (this._activeProvider === 'webspeech') {
       try {
@@ -880,6 +991,20 @@ const VoiceInput = {
 
     // Haptic feedback on mobile
     if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+  },
+
+  /**
+   * Insert the accumulated Deepgram transcript, once. Runs when the socket is
+   * finally down, so the tail Deepgram only returns after CloseStream is part of
+   * it. The _draining guard is what makes it once: a socket that both errors and
+   * closes reports the end twice, and the second report finds nothing to flush.
+   */
+  _flushDeepgram() {
+    if (!this._draining) return;
+    this._draining = false;
+    const text = this._accumulatedFinal;
+    this._accumulatedFinal = '';
+    if (text) this._insertText(text);
   },
 
   _onWebSpeechResult(event) {
@@ -1089,15 +1214,15 @@ const VoiceInput = {
   _resetSilenceTimeout() {
     clearTimeout(this.silenceTimeout);
     this.silenceTimeout = setTimeout(() => {
-      if (this.isRecording) {
-        // Finalize any accumulated text before stopping (cleared so a Deepgram
-        // stop() does not flush the same text a second time)
-        if (this._accumulatedFinal) {
-          this._insertText(this._accumulatedFinal);
-          this._accumulatedFinal = '';
-        }
-        this.stop();
+      if (!this.isRecording) return;
+      // Finalize any accumulated text before stopping (cleared so stop() cannot
+      // flush the same text a second time). Deepgram is the exception: its tail
+      // is still coming, so _flushDeepgram() inserts after the drain instead.
+      if (this._activeProvider !== 'deepgram' && this._accumulatedFinal) {
+        this._insertText(this._accumulatedFinal);
+        this._accumulatedFinal = '';
       }
+      this.stop();
     }, 8000);
   },
 
@@ -1272,6 +1397,8 @@ const VoiceInput = {
   /** Cleanup on SSE reconnect or page unload */
   cleanup() {
     if (this.isRecording) this.stop();
+    // Hard teardown — no time to wait for a drain, so flush what is already in.
+    this._flushDeepgram();
     this._hideVoiceSendBtn();
     DeepgramProvider._cleanup();
     ClaudeVoiceProvider._cleanup();
