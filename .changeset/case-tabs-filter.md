@@ -10,6 +10,6 @@ It is a filter, not a second tab implementation. Rows are hidden with the same `
 
 A session's case is the longest `case.path` that prefixes its `workingDir`, resolved through `_mobileOverviewCaseFor()` (mobile-overview.js) rather than a third copy of that match. The row is ordered by `GET /api/cases`, which is already sorted by the persisted `caseOrder`.
 
-Two rules keep a filter from stranding you: it disappears below two cases (nothing to choose), and a remembered case with no sessions left falls back to All rather than hiding everything. Selecting a session from outside the filter — Alt+N, `Ctrl+Shift+[`/`]`, the command palette — moves the row onto that session's case instead of hiding it. Phones keep the overview home screen, which already groups the same sessions by case and has room to show them; the 44px fixed header gets no second row.
+Two rules keep a filter from stranding you: it disappears below two cases (nothing to choose), and a remembered case with no sessions left falls back to All rather than hiding everything. Selecting a session from outside the filter — Alt+N, `Ctrl+Shift+[`/`]`, the command palette — moves the row onto that session's case instead of hiding it. Handhelds keep the overview home screen, which already groups the same sessions by case and has room to show them; their header is fixed and capped (44px on a phone, 48px on a tablet), so a second row would be clipped rather than fit.
 
 Tests: `test/case-tabs.test.ts`.

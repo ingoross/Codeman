@@ -17,10 +17,12 @@
  *    `activeCaseFilter()` is the JS half of the same rule: it returns null
  *    whenever the row is off screen or the remembered case has no sessions.
  *
- * 3. PHONES DO NOT GET THE ROW. The phone overview already groups the same
- *    sessions by case, and the 44px fixed header has no second line to give.
- *    Gated in JS (`_caseTabsAvailable()`) and in CSS (mobile.css under 600px),
- *    because either alone leaves a window between a resize and the next render.
+ * 3. HANDHELDS DO NOT GET THE ROW. Their header is fixed and capped (44px on a
+ *    phone, 48px on a tablet), so a second row is clipped rather than squeezed,
+ *    and the phone overview already groups the same sessions by case. Gated in
+ *    CSS (mobile.css under 768px) and in JS at the SAME raw width, because
+ *    either alone leaves a window between a resize and the next render, and a
+ *    boundary that drifts by a pixel leaves a filter no control can clear.
  *
  * Builds a JSDOM window in-test under the default node env, same shape as
  * test/session-list-layout.test.ts. Do NOT declare a per-file jsdom
@@ -108,12 +110,20 @@ const SESSIONS: SessionRow[] = [
   { id: 's4', name: 'scratch', workingDir: '/srv/scratch' },
 ];
 
-function boot(options: { deviceType?: string; sessions?: SessionRow[]; cases?: CaseInfo[] } = {}) {
+function boot(options: { viewportWidth?: number; sessions?: SessionRow[]; cases?: CaseInfo[] } = {}) {
   const dom = new JSDOM(`<!doctype html><html><body>${SHELL}</body></html>`, {
     url: 'http://localhost/',
     runScripts: 'outside-only',
   });
   const win = dom.window as unknown as Window & typeof globalThis & { __CodemanApp: new () => CaseApp };
+
+  // _caseTabsAvailable() mirrors `@media (max-width: 768px)` in mobile.css off
+  // the raw width, so the harness has to say which side of it we are on.
+  Object.defineProperty(win, 'innerWidth', {
+    value: options.viewportWidth ?? 1440,
+    configurable: true,
+    writable: true,
+  });
 
   // app.js assigns window.MobileDetection at top level from the global that
   // mobile-handlers.js declares, so it has to exist before the source runs.
@@ -123,12 +133,8 @@ function boot(options: { deviceType?: string; sessions?: SessionRow[]; cases?: C
   // the shipped delegation untested.
   (win as unknown as { eval: (s: string) => void }).eval(
     [
-      `var MobileDetection = {
-         getDeviceType: () => ${JSON.stringify(options.deviceType ?? 'desktop')},
-         isHandheldDevice: () => false,
-         isMobile: () => false,
-         isTouchDevice: () => false,
-       };`,
+      `var MobileDetection = { getDeviceType: () => 'desktop', isHandheldDevice: () => false,
+         isMobile: () => false, isTouchDevice: () => false };`,
       CONSTANTS,
       APP_SOURCE,
       MOBILE_OVERVIEW,
@@ -205,16 +211,24 @@ describe('case tab row', () => {
     ]);
   });
 
-  it('drops the row when there is only one case to choose — and on a phone', () => {
+  it('drops the row when there is only one case to choose', () => {
     const single = boot({ sessions: SESSIONS.filter((s) => s.workingDir?.startsWith('/srv/cases/alpha')) });
     single.app._renderCaseTabsImmediate();
     expect(caseRow(single.win).innerHTML).toBe('');
     expect(caseRow(single.win).hasAttribute('hidden')).toBe(true);
+  });
 
-    const phone = boot({ deviceType: 'mobile' });
-    phone.app._renderCaseTabsImmediate();
-    expect(phone.app._caseTabsAvailable()).toBe(false);
-    expect(caseRow(phone.win).innerHTML).toBe('');
+  it('drops the row on every handheld width, phone and tablet alike', () => {
+    // The tablet header is FIXED and max-height: 48px, so a second row is
+    // clipped rather than squeezed. 768 is the boundary mobile.css uses and the
+    // one _caseTabsAvailable() has to agree with exactly.
+    for (const viewportWidth of [393, 768]) {
+      const handheld = boot({ viewportWidth });
+      handheld.app._renderCaseTabsImmediate();
+      expect(handheld.app._caseTabsAvailable()).toBe(false);
+      expect(caseRow(handheld.win).innerHTML).toBe('');
+    }
+    expect(boot({ viewportWidth: 769 }).app._caseTabsAvailable()).toBe(true);
   });
 
   it('narrows the session strip to the selected case and opens the gate the CSS needs', () => {
@@ -270,8 +284,8 @@ describe('case tab row', () => {
     expect(app.activeCaseTab).toBe('*');
   });
 
-  it('never filters a phone, whatever case the last desktop window left behind', () => {
-    const { win, app } = boot({ deviceType: 'mobile' });
+  it('never filters a handheld, whatever case the last desktop window left behind', () => {
+    const { win, app } = boot({ viewportWidth: 393 });
     app.activeCaseTab = 'alpha';
     app.applySidebarFilter('');
     expect(app.activeCaseFilter()).toBeNull();
@@ -373,8 +387,14 @@ describe('case tab markup and styling contract', () => {
     expect(APP_SOURCE).not.toMatch(/localStorage\.\w+Item\('codeman-case/);
   });
 
-  it('drops the row on phones in CSS as well as in JS', () => {
-    const phoneBlock = MOBILE_CSS.slice(MOBILE_CSS.indexOf('@media (max-width: 599px)'));
-    expect(phoneBlock).toContain('.case-tabs {\n    display: none;\n  }');
+  it('drops the row on handhelds in CSS as well as in JS, at the same width', () => {
+    const handheldBlock = MOBILE_CSS.slice(
+      MOBILE_CSS.indexOf('@media (max-width: 768px)'),
+      MOBILE_CSS.indexOf('@media (max-width: 768px) and (min-width: 600px)')
+    );
+    expect(handheldBlock).toContain('.case-tabs {\n    display: none;\n  }');
+    // The JS gate must name the same boundary, or a filter survives on a width
+    // whose row is hidden and nothing on screen can clear it.
+    expect(APP_SOURCE).toContain('return window.innerWidth > 768;');
   });
 });

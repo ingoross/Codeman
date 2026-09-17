@@ -4752,16 +4752,25 @@ class CodemanApp {
   }
 
   /**
-   * Can the case row be on screen at all? Phones answer the "which project?"
-   * question with the overview home screen (mobile-overview.js) and a fixed
-   * header that cannot afford a second row; a solo `/session/:id` window shows
-   * no session list to filter. In both the row is absent, so no remembered
-   * selection may hide anything — activeCaseFilter() gates on this too.
+   * Can the case row be on screen at all? A solo `/session/:id` window shows no
+   * session list to filter. Handhelds have no room for a second row: mobile.css
+   * pins the header at a fixed 44px on phones and a fixed 48px on tablets
+   * (`max-height`, so a second row would be clipped rather than fit), and the
+   * phone overview home screen already groups the same sessions by case. In
+   * both cases the row is absent, so no remembered selection may hide
+   * anything — activeCaseFilter() gates on this too.
+   *
+   * The width test MIRRORS `@media (max-width: 768px)` in mobile.css, and is
+   * written as the raw width rather than `getDeviceType()` so the two
+   * boundaries cannot drift by a pixel: at exactly 768 getDeviceType() already
+   * says 'desktop' while that media query still matches, and a filter with no
+   * visible row is a session list nothing on screen can un-hide. Same idiom as
+   * _isSessionSidebarOverlay().
    */
   _caseTabsAvailable() {
     if (typeof this._mobileOverviewCaseFor !== 'function') return false;
     if (document.body?.classList.contains('solo-mode')) return false;
-    return MobileDetection.getDeviceType() !== 'mobile';
+    return window.innerWidth > 768;
   }
 
   /**
