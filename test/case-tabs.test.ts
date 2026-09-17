@@ -34,7 +34,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 const CONSTANTS = readFileSync(new URL('../src/web/public/constants.js', import.meta.url), 'utf-8');
-const APP = readFileSync(new URL('../src/web/public/app.js', import.meta.url), 'utf-8');
+const APP_SOURCE = readFileSync(new URL('../src/web/public/app.js', import.meta.url), 'utf-8');
 const MOBILE_OVERVIEW = readFileSync(new URL('../src/web/public/mobile-overview.js', import.meta.url), 'utf-8');
 const INDEX_HTML = readFileSync(new URL('../src/web/public/index.html', import.meta.url), 'utf-8');
 const STYLES_CSS = readFileSync(new URL('../src/web/public/styles.css', import.meta.url), 'utf-8');
@@ -72,6 +72,8 @@ interface CaseApp {
   selectSession(id: string): void;
   isSessionSidebarActive(): boolean;
   updateSidebarCount(): void;
+  reorderCaseTab(dragged: string, target: string, insertBefore: boolean): void;
+  saveCaseOrder(order: string[]): void;
 }
 
 /** The parts of index.html this feature touches, minus everything it does not. */
@@ -128,7 +130,7 @@ function boot(options: { deviceType?: string; sessions?: SessionRow[]; cases?: C
          isTouchDevice: () => false,
        };`,
       CONSTANTS,
-      APP,
+      APP_SOURCE,
       MOBILE_OVERVIEW,
       'window.__CodemanApp = CodemanApp;',
     ].join('\n')
@@ -146,6 +148,7 @@ function boot(options: { deviceType?: string; sessions?: SessionRow[]; cases?: C
   app._sidebarFilter = '';
   app._elemCache = {};
   app.selectSession = vi.fn();
+  app.saveCaseOrder = vi.fn();
   app.isSessionSidebarActive = () => false;
 
   // The strip as the session renderer leaves it: one row per session in
@@ -298,6 +301,48 @@ describe('case tab row', () => {
   });
 });
 
+describe('case tab drag reordering', () => {
+  it('offers the drag affordance to real cases only', () => {
+    const { win, app } = boot();
+    app._renderCaseTabsImmediate();
+    const draggable = [...caseRow(win).querySelectorAll('.case-tab')].map((el) => el.getAttribute('draggable'));
+    // All (anchor) and Other (not a case) have no position to persist.
+    expect(draggable).toEqual([null, 'true', 'true', null]);
+  });
+
+  it('moves a case and persists the whole list through the case-order endpoint', () => {
+    const { win, app } = boot();
+    app._renderCaseTabsImmediate();
+    app.reorderCaseTab('beta', 'alpha', true);
+    expect(chips(win)).toEqual(['*', 'beta', 'alpha', '']);
+    // saveCaseOrder (session-ui.js) PUTs /api/cases/order, which is the one
+    // owner of case order — the Run dropdown and the Case Manager read it back.
+    expect(app.saveCaseOrder).toHaveBeenCalledWith(['beta', 'alpha', 'gamma']);
+  });
+
+  it('inserts after the target when the drop lands on its right half', () => {
+    const { win, app } = boot();
+    app._renderCaseTabsImmediate();
+    app.reorderCaseTab('alpha', 'beta', false);
+    expect(chips(win)).toEqual(['*', 'beta', 'alpha', '']);
+  });
+
+  it('leaves a case with no sessions exactly where it was', () => {
+    // `gamma` has no chip to drag, so a drag between the two visible cases must
+    // not shuffle it — the Run dropdown reads this same order, and moving a
+    // case the user cannot see would look like corruption.
+    const { app } = boot();
+    app._renderCaseTabsImmediate();
+    app.cases = [
+      { name: 'alpha', path: '/srv/cases/alpha' },
+      { name: 'gamma', path: '/srv/cases/gamma' },
+      { name: 'beta', path: '/srv/cases/beta' },
+    ];
+    app.reorderCaseTab('beta', 'alpha', true);
+    expect(app.cases.map((c) => c.name)).toEqual(['beta', 'gamma', 'alpha']);
+  });
+});
+
 describe('case tab markup and styling contract', () => {
   it('keeps the row OUTSIDE the host that gets re-parented', () => {
     // applySessionListLayout() moves #sessionTabs into the sidebar or the tab
@@ -318,6 +363,14 @@ describe('case tab markup and styling contract', () => {
     // an unscoped rule that hides tabs no control can bring back.
     expect(STYLES_CSS).toContain('html[data-session-list="sidebar"] .session-tab.tab-filtered-out');
     expect(STYLES_CSS).not.toMatch(/^\.session-tab\.tab-filtered-out/m);
+  });
+
+  it('persists the row order server-side, never in localStorage', () => {
+    // `PUT /api/cases/order` is the upstream owner of case order. A private
+    // localStorage copy here would drift from the Run dropdown and the Case
+    // Manager, which both read the server's list back.
+    expect(APP_SOURCE).toContain('this.saveCaseOrder?.(');
+    expect(APP_SOURCE).not.toMatch(/localStorage\.\w+Item\('codeman-case/);
   });
 
   it('drops the row on phones in CSS as well as in JS', () => {

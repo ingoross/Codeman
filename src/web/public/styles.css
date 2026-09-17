@@ -642,6 +642,27 @@ body {
   color: var(--text-dim);
 }
 
+/* Drag-reordering, same affordances and the same insertion edges as the session
+   strip. Only real case chips carry [draggable]; All is an anchor and Other is
+   not a case, so neither has a position to persist. The row is always
+   horizontal, so there is no vertical twin of these rules. */
+.case-tab[draggable='true'] {
+  cursor: grab;
+}
+
+.case-tab.dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.case-tab.drag-over-left {
+  box-shadow: -2px 0 0 0 var(--accent);
+}
+
+.case-tab.drag-over-right {
+  box-shadow: 2px 0 0 0 var(--accent);
+}
+
 /* One of this case's sessions is asking for a human — same signal the session
    tab carries, aggregated one level up so a collapsed case still shows it. */
 .case-tab-alert {

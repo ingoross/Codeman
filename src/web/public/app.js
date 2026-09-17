@@ -557,6 +557,7 @@ class CodemanApp {
     this._shortIdCache = new Map(); // Cache session ID .slice(0, 8) results
     this.sessionOrder = []; // Track tab order for drag-and-drop reordering
     this.draggedTabId = null; // Currently dragged tab session ID
+    this.draggedCaseName = null; // Currently dragged case (project) tab name
     this.cases = [];
     // Active case (project) tab. CASE_TAB_ALL = no filter, '' = the "Other"
     // bucket for sessions outside every case, otherwise a CaseInfo.name.
@@ -4837,6 +4838,98 @@ class CodemanApp {
     }
     container.innerHTML = parts.join('');
     this.setupCaseTabKeyboardNavigation(container);
+    this.setupCaseTabDragHandlers(container);
+  }
+
+  /**
+   * Drag-reordering for the case row, same affordance and same drag-over-left/
+   * -right indicators as the session strip. Only real case chips are draggable:
+   * All is an anchor and Other is not a case, so neither has a position to
+   * persist.
+   *
+   * The order is persisted SERVER-side through the existing `PUT /api/cases/order`
+   * (saveCaseOrder in session-ui.js), not in localStorage. That endpoint is
+   * already the one owner of case order — it writes `caseOrder` into
+   * settings.json, `GET /api/cases` sorts by it, and it broadcasts
+   * `case:order-changed` — so a drag here moves the Run dropdown and the Case
+   * Manager list with it, follows the user to their other devices, and cannot
+   * disagree with them. `PUT /api/tab-layout` is deliberately NOT used: that
+   * model orders session/webview REFS inside user-made groups, and a case is
+   * neither — it is derived from workingDir and has no ref of its own.
+   *
+   * Reordering by keyboard already exists upstream and stays the accessible
+   * route: Case Manager → move up/down, which writes the very same order.
+   */
+  setupCaseTabDragHandlers(container) {
+    for (const tab of container.querySelectorAll('.case-tab')) {
+      const name = tab.dataset.case;
+      if (!name || name === CASE_TAB_ALL) continue;
+      tab.setAttribute('draggable', 'true');
+
+      tab.addEventListener('dragstart', (e) => {
+        this.draggedCaseName = name;
+        tab.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', name);
+      });
+
+      tab.addEventListener('dragend', () => {
+        tab.classList.remove('dragging');
+        this.draggedCaseName = null;
+        for (const other of container.querySelectorAll('.case-tab')) {
+          other.classList.remove('drag-over-left', 'drag-over-right');
+        }
+      });
+
+      tab.addEventListener('dragover', (e) => {
+        if (!this.draggedCaseName || this.draggedCaseName === name) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        const rect = tab.getBoundingClientRect();
+        const insertBefore = e.clientX < rect.left + rect.width / 2;
+        tab.classList.toggle('drag-over-left', insertBefore);
+        tab.classList.toggle('drag-over-right', !insertBefore);
+      });
+
+      tab.addEventListener('dragleave', () => {
+        tab.classList.remove('drag-over-left', 'drag-over-right');
+      });
+
+      tab.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tab.classList.remove('drag-over-left', 'drag-over-right');
+        if (!this.draggedCaseName || this.draggedCaseName === name) return;
+        const rect = tab.getBoundingClientRect();
+        this.reorderCaseTab(this.draggedCaseName, name, e.clientX < rect.left + rect.width / 2);
+      });
+    }
+  }
+
+  /**
+   * Move `draggedName` before or after `targetName` and persist the result.
+   *
+   * Only the slots held by cases that are ON the row are permuted: a case with
+   * no live sessions has no chip to drag, and letting a drag here push it to the
+   * end would silently reshuffle the Run dropdown around tabs the user cannot
+   * even see. Everything else keeps its index.
+   */
+  reorderCaseTab(draggedName, targetName, insertBefore) {
+    const cases = this.cases || [];
+    const onRow = new Set([...this.caseTabGroups().keys()].filter((n) => n !== ''));
+    const names = cases.map((c) => c.name).filter((n) => onRow.has(n));
+    const from = names.indexOf(draggedName);
+    if (from === -1) return;
+    names.splice(from, 1);
+    const to = names.indexOf(targetName);
+    if (to === -1) return;
+    names.splice(insertBefore ? to : to + 1, 0, draggedName);
+
+    const byName = new Map(cases.map((c) => [c.name, c]));
+    let next = 0;
+    const reordered = cases.map((c) => (onRow.has(c.name) ? byName.get(names[next++]) : c));
+    this.cases = reordered;
+    this._renderCaseTabsImmediate();
+    this.saveCaseOrder?.(reordered.map((c) => c.name));
   }
 
   /** One case chip. `value` is the filter key; CASE_TAB_ALL and '' are sentinels. */
