@@ -43,6 +43,19 @@ html.mobile-init .file-browser-panel {
   .session-tab .tab-detach {
     display: none !important;
   }
+
+  /* No case (project) row on a handheld. The header is FIXED and capped by
+     max-height below (44px phone, 48px tablet), so a second row would be
+     clipped rather than fit, and the question the row answers — which project
+     am I in — is what the phone overview home screen (mobile-overview.js) is
+     FOR: it groups the same sessions by case with room to read them.
+     `_caseTabsAvailable()` mirrors THIS media query in JS, so a remembered case
+     can never filter a handheld's session strip; this rule is the second lock,
+     and the one that also covers a desktop window dragged narrow before the
+     next render. */
+  .case-tabs {
+    display: none;
+  }
 }
 
 /* ============================================================================

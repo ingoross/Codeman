@@ -5260,7 +5260,7 @@ Object.assign(CodemanApp.prototype, {
           this.sessions.clear();
           this.muxSessions = [];
           this.activeSessionId = null;
-          try { localStorage.removeItem('codeman-active-session'); } catch {}
+          clearWindowState('codeman-active-session');
           this.renderSessionTabs();
           this.renderMuxSessions();
           this.terminal.clear();
@@ -5271,7 +5271,7 @@ Object.assign(CodemanApp.prototype, {
         // Just remove tabs, keep mux sessions running
         this.sessions.clear();
         this.activeSessionId = null;
-        try { localStorage.removeItem('codeman-active-session'); } catch {}
+        clearWindowState('codeman-active-session');
         this.renderSessionTabs();
         this.terminal.clear();
         this.terminal.reset();

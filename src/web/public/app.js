@@ -483,6 +483,49 @@ const DEFAULT_SHORTCUTS = [
 
 
 // ═══════════════════════════════════════════════════════════════
+// Per-window UI state
+//
+// Which session you are looking at, and which case row is selected, are facts
+// about a WINDOW, not about the browser profile. localStorage is shared by
+// every tab and window of the same origin, so two windows side by side — the
+// point of opening a second one — kept overwriting each other's choice: the
+// second window's selectSession() wrote the key, the first one read it back on
+// its next reconnect and jumped to the other window's session.
+//
+// sessionStorage is per window (and survives reload and restore-after-crash,
+// unlike an in-memory value), so it owns the live state. localStorage stays
+// written as the SEED a brand-new window starts from, which is exactly the
+// behaviour that shipped before: a fresh window has no sessionStorage yet, so
+// it still restores the last session picked anywhere. Nothing about the restore
+// order changes for a single window.
+//
+// Each accessor guards its two stores separately: sessionStorage can be
+// unavailable (Safari private mode, disabled site data, a vm-loaded test)
+// while localStorage works, and the reverse, and neither may take the other
+// down with it.
+// ═══════════════════════════════════════════════════════════════
+
+/** This window's value for `key`, falling back to the cross-window seed. */
+function readWindowState(key) {
+  let value = null;
+  try { value = sessionStorage.getItem(key); } catch { /* no sessionStorage */ }
+  if (value !== null && value !== undefined) return value;
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+/** Set this window's value AND the seed new windows will start from. */
+function writeWindowState(key, value) {
+  try { sessionStorage.setItem(key, value); } catch { /* no sessionStorage */ }
+  try { localStorage.setItem(key, value); } catch { /* no localStorage */ }
+}
+
+/** Forget `key` in both stores — a seed nothing can restore is worse than none. */
+function clearWindowState(key) {
+  try { sessionStorage.removeItem(key); } catch { /* no sessionStorage */ }
+  try { localStorage.removeItem(key); } catch { /* no localStorage */ }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // CodemanApp Class — constructor and global state
 // ═══════════════════════════════════════════════════════════════
 
@@ -494,13 +537,35 @@ const DEFAULT_SHORTCUTS = [
  */
 const SIDEBAR_RICH_CLOCK_MS = 20000;
 
+/**
+ * Sentinel for the "All" case tab. `*` can never collide with a real case name:
+ * SAFE_CASE_NAME (case-routes.ts) is `^[a-zA-Z0-9_-]+$`, and the other bucket
+ * key — sessions outside every case — is the empty string, which is equally
+ * unreachable for a CaseInfo.name.
+ */
+const CASE_TAB_ALL = '*';
+
+/**
+ * A case row is only worth a header row once it actually splits the session
+ * list. Below this the strip already shows everything the row could filter to.
+ */
+const CASE_TABS_MIN_GROUPS = 2;
+
 class CodemanApp {
   constructor() {
     this.sessions = new Map();
     this._shortIdCache = new Map(); // Cache session ID .slice(0, 8) results
     this.sessionOrder = []; // Track tab order for drag-and-drop reordering
     this.draggedTabId = null; // Currently dragged tab session ID
+    this.draggedCaseName = null; // Currently dragged case (project) tab name
     this.cases = [];
+    // Active case (project) tab. CASE_TAB_ALL = no filter, '' = the "Other"
+    // bucket for sessions outside every case, otherwise a CaseInfo.name.
+    this.activeCaseTab = CASE_TAB_ALL;
+    try {
+      const savedCaseTab = readWindowState('codeman-active-case');
+      if (typeof savedCaseTab === 'string') this.activeCaseTab = savedCaseTab;
+    } catch { /* storage unavailable — start unfiltered */ }
     this.currentRun = null;
     this.totalTokens = 0;
     this.globalStats = null; // Global token/cost stats across all sessions
@@ -1888,7 +1953,7 @@ class CodemanApp {
     // when the thing you were looking at was taken away.
     if (this.activeSessionId === data.id && !this._closingSessions.has(data.id)) {
       this.activeSessionId = null;
-      try { localStorage.removeItem('codeman-active-session'); } catch {}
+      clearWindowState('codeman-active-session');
       this.terminal.clear();
       this.showWelcome();
     }
@@ -3959,10 +4024,12 @@ class CodemanApp {
     if (this.sessionOrder.length === 0) {
       this.activeSessionId = null;
     } else {
-      // Priority: current active > localStorage > first session
+      // Priority: current active > this window's last session > the
+      // cross-window seed (readWindowState falls back to it, which is what a
+      // brand-new window restores from) > first session.
       let restoreId = previousActiveId;
       if (!restoreId || !this.sessions.has(restoreId)) {
-        try { restoreId = localStorage.getItem('codeman-active-session'); } catch {}
+        restoreId = readWindowState('codeman-active-session');
       }
       if (keepTerminal && restoreId === previousActiveId && this.sessions.has(restoreId)) {
         // Reconnect onto the session already on screen. renderSessionTabs() ran
@@ -4358,6 +4425,12 @@ class CodemanApp {
     // drops it in sidebar mode, but drop it here too so nothing paints wrapped
     // for a frame before the next measure.
     if (sidebar) tabsEl.classList.remove('tabs-auto-wrap');
+    // This method is also the debounced resize hook (mobile-handlers.js), and
+    // whether the case row exists at all is width-driven — it is gone under
+    // 600px, where the phone overview answers the same question. Rendered
+    // straight through, not debounced: this call is already the tail of a
+    // debounce, and the filter pass two lines down has to see a current row.
+    this._renderCaseTabsImmediate();
     // Collapse/expand changes whether the filter is reachable, so re-evaluate it
     // here too — not only at the render tails.
     this.applySidebarFilter(this._sidebarFilter);
@@ -4427,19 +4500,29 @@ class CodemanApp {
   }
 
   /**
-   * Sidebar filter box. Pure DOM class toggling — no re-render, no state on the
-   * sessions themselves. Matches the rendered aria-label (session name) and the
-   * title (working directory).
+   * The ONE post-render filter pass over the session list. Two filters share it
+   * and share the `tab-filtered-out` class, because a row hidden by either is
+   * hidden for the same reasons everywhere else: the sidebar count skips it and
+   * the arrow-key walk steps over it, and a second class would have to be added
+   * to both of those selectors to stay honest.
    *
+   *  1. the sidebar filter box — matches the rendered aria-label (session name)
+   *     and the title (working directory);
+   *  2. the case (project) tab row — `activeCaseTab`, resolved per session via
+   *     resolveSessionCaseName().
+   *
+   * Pure DOM class toggling — no re-render, no state on the sessions themselves.
    * Re-applied at the tail of both render paths: _fullRenderSessionTabs() rebuilds
    * innerHTML wholesale, so without that the filtered-out rows flicker back in on
    * every SSE tick.
    *
-   * The filter only takes effect while the box that produced it is on screen —
-   * i.e. the expanded sidebar. In the header strip, the collapsed rail or a
-   * closed drawer the classes come off, otherwise sessions would stay hidden
-   * with no visible cause and no reachable control to clear them. The remembered
-   * needle is restored when the box comes back.
+   * The sidebar needle only takes effect while the box that produced it is on
+   * screen — i.e. the expanded sidebar. In the header strip, the collapsed rail
+   * or a closed drawer the classes come off, otherwise sessions would stay
+   * hidden with no visible cause and no reachable control to clear them. The
+   * remembered needle is restored when the box comes back. The case filter has
+   * the same rule expressed in its own terms: activeCaseFilter() returns null
+   * whenever the case row is not on screen.
    */
   applySidebarFilter(query) {
     this._sidebarFilter = (query ?? '').trim().toLowerCase();
@@ -4448,13 +4531,29 @@ class CodemanApp {
     const reachable =
       this.isSessionSidebarActive() && document.documentElement.dataset.sidebar !== 'collapsed';
     const needle = reachable ? this._sidebarFilter : '';
+    const caseFilter = this.activeCaseFilter();
+    // The CSS that hides `tab-filtered-out` is scoped per filter, so a leaked
+    // class can never hide a row the user has no control to bring back: the
+    // sidebar rule needs the sidebar layout, this one needs a case tab to be
+    // selected. Written here because this pass is the one that knows.
+    document.documentElement.dataset.caseFilter = caseFilter === null ? 'off' : 'on';
     for (const tab of container.querySelectorAll('.session-tab')) {
-      if (!needle) {
+      if (!needle && caseFilter === null) {
         tab.classList.remove('tab-filtered-out');
         continue;
       }
-      const haystack = `${tab.getAttribute('aria-label') || ''} ${tab.getAttribute('title') || ''}`.toLowerCase();
-      tab.classList.toggle('tab-filtered-out', !haystack.includes(needle));
+      let hidden = false;
+      if (needle) {
+        const haystack = `${tab.getAttribute('aria-label') || ''} ${tab.getAttribute('title') || ''}`.toLowerCase();
+        hidden = !haystack.includes(needle);
+      }
+      // Web-tab rows render in this very strip but are not sessions and belong
+      // to no case, so the case filter leaves them alone (they carry
+      // data-webview-id, never data-id).
+      if (!hidden && caseFilter !== null && tab.dataset.id) {
+        hidden = this.resolveSessionCaseName(this.sessions.get(tab.dataset.id)) !== caseFilter;
+      }
+      tab.classList.toggle('tab-filtered-out', hidden);
     }
     // The count shows visible rows, so it moves with every filter change —
     // including keystrokes in the filter box, which call this directly.
@@ -4623,12 +4722,343 @@ class CodemanApp {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  // Case (project) Tabs — a FILTER over the session list, not a second list
+  //
+  // The row above the session strip carries one tab per case that currently has
+  // sessions, plus "All". Picking one narrows the session list to that case by
+  // toggling `tab-filtered-out` in applySidebarFilter() — the same class, the
+  // same single pass and the same render tails the sidebar filter box uses.
+  //
+  // Nothing about how sessions are RENDERED changes: `sessionOrder` still drives
+  // the strip, the Alt+N badges still count the whole strip, the incremental
+  // render path still diffs the full session set, drag-reordering still rewrites
+  // one global order, and the lineage/connector geometry is untouched. That is
+  // the whole point of layering this as a filter instead of a second renderer.
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * The case a session belongs to, or '' when it is outside every case.
+   *
+   * Deliberately delegates to `_mobileOverviewCaseFor()` (mobile-overview.js),
+   * the existing owner of the longest-prefix workingDir → case match, rather
+   * than adding a third copy of it (terminal-ui.js `_resolveCaseLabel()` is the
+   * second). If that module failed to load, the case row simply never appears
+   * and the session list behaves exactly as it did before this feature.
+   */
+  resolveSessionCaseName(session) {
+    if (!session || typeof this._mobileOverviewCaseFor !== 'function') return '';
+    const matched = this._mobileOverviewCaseFor(session.workingDir, this.cases);
+    return matched ? matched.name : '';
+  }
+
+  /**
+   * Can the case row be on screen at all? A solo `/session/:id` window shows no
+   * session list to filter. Handhelds have no room for a second row: mobile.css
+   * pins the header at a fixed 44px on phones and a fixed 48px on tablets
+   * (`max-height`, so a second row would be clipped rather than fit), and the
+   * phone overview home screen already groups the same sessions by case. In
+   * both cases the row is absent, so no remembered selection may hide
+   * anything — activeCaseFilter() gates on this too.
+   *
+   * The width test MIRRORS `@media (max-width: 768px)` in mobile.css, and is
+   * written as the raw width rather than `getDeviceType()` so the two
+   * boundaries cannot drift by a pixel: at exactly 768 getDeviceType() already
+   * says 'desktop' while that media query still matches, and a filter with no
+   * visible row is a session list nothing on screen can un-hide. Same idiom as
+   * _isSessionSidebarOverlay().
+   */
+  _caseTabsAvailable() {
+    if (typeof this._mobileOverviewCaseFor !== 'function') return false;
+    if (document.body?.classList.contains('solo-mode')) return false;
+    return window.innerWidth > 768;
+  }
+
+  /**
+   * Live sessions grouped by case name, in the order the row should show them:
+   * the server's case order (GET /api/cases is already sorted by the persisted
+   * `caseOrder`) first, then the '' bucket — sessions outside every case — last.
+   * @returns {Map<string, {count: number, alert: boolean}>}
+   */
+  caseTabGroups() {
+    const counts = new Map();
+    for (const session of this.sessions.values()) {
+      const name = this.resolveSessionCaseName(session);
+      const group = counts.get(name) || { count: 0, alert: false };
+      group.count++;
+      if (this.tabAlerts.has(session.id)) group.alert = true;
+      counts.set(name, group);
+    }
+    const ordered = new Map();
+    for (const c of this.cases || []) {
+      if (counts.has(c.name)) ordered.set(c.name, counts.get(c.name));
+    }
+    // A case can hold sessions without being in this.cases (deleted case, a
+    // list that has not loaded yet) — keep those rather than dropping sessions
+    // out of every tab, and keep '' last whatever happens.
+    for (const [name, group] of counts) {
+      if (name !== '' && !ordered.has(name)) ordered.set(name, group);
+    }
+    if (counts.has('')) ordered.set('', counts.get(''));
+    return ordered;
+  }
+
+  /**
+   * The case name the session list is currently narrowed to, or null for "no
+   * case filter". Null whenever the row is off screen or the remembered
+   * selection has no sessions left, so a stale choice can never hide the whole
+   * list with no visible control to clear it.
+   */
+  activeCaseFilter() {
+    if (this.activeCaseTab === CASE_TAB_ALL) return null;
+    if (!this._caseTabsAvailable()) return null;
+    const groups = this.caseTabGroups();
+    if (groups.size < CASE_TABS_MIN_GROUPS) return null;
+    return groups.has(this.activeCaseTab) ? this.activeCaseTab : null;
+  }
+
+  renderCaseTabs() {
+    this._debouncedCall('caseTabs', this._renderCaseTabsImmediate);
+  }
+
+  _renderCaseTabsImmediate() {
+    const container = this.$('caseTabs');
+    if (!container) return;
+    const groups = this._caseTabsAvailable() ? this.caseTabGroups() : new Map();
+    // One group is not a choice: the strip already shows everything the row
+    // could filter to, so the row would only cost a header line.
+    if (groups.size < CASE_TABS_MIN_GROUPS) {
+      container.innerHTML = '';
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
+
+    // A remembered case with no sessions left falls back to All rather than
+    // showing an empty list under a tab that is no longer there.
+    if (this.activeCaseTab !== CASE_TAB_ALL && !groups.has(this.activeCaseTab)) {
+      this.activeCaseTab = CASE_TAB_ALL;
+    }
+
+    let total = 0;
+    for (const group of groups.values()) total += group.count;
+    const parts = [this._caseTabHTML(CASE_TAB_ALL, 'All', total, false)];
+    for (const [name, group] of groups) {
+      parts.push(this._caseTabHTML(name, name === '' ? 'Other' : name, group.count, group.alert));
+    }
+    container.innerHTML = parts.join('');
+    this.setupCaseTabKeyboardNavigation(container);
+    this.setupCaseTabDragHandlers(container);
+  }
+
+  /**
+   * Drag-reordering for the case row, same affordance and same drag-over-left/
+   * -right indicators as the session strip. Only real case chips are draggable:
+   * All is an anchor and Other is not a case, so neither has a position to
+   * persist.
+   *
+   * The order is persisted SERVER-side through the existing `PUT /api/cases/order`
+   * (saveCaseOrder in session-ui.js), not in localStorage. That endpoint is
+   * already the one owner of case order — it writes `caseOrder` into
+   * settings.json, `GET /api/cases` sorts by it, and it broadcasts
+   * `case:order-changed` — so a drag here moves the Run dropdown and the Case
+   * Manager list with it, follows the user to their other devices, and cannot
+   * disagree with them. `PUT /api/tab-layout` is deliberately NOT used: that
+   * model orders session/webview REFS inside user-made groups, and a case is
+   * neither — it is derived from workingDir and has no ref of its own.
+   *
+   * Reordering by keyboard already exists upstream and stays the accessible
+   * route: Case Manager → move up/down, which writes the very same order.
+   */
+  setupCaseTabDragHandlers(container) {
+    for (const tab of container.querySelectorAll('.case-tab')) {
+      const name = tab.dataset.case;
+      if (!name || name === CASE_TAB_ALL) continue;
+      tab.setAttribute('draggable', 'true');
+
+      tab.addEventListener('dragstart', (e) => {
+        this.draggedCaseName = name;
+        tab.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', name);
+      });
+
+      tab.addEventListener('dragend', () => {
+        tab.classList.remove('dragging');
+        this.draggedCaseName = null;
+        for (const other of container.querySelectorAll('.case-tab')) {
+          other.classList.remove('drag-over-left', 'drag-over-right');
+        }
+      });
+
+      tab.addEventListener('dragover', (e) => {
+        if (!this.draggedCaseName || this.draggedCaseName === name) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        const rect = tab.getBoundingClientRect();
+        const insertBefore = e.clientX < rect.left + rect.width / 2;
+        tab.classList.toggle('drag-over-left', insertBefore);
+        tab.classList.toggle('drag-over-right', !insertBefore);
+      });
+
+      tab.addEventListener('dragleave', () => {
+        tab.classList.remove('drag-over-left', 'drag-over-right');
+      });
+
+      tab.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tab.classList.remove('drag-over-left', 'drag-over-right');
+        if (!this.draggedCaseName || this.draggedCaseName === name) return;
+        const rect = tab.getBoundingClientRect();
+        this.reorderCaseTab(this.draggedCaseName, name, e.clientX < rect.left + rect.width / 2);
+      });
+    }
+  }
+
+  /**
+   * Move `draggedName` before or after `targetName` and persist the result.
+   *
+   * Only the slots held by cases that are ON the row are permuted: a case with
+   * no live sessions has no chip to drag, and letting a drag here push it to the
+   * end would silently reshuffle the Run dropdown around tabs the user cannot
+   * even see. Everything else keeps its index.
+   */
+  reorderCaseTab(draggedName, targetName, insertBefore) {
+    const cases = this.cases || [];
+    const onRow = new Set([...this.caseTabGroups().keys()].filter((n) => n !== ''));
+    const names = cases.map((c) => c.name).filter((n) => onRow.has(n));
+    const from = names.indexOf(draggedName);
+    if (from === -1) return;
+    names.splice(from, 1);
+    const to = names.indexOf(targetName);
+    if (to === -1) return;
+    names.splice(insertBefore ? to : to + 1, 0, draggedName);
+
+    const byName = new Map(cases.map((c) => [c.name, c]));
+    let next = 0;
+    const reordered = cases.map((c) => (onRow.has(c.name) ? byName.get(names[next++]) : c));
+    this.cases = reordered;
+    this._renderCaseTabsImmediate();
+    this.saveCaseOrder?.(reordered.map((c) => c.name));
+  }
+
+  /** One case chip. `value` is the filter key; CASE_TAB_ALL and '' are sentinels. */
+  _caseTabHTML(value, label, count, alert) {
+    const isActive = value === this.activeCaseTab;
+    const title = value === CASE_TAB_ALL ? 'All sessions' : value === '' ? 'Sessions outside every case' : value;
+    return `<div class="case-tab${isActive ? ' active' : ''}" data-case="${escapeHtml(value)}"
+        onclick="app.selectCaseTab('${escapeHtml(value)}')" tabindex="0" role="tab"
+        aria-selected="${isActive ? 'true' : 'false'}" aria-label="${escapeHtml(label)} case"
+        title="${escapeHtml(title)}"
+      ><span class="case-tab-name">${escapeHtml(label)}</span
+      ><span class="case-tab-count">${count}</span>${alert ? '<span class="case-tab-alert" aria-hidden="true"></span>' : ''}</div>`;
+  }
+
+  /**
+   * Activate a case tab. Re-runs the filter pass rather than re-rendering the
+   * strip: the rows themselves did not change, only which of them are shown.
+   */
+  selectCaseTab(value) {
+    if (typeof value !== 'string') return;
+    this.activeCaseTab = value;
+    this._persistActiveCaseTab(value);
+    this._renderCaseTabsImmediate();
+    this.applySidebarFilter(this._sidebarFilter);
+    // The terminal must not stay parked on a session the list no longer shows.
+    // Nothing to do when the filter is off, or when the active session survived.
+    const caseFilter = this.activeCaseFilter();
+    if (caseFilter === null) return;
+    const active = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+    if (active && this.resolveSessionCaseName(active) === caseFilter) return;
+    const next = this.sessionOrder.find((id) => {
+      const session = this.sessions.get(id);
+      return session && this.resolveSessionCaseName(session) === caseFilter;
+    });
+    if (next) this.selectSession(next);
+  }
+
+  /**
+   * Move the case row onto the case a newly selected session belongs to. No-op
+   * under "All" and for a session that is already in the filtered case, so the
+   * ordinary click-a-visible-tab path costs one Map lookup.
+   */
+  _followSessionCase(sessionId) {
+    const caseFilter = this.activeCaseFilter();
+    if (caseFilter === null) return;
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const name = this.resolveSessionCaseName(session);
+    if (name === caseFilter) return;
+    this.activeCaseTab = name;
+    this._persistActiveCaseTab(name);
+    this._renderCaseTabsImmediate();
+    this.applySidebarFilter(this._sidebarFilter);
+  }
+
+  /**
+   * The selected case is per window (writeWindowState), like the active
+   * session: two windows open side by side are almost always two DIFFERENT
+   * projects, and a shared key made the second one pull the first one's row out
+   * from under it on the next reconnect.
+   */
+  _persistActiveCaseTab(value) {
+    writeWindowState('codeman-active-case', value);
+  }
+
+  /**
+   * Arrow-key navigation for the case row, deliberately the same contract as
+   * setupTabKeyboardNavigation(): Left/Right with Up/Down as aliases, Home/End,
+   * Enter/Space to activate, wrapping at both ends.
+   */
+  setupCaseTabKeyboardNavigation(container) {
+    if (this._caseTabKeydownHandler) {
+      container.removeEventListener('keydown', this._caseTabKeydownHandler);
+    }
+    this._caseTabKeydownHandler = (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', ' '].includes(e.key)) return;
+      const tabs = [...container.querySelectorAll('.case-tab')];
+      const currentIndex = tabs.indexOf(document.activeElement);
+      if ((e.key === 'Enter' || e.key === ' ') && currentIndex >= 0) {
+        e.preventDefault();
+        this.selectCaseTab(tabs[currentIndex].dataset.case ?? CASE_TAB_ALL);
+        return;
+      }
+      if (currentIndex < 0) return;
+      let newIndex;
+      switch (e.key) {
+        case 'ArrowLeft':
+        case 'ArrowUp':
+          newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.length - 1;
+          break;
+        case 'ArrowRight':
+        case 'ArrowDown':
+          newIndex = currentIndex < tabs.length - 1 ? currentIndex + 1 : 0;
+          break;
+        case 'Home':
+          newIndex = 0;
+          break;
+        case 'End':
+          newIndex = tabs.length - 1;
+          break;
+        default:
+          return;
+      }
+      e.preventDefault();
+      tabs[newIndex]?.focus();
+    };
+    container.addEventListener('keydown', this._caseTabKeydownHandler);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // Session Tabs
   // ═══════════════════════════════════════════════════════════════
 
   renderSessionTabs() {
     // Don't re-render while user is typing in the inline rename input
     if (this._inlineRenameActive) return;
+    // The case row is derived from the same session set, so it goes stale on
+    // exactly the events this renderer answers to. Scheduled FIRST so its
+    // timer runs first and the strip is filtered against a current row.
+    this.renderCaseTabs();
     this._debouncedCall('sessionTabs', this._renderSessionTabsImmediate);
   }
 
@@ -6080,7 +6510,13 @@ class CodemanApp {
     // replay paths refresh it when their fetch lands; without this the previous
     // session's notice stays on screen until then (#258).
     this._renderHistoryTruncationBanner();
-    try { localStorage.setItem('codeman-active-session', sessionId); } catch {}
+    writeWindowState('codeman-active-session', sessionId);
+    // Follow the session's case, so the routes that reach PAST the filter —
+    // Alt+N and Ctrl+Shift+[/] walk the whole strip order, the palette lists
+    // every session, a hook alert jumps to its own tab — move the case row with
+    // them instead of selecting a tab the row says is not there. Only while a
+    // case filter is actually on: under "All" there is nothing to follow.
+    this._followSessionCase(sessionId);
     // Narrow SSE filter to the active session — server stops streaming
     // session:terminal events for other sessions to this client. Cuts
     // SSE traffic ~Nx for N concurrent sessions. Fire-and-forget; on the
@@ -6640,7 +7076,7 @@ class CodemanApp {
 
       if (wasActive) {
         this.activeSessionId = null;
-        try { localStorage.removeItem('codeman-active-session'); } catch {}
+        clearWindowState('codeman-active-session');
         // Next tab in the user's own order, skipping ids the cleanup has not
         // caught up with yet: sessionOrder can transiently hold a dead id
         // (delete racing the order sync), which is the same reason Alt+N
@@ -6745,7 +7181,7 @@ class CodemanApp {
   goHome() {
     // Deselect active session and show welcome screen
     this.activeSessionId = null;
-    try { localStorage.removeItem('codeman-active-session'); } catch {}
+    clearWindowState('codeman-active-session');
     this.terminal.clear();
     this.showWelcome();
     this.renderSessionTabs();
@@ -6804,7 +7240,7 @@ class CodemanApp {
         }
       } catch {}
       this.activeSessionId = null;
-      try { localStorage.removeItem('codeman-active-session'); } catch {}
+      clearWindowState('codeman-active-session');
       this.respawnStatus = {};
       this.respawnCountdownTimers = {};
       this.respawnActionLogs = {};
