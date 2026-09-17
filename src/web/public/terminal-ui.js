@@ -596,6 +596,7 @@ Object.assign(CodemanApp.prototype, {
         // selection on any keypress, so without this a keystroke would leave a
         // stale flush armed for the next unrelated mouseup.
         this._autoCopyPending = false;
+        this._onTerminalSelectionCleared();
         return;
       }
       // Auto Copy arms here and fires at the END of the gesture (below). This
@@ -3944,6 +3945,20 @@ Object.assign(CodemanApp.prototype, {
       this._gapRecoveryAt = Date.now();
       void this._onSessionNeedsRefresh();
     }, delay);
+  },
+
+  /**
+   * The selection is gone, so a recovery reload that stood aside for it may run.
+   *
+   * `_onSessionNeedsRefresh` defers rather than reschedules while text is
+   * highlighted: a poll would keep a timer alive for as long as the user leaves
+   * a selection standing, and xterm tells us the moment it goes (any keypress,
+   * any click, a session switch).
+   */
+  _onTerminalSelectionCleared() {
+    if (!this._gapRecoveryDeferred) return;
+    this._gapRecoveryDeferred = false;
+    this._scheduleGapRecovery();
   },
 
   // ═══════════════════════════════════════════════════════════════
