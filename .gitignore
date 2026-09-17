@@ -2,6 +2,12 @@
 .agents/
 skills-lock.json
 
+
+# In-session decision scratchpad (context-survival mechanism, not a deliverable)
+DECISIONS.md
+# Written by install.sh into end-user clones when setup finishes
+.install-complete
+
 # Dependencies
 node_modules/
 
@@ -42,6 +48,10 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Local Compose customisation (host-specific, not part of the project)
+docker-compose.override.yml
+docker-compose.override.yaml
+
 # State files (local to each machine)
 .claude/ralph-loop.local.md
 
@@ -52,11 +62,22 @@ Thumbs.db
 # Generated output
 out/
 screenshots-echo-diag/
+screenshots-readme/
+screenshots-readme-real/
+screenshots-real/
 scripts/remotion/out/
+
+# Local UI/README capture scratch (screenshot runs, design mockups). Not build
+# output, but never meant for git — an unqualified `git add -A` during a COM has
+# swept dirs like these into a release before.
+design-explorations/
 
 # Artifacts that should not be tracked
 test-results/
 tmp/
+# Machine-local working files (never meant for git). ANCHORED so only the root
+# dir matches.
+/pr/
 # Root `public` (a symlink to scripts/remotion/public — local artifact). ANCHORED
 # with a leading slash so it does NOT also match src/web/public (a bare `public`
 # would swallow the whole web UI source dir and silently un-stage any new asset
@@ -79,8 +100,6 @@ packages/gesture-control/.vite/
 # Claude Code plan tracking
 plan.json
 
-# Unfinished TUI (local development only)
-src/tui/
 .claude/
 media-assets/
 commands
@@ -90,3 +109,7 @@ readme-preview.mjs
 
 # Uploaded images land here under each session working dir (runtime artifact)
 .claude-images/
+
+# Local-LLM harness smoke-test config (real IPs/keys) — see the .example.json
+# alongside it in scripts/, which IS tracked as the template.
+scripts/local-llm-test.config.json

@@ -37,6 +37,16 @@ export enum ApiErrorCode {
   RATE_LIMITED = 'RATE_LIMITED',
   /** Operation could not be completed (well-formed but unprocessable) */
   OPERATION_FAILED = 'OPERATION_FAILED',
+  /** Authenticated but not permitted (e.g. non-admin hitting an admin route) */
+  FORBIDDEN = 'FORBIDDEN',
+  /** User must change their password before any other action (multi-user) */
+  PASSWORD_CHANGE_REQUIRED = 'PASSWORD_CHANGE_REQUIRED',
+  /** A user with this name already exists (multi-user) */
+  USER_EXISTS = 'USER_EXISTS',
+  /** No user with this name (multi-user) */
+  USER_NOT_FOUND = 'USER_NOT_FOUND',
+  /** Refusing to demote/disable/delete the last enabled admin (multi-user) */
+  LAST_ADMIN = 'LAST_ADMIN',
   /** Internal server error */
   INTERNAL_ERROR = 'INTERNAL_ERROR',
 }
@@ -53,6 +63,11 @@ const ErrorMessages: Record<ApiErrorCode, string> = {
   [ApiErrorCode.ALREADY_EXISTS]: 'Resource already exists',
   [ApiErrorCode.RATE_LIMITED]: 'Too many requests',
   [ApiErrorCode.OPERATION_FAILED]: 'The operation failed',
+  [ApiErrorCode.FORBIDDEN]: 'You do not have permission to perform this action',
+  [ApiErrorCode.PASSWORD_CHANGE_REQUIRED]: 'You must change your password before continuing',
+  [ApiErrorCode.USER_EXISTS]: 'A user with that name already exists',
+  [ApiErrorCode.USER_NOT_FOUND]: 'No such user',
+  [ApiErrorCode.LAST_ADMIN]: 'Cannot remove the last enabled admin',
   [ApiErrorCode.INTERNAL_ERROR]: 'An internal error occurred',
 };
 
@@ -69,6 +84,11 @@ const ErrorStatus: Record<ApiErrorCode, number> = {
   [ApiErrorCode.CONFLICT]: 409,
   [ApiErrorCode.ALREADY_EXISTS]: 409,
   [ApiErrorCode.OPERATION_FAILED]: 422,
+  [ApiErrorCode.FORBIDDEN]: 403,
+  [ApiErrorCode.PASSWORD_CHANGE_REQUIRED]: 403,
+  [ApiErrorCode.USER_EXISTS]: 409,
+  [ApiErrorCode.USER_NOT_FOUND]: 404,
+  [ApiErrorCode.LAST_ADMIN]: 409,
   [ApiErrorCode.RATE_LIMITED]: 429,
   [ApiErrorCode.INTERNAL_ERROR]: 500,
 };
@@ -85,9 +105,19 @@ export type HookEventType =
   | 'idle_prompt'
   | 'permission_prompt'
   | 'elicitation_dialog'
+  | 'elicitation_complete'
+  | 'elicitation_response'
   | 'stop'
   | 'teammate_idle'
-  | 'task_completed';
+  | 'task_completed'
+  // Claude Code's UserPromptSubmit. The payload's `session_id` is the pane's
+  // LIVE conversation id, reported by the CLI process itself, so it survives a
+  // `/clear` without any cwd/timestamp correlation.
+  | 'prompt_submitted'
+  // No Claude Code hook behind this one: it is the DeepSeek status bridge's
+  // "a turn STARTED" report (see deepseek-status-shim.ts). Keep in step with
+  // HookEventSchema in web/schemas.ts.
+  | 'agent_working';
 
 // ========== API Response Types ==========
 
@@ -123,6 +153,82 @@ export interface CaseInfo {
   path: string;
   /** Whether CLAUDE.md exists */
   hasClaudeMd?: boolean;
+  /** Case storage/execution location */
+  location?: 'local' | 'linked-local' | 'remote' | 'docker';
+  /** Whether this is a linked local folder */
+  linked?: boolean;
+  /**
+   * Present when Codeman scaffolded this case directory for an AGENT-spawned session
+   * (the packaged skill's workers, or any spawn naming a parent session), read back
+   * from the case's own marker file — see `src/agent-case-marker.ts`. Absent for every
+   * case a human created, linked or cloned, which is what makes it usable as the
+   * "safe to clean up" signal in the Manage tab.
+   */
+  agentCreated?: {
+    createdAt: string;
+    createdBy: string;
+    parentSessionId?: string;
+    parentSessionName?: string;
+    mode?: string;
+  };
+  /** Remote case metadata for display and session creation */
+  remote?: {
+    hostId: string;
+    host: string;
+    username: string;
+    path: string;
+  };
+  /** Docker case metadata for display and session creation */
+  docker?: {
+    hostId: string;
+    container: string;
+    image?: string;
+    path: string;
+    /** Directory INSIDE the container (defaults to `path` when unset). */
+    containerWorkdir?: string;
+    network?: string;
+    /**
+     * CLIs available INSIDE the container. A container case runs its agents in
+     * the container, so HOST CLI availability says nothing about what it can
+     * run. Absent = unknown (an owned container runs our base image, which ships
+     * every CLI), which the UI reads as "do not gate".
+     */
+    availableModes?: string[];
+    /**
+     * `false` for an ADOPTED container (mirror of `DockerCase.owned`); absent = owned.
+     *
+     * ⚠️ The UI needs this to read a FAILED container probe correctly. For an adopted
+     * case a missing container is a real fault worth reporting, because the user is the
+     * only one who can start it. For an owned case it is the NORMAL state before the
+     * first session: the container is created on demand by the launch chain, so treating
+     * "not found" as a fault there hid every agent mode behind an error telling the user
+     * to start a container Codeman was about to create itself.
+     *
+     * It also gates the Add Case panel's "copy an existing case" picker: only an ADOPTED
+     * container may back several cases at once (`classifyAdoptContainerConflict`), since an
+     * owned container's lifecycle belongs to its one case.
+     */
+    owned?: boolean;
+  };
+}
+
+/**
+ * One agent-created case as `GET /api/cases/agent-created` reports it: the cleanup
+ * view over `CaseInfo.agentCreated`, with the two facts a human needs before deleting
+ * a directory — whether an agent is still working in it, and when it was last touched.
+ */
+export interface AgentCaseSummary {
+  name: string;
+  path: string;
+  createdAt: string;
+  createdBy: string;
+  parentSessionId?: string;
+  parentSessionName?: string;
+  mode?: string;
+  /** A live session's working directory is this case — deleting it would pull the rug. */
+  inUse: boolean;
+  /** Directory mtime, so "nothing has touched this in a week" is answerable. */
+  modifiedAt?: string;
 }
 
 // ========== Error Handling Utilities ==========

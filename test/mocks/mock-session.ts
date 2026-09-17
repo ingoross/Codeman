@@ -4,6 +4,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
+import type { SessionAttachmentHistoryItem, SessionStatus, SessionRemote } from '../../src/types.js';
 
 /**
  * Enhanced mock session for testing RespawnController.
@@ -12,13 +13,63 @@ import { vi } from 'vitest';
 export class MockSession extends EventEmitter {
   id: string;
   workingDir: string = '/tmp/test-workdir';
-  status: 'idle' | 'working' = 'idle';
-  pid: number = 12345;
+  /**
+   * Mirrors `Session.remote` — set to a `SessionRemote` to model a remote-SSH case,
+   * whose `workingDir` is an absolute path on ANOTHER host. File routes must read it
+   * over ssh instead of with local `fs` (#415).
+   */
+  remote?: SessionRemote;
+  /** Mirrors Session.attachmentHistory (the attachment panel's source of truth). */
+  attachmentHistory: SessionAttachmentHistoryItem[] = [];
+  /** Mirrors Session.getAttachmentHistoryForPersist(). */
+  getAttachmentHistoryForPersist(): SessionAttachmentHistoryItem[] {
+    return this.attachmentHistory;
+  }
+  /**
+   * The REAL union, deliberately. This used to be `'idle' | 'working'`, and
+   * `'working'` is not a `SessionStatus` at all — so `signalForStatus()` fell to its
+   * `default: null` branch in every route test and the busy / stopped / error halves
+   * of the immediate-resolve mapping had zero coverage while appearing to be tested.
+   */
+  status: SessionStatus = 'idle';
+  /** `null` once the PTY is gone (or before it has ever started) — see `pid` in Session. */
+  pid: number | null = 12345;
   isWorking: boolean = false;
   private _activeChildProcesses: { pid: number; command: string }[] = [];
   ralphTracker: null = null;
   writeBuffer: string[] = [];
   terminalBuffer: string = '';
+  /** Mirrors Session.lastSubmitAt — the response viewer credits history entries by it. */
+  lastSubmitAt: number = 0;
+  /** Mirrors Session.claudeSessionId — the conversation the viewer reads. */
+  claudeSessionId: string | null = null;
+  /** Mirrors Session.claudeSessionIdIsFirstHand — set only by a hook adoption. */
+  claudeSessionIdIsFirstHand: boolean = false;
+  /** Mirrors Session.claudeSessionChain — oldest first, current last. */
+  claudeSessionChain: string[] = [];
+
+  /** Mirrors Session.adoptClaudeSessionId, including the first-hand chain rule. */
+  adoptClaudeSessionId(newId: string, options: { firstHand?: boolean } = {}): void {
+    if (!newId) return;
+    if (options.firstHand) {
+      this.claudeSessionIdIsFirstHand = true;
+      if (this.claudeSessionChain[this.claudeSessionChain.length - 1] !== newId) {
+        const existing = this.claudeSessionChain.indexOf(newId);
+        if (existing !== -1) this.claudeSessionChain.splice(existing, 1);
+        this.claudeSessionChain.push(newId);
+      }
+    }
+    if (newId === this.claudeSessionId) return;
+    this.claudeSessionId = newId;
+  }
+
+  /** Mirrors Session.markPromptSubmitted. */
+  markPromptSubmitted(): void {
+    this.lastSubmitAt = Date.now();
+  }
+
+  /** Mirrors Session.trackUserInput (the send-key route feeds it around the write path). */
+  trackUserInput(_data: string): void {}
 
   private _muxName: string | null = null;
 
@@ -28,13 +79,22 @@ export class MockSession extends EventEmitter {
     this._muxName = `codeman-test-${id.slice(0, 8)}`;
   }
 
-  /** Direct PTY write (used by session.write()) */
-  write(data: string): void {
+  /**
+   * Set to simulate a session whose PTY is gone: both write paths report failure,
+   * which is the state in which input used to disappear silently.
+   */
+  failWrites = false;
+
+  /** Direct PTY write (used by session.write()). Mirrors the real boolean return. */
+  write(data: string): boolean {
+    if (this.failWrites) return false;
     this.writeBuffer.push(data);
+    return true;
   }
 
   /** Write via mux (used by respawn controller) */
   async writeViaMux(data: string): Promise<boolean> {
+    if (this.failWrites) return false;
     this.writeBuffer.push(data);
     return true;
   }
@@ -42,6 +102,10 @@ export class MockSession extends EventEmitter {
   /** Exactly-once input dedup — mirrors Session.shouldApplyInput so route tests
    *  exercising the reliable-delivery path behave like production. */
   private _appliedInputSeq = new Map<string, number>();
+  forgetInputSeq(clientId: string, seq: number): void {
+    if (this._appliedInputSeq.get(clientId) === seq) this._appliedInputSeq.set(clientId, seq - 1);
+  }
+
   shouldApplyInput(clientId: string, seq: number): boolean {
     const last = this._appliedInputSeq.get(clientId);
     if (last !== undefined && seq <= last) return false;
@@ -98,7 +162,9 @@ export class MockSession extends EventEmitter {
   /** Simulate working state with spinner */
   simulateWorking(text: string = 'Thinking'): void {
     this.simulateTerminalOutput(`${text}... \u280b`);
-    this.status = 'working';
+    // 'busy' is what the real Session sets while a turn is in flight; the old
+    // 'working' here was the event name, not a status value.
+    this.status = 'busy';
     this.emit('working');
   }
 
@@ -167,6 +233,14 @@ export class MockSession extends EventEmitter {
     return this._muxName;
   }
 
+  /**
+   * Mirrors `Session.usesMux`. True by default because that is the normal
+   * configuration, and it is what makes a route's pane-liveness probe reachable:
+   * `session.pid` is the tmux ATTACH CLIENT, so a mux-backed session's worker can be
+   * dead while `pid` is still a live number.
+   */
+  usesMux: boolean = true;
+
   /** Check for active child processes (mock returns configurable list) */
   getActiveChildProcesses(): { pid: number; command: string }[] {
     return this._activeChildProcesses;
@@ -229,6 +303,8 @@ export class MockSession extends EventEmitter {
       color: this.color,
       mode: this.mode,
       muxName: this._muxName,
+      pinned: this.pinned || undefined,
+      pinnedAt: this.pinned ? (this.pinnedAt ?? undefined) : undefined,
     };
   }
 
@@ -241,6 +317,14 @@ export class MockSession extends EventEmitter {
     if (!enabled) this.autoResumeAt = null;
   });
 
+  /** Pin state (COD-139) */
+  pinned: boolean = false;
+  pinnedAt: number | null = null;
+  setPinned = vi.fn((pinned: boolean) => {
+    this.pinned = pinned;
+    this.pinnedAt = pinned ? Date.now() : null;
+  });
+
   /** Check if session is busy */
   isBusy = vi.fn(() => false);
 
@@ -248,6 +332,43 @@ export class MockSession extends EventEmitter {
   setColor = vi.fn((c: string) => {
     this.color = c;
   });
+
+  /** Custom Model Endpoint Profiles (docs/custom-model-endpoints-plan.md) */
+  customModel: { endpointId: string; modelId: string; label?: string } | undefined = undefined;
+  remote: unknown = undefined;
+  docker: unknown = undefined;
+  private _mockCustomModel:
+    | {
+        endpointId: string;
+        modelId: string;
+        label?: string;
+        envKeys: string[];
+        configDir?: string;
+        launchModel?: string;
+      }
+    | undefined;
+  setCustomModel = vi.fn(
+    (
+      next:
+        | {
+            endpointId: string;
+            modelId: string;
+            label?: string;
+            envKeys: string[];
+            configDir?: string;
+            launchModel?: string;
+          }
+        | undefined,
+      _envOverrides?: Record<string, string>
+    ): { removedEnvKeys: string[]; previousConfigDir: string | undefined } => {
+      const previous = this._mockCustomModel;
+      this._mockCustomModel = next;
+      this.customModel = next ? { endpointId: next.endpointId, modelId: next.modelId, label: next.label } : undefined;
+      return { removedEnvKeys: previous?.envKeys ?? [], previousConfigDir: previous?.configDir };
+    }
+  );
+  restartCli = vi.fn(async () => true);
+  getCustomModelForPersist = vi.fn(() => this._mockCustomModel);
 
   /** Stub for sendInput */
   sendInput = vi.fn();
@@ -265,6 +386,9 @@ export class MockSession extends EventEmitter {
 
   /** Stub for startInteractive */
   startInteractive = vi.fn(async () => {});
+
+  /** Stub for resetRespawnBreaker (COD-118) */
+  resetRespawnBreaker = vi.fn();
 
   /** Stub for startShell */
   startShell = vi.fn(async () => {});

@@ -8,7 +8,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { TmuxManager, formatPaneSnapshot, parsePaneList, resolveActivePaneTarget } from '../src/tmux-manager.js';
+import {
+  TmuxManager,
+  buildCodexCommand,
+  buildRemoteKillCommand,
+  buildRemoteLaunchCommand,
+  formatPaneSnapshot,
+  parsePaneList,
+  resolveActivePaneTarget,
+} from '../src/tmux-manager.js';
 import { execSync, exec } from 'node:child_process';
 
 // ============================================================================
@@ -91,6 +99,166 @@ describe('TmuxManager (unit)', () => {
     });
   });
 
+  describe('statusline user-command env', () => {
+    // A tmux setenv survives respawn-pane, so the absence of a user statusline
+    // must UNSET the variable rather than leave a stale one for the exporter
+    // to wrap.
+    it('unsets CODEMAN_USER_STATUSLINE_CMD when the user has no statusline', () => {
+      mockedExecSync.mockClear();
+      (
+        manager as unknown as { _configureStatusLineUserCommand: (m: string, c?: string) => void }
+      )._configureStatusLineUserCommand('codeman-abc', undefined);
+      const cmds = mockedExecSync.mock.calls.map((c) => String(c[0]));
+      expect(cmds.some((c) => c.includes("setenv -t 'codeman-abc' -u CODEMAN_USER_STATUSLINE_CMD"))).toBe(true);
+    });
+
+    it('sets CODEMAN_USER_STATUSLINE_CMD, shell-escaped, when the user has one', () => {
+      mockedExecSync.mockClear();
+      (
+        manager as unknown as { _configureStatusLineUserCommand: (m: string, c?: string) => void }
+      )._configureStatusLineUserCommand('codeman-abc', `printf '%s' "$1" | jq -r .model`);
+      const cmds = mockedExecSync.mock.calls.map((c) => String(c[0]));
+      const setCmd = cmds.find((c) => c.includes('CODEMAN_USER_STATUSLINE_CMD'));
+      expect(setCmd).toBeDefined();
+      expect(setCmd).not.toContain(' -u ');
+      expect(setCmd).toContain("setenv -t 'codeman-abc' CODEMAN_USER_STATUSLINE_CMD ");
+    });
+  });
+
+  describe('Codex command builder', () => {
+    it('controls decorative TUI animation through Codex config', () => {
+      expect(buildCodexCommand({ animations: false })).toBe('codex --config tui.animations=false');
+      expect(buildCodexCommand({ animations: true })).toBe('codex --config tui.animations=true');
+      expect(buildCodexCommand()).toBe('codex');
+    });
+  });
+
+  describe('remote launch command builder', () => {
+    it('wraps codex command overrides in ssh with remote tmux launch', () => {
+      const command = buildRemoteLaunchCommand({
+        mode: 'codex',
+        remote: {
+          hostId: 'gpu-box',
+          label: 'GPU Box',
+          host: '10.0.0.42',
+          username: 'ubuntu',
+          remotePath: '/home/ubuntu/work',
+          commands: { codex: 'exec codx personal' },
+        },
+        sessionId: 'abc123def456',
+      });
+
+      expect(command).toContain('ssh');
+      expect(command).toContain('BatchMode=yes');
+      expect(command).toContain('ubuntu@10.0.0.42');
+      expect(command).toContain('/home/ubuntu/work');
+      // Dedicated socket + a name that fails a remote Codeman's SAFE_MUX_NAME_PATTERN.
+      expect(command).toContain('tmux -L codeman-remote new-session -A -s codeman-ssh-abc123de');
+      expect(command).toContain('exec codx personal');
+      // Session options are scoped per-session, never global (-g).
+      expect(command).not.toContain('set -g');
+    });
+
+    it('uses default shell command when no override is configured', () => {
+      const command = buildRemoteLaunchCommand({
+        mode: 'shell',
+        remote: {
+          hostId: 'gpu-box',
+          label: 'GPU Box',
+          host: '10.0.0.42',
+          username: 'ubuntu',
+          remotePath: '/home/ubuntu/work',
+        },
+        sessionId: 'abc123def456',
+      });
+
+      expect(command).toContain('exec "${SHELL:-/bin/sh}" -i -l');
+      // `failed`, not `on`: `on` also keeps the pane after a CLEAN exit, so typing
+      // `exit` in a remote shell strands a dead pane that the next launch's `-A`
+      // reattaches to instead of starting a shell.
+      expect(command).toContain('remain-on-exit failed');
+      expect(command).not.toContain('remain-on-exit on');
+      // Last in the chain: tmux aborts the rest of a `\;` sequence after an error,
+      // and `failed` needs tmux >= 3.2 on the REMOTE host. Trailing, a rejection
+      // costs only this option instead of every setting after it.
+      expect(command.trimEnd().endsWith("remain-on-exit failed'")).toBe(true);
+    });
+
+    it('defaults claude to a non-interactive launch (--dangerously-skip-permissions)', () => {
+      const command = buildRemoteLaunchCommand({
+        mode: 'claude',
+        remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        sessionId: 'abc123def456',
+      });
+      // Routed through an interactive login shell so ~/.local/bin (where `claude`
+      // typically lives) is on PATH — ssh's remote-command execution is neither
+      // interactive nor login, so a bare `exec claude` fails with "command not found".
+      // The inner quoting is escaped twice over (once per shellescape() layer), so
+      // assert on the unescaped substrings rather than the literal quoted form.
+      expect(command).toContain('exec "${SHELL:-/bin/sh}" -i -l -c');
+      expect(command).toContain('claude --dangerously-skip-permissions');
+    });
+
+    it('pins SSH-remote claude to the Codeman session id so a respawn resumes the same conversation', () => {
+      // Regression (2026-08-29): remote claude was launched as a bare `claude …`,
+      // so every reattach/respawn after a pane death (user ctrl-d or ctrl-c exit)
+      // started a NEW conversation. The launch now mirrors the docker-claude shape:
+      // `--session-id <id>` to create, with a `|| --resume <id>` fallback so the
+      // idempotent re-run resumes instead of erroring ("already in use").
+      const command = buildRemoteLaunchCommand({
+        mode: 'claude',
+        remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        sessionId: 'abc123def456',
+      });
+      expect(command).toContain('claude --dangerously-skip-permissions --session-id abc123def456');
+      expect(command).toContain('claude --dangerously-skip-permissions --resume abc123def456');
+    });
+
+    it('resumes an explicit resumeSessionId distinct from sessionId (mirrors claudeDockerPaneCommand)', () => {
+      // The docker-claude builder (claudeDockerPaneCommand) has always handled a
+      // resumeId that differs from sessionId — e.g. a resume-from-history launch —
+      // by leading with `--resume <rid> || --session-id <sessionId>`. The remote
+      // claude branch used to only mirror the SAME-id fallback shape and silently
+      // dropped a distinct resumeSessionId, so a remote resume-from-history claude
+      // launch created a brand-new conversation instead of resuming the named one.
+      const command = buildRemoteLaunchCommand({
+        mode: 'claude',
+        remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        sessionId: 'abc123def456',
+        resumeSessionId: 'old-conversation-uuid',
+      });
+      expect(command).toContain('claude --dangerously-skip-permissions --resume old-conversation-uuid');
+      expect(command).toContain('claude --dangerously-skip-permissions --session-id abc123def456');
+      // The resume attempt must lead — session-id is the fallback here, reversed
+      // from the same-id case.
+      const resumeIdx = command.indexOf('--resume old-conversation-uuid');
+      const sessionIdIdx = command.indexOf('--session-id abc123def456');
+      expect(resumeIdx).toBeLessThan(sessionIdIdx);
+    });
+  });
+
+  describe('remote kill command builder', () => {
+    it('kills the durable remote tmux session on the dedicated socket via ssh', () => {
+      const command = buildRemoteKillCommand({
+        remote: {
+          hostId: 'gpu-box',
+          label: 'GPU Box',
+          host: '10.0.0.42',
+          username: 'ubuntu',
+          remotePath: '/home/ubuntu/work',
+        },
+        sessionId: 'abc123def456',
+      });
+
+      expect(command).toContain('ssh');
+      // Shares the default ConnectTimeout so an unreachable host fails fast (never blocks kill).
+      expect(command).toContain('-o ConnectTimeout=10');
+      expect(command).toContain('ubuntu@10.0.0.42');
+      expect(command).toContain('tmux -L codeman-remote kill-session -t');
+      expect(command).toContain('codeman-ssh-abc123de');
+    });
+  });
+
   describe('getAttachCommand', () => {
     it('should return tmux', () => {
       expect(manager.getAttachCommand()).toBe('tmux');
@@ -142,14 +310,48 @@ describe('TmuxManager (unit)', () => {
   });
 
   describe('environment exports', () => {
-    it('keeps COLORTERM unset for OpenCode sessions', () => {
-      const exports = (
+    const callBuildEnvExports = (mode: string) =>
+      (
         manager as unknown as {
           buildEnvExports(sessionId: string, muxName: string, mode: string): string[];
         }
-      ).buildEnvExports('session-1', 'codeman-abc12345', 'opencode');
+      ).buildEnvExports('session-1', 'codeman-abc12345', mode);
 
-      expect(exports).toContain('unset COLORTERM');
+    it('keeps COLORTERM unset for OpenCode sessions', () => {
+      expect(callBuildEnvExports('opencode')).toContain('unset COLORTERM');
+    });
+
+    // Claude renders its themed backgrounds as RGB. Without this the pane inherits
+    // tmux's TERM=screen, supports-color reads 16 colors, and every dark background
+    // quantizes to ESC[40m — the terminal's own black — so the block goes invisible.
+    it('exports truecolor for Claude sessions', () => {
+      expect(callBuildEnvExports('claude')).toContain('export COLORTERM=truecolor');
+    });
+
+    it('exports the server-stamped CODEMAN_API_URL verbatim', () => {
+      const original = process.env.CODEMAN_API_URL;
+      process.env.CODEMAN_API_URL = 'https://127.0.0.1:3199';
+      try {
+        expect(callBuildEnvExports('claude')).toContain('export CODEMAN_API_URL=https://127.0.0.1:3199');
+      } finally {
+        if (original === undefined) delete process.env.CODEMAN_API_URL;
+        else process.env.CODEMAN_API_URL = original;
+      }
+    });
+
+    // A hardcoded fallback exported the wrong scheme on HTTPS installs; unset must
+    // stay unset so in-session guards fail closed instead of curling a bad URL.
+    it('exports no CODEMAN_API_URL at all when the server has not stamped one', () => {
+      const original = process.env.CODEMAN_API_URL;
+      delete process.env.CODEMAN_API_URL;
+      try {
+        const exports = callBuildEnvExports('claude');
+        expect(exports.some((line) => line.startsWith('export CODEMAN_API_URL'))).toBe(false);
+        expect(exports.join(' ')).not.toContain('localhost:3000');
+      } finally {
+        if (original === undefined) delete process.env.CODEMAN_API_URL;
+        else process.env.CODEMAN_API_URL = original;
+      }
     });
   });
 
@@ -543,6 +745,7 @@ describe('TmuxManager (unit)', () => {
           sessionId: 'abc12345-1234-5678-90ab-cdef12345678',
           workingDir: '/mnt/gdrive/project with spaces',
           mode: 'shell',
+          historyLimit: 250_000,
         });
 
         expect(session.workingDir).toBe('/mnt/gdrive/project with spaces');
@@ -551,7 +754,9 @@ describe('TmuxManager (unit)', () => {
         const newSessionCall = mockedExecSync.mock.calls.find(
           ([cmd]) => typeof cmd === 'string' && cmd.includes(' new-session ')
         );
-        expect(newSessionCall?.[0]).toBe(`tmux -L 'codeman' new-session -ds "codeman-abc12345" -c /tmp`);
+        expect(newSessionCall?.[0]).toBe(
+          `tmux -L 'codeman' set-option -g history-limit 250000 \\; new-session -ds "codeman-abc12345" -c /tmp \\; set-option -t "codeman-abc12345" history-limit 250000`
+        );
         expect(newSessionCall?.[1]).toEqual(expect.objectContaining({ cwd: '/tmp' }));
 
         const respawnCall = mockedExecSync.mock.calls.find(
@@ -559,6 +764,59 @@ describe('TmuxManager (unit)', () => {
         );
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abc12345"`);
         expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project with spaces\\" &&');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('changes the global history default on tmux versions that cannot resize panes', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+
+      try {
+        await nonTestManager.setHistoryLimit(200_000);
+        const historyCall = mockedExec.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' history-limit ')
+        );
+        expect(historyCall?.[0]).toBe(`tmux -L 'codeman' set-option -g history-limit 200000`);
+        expect(historyCall?.[0]).not.toContain(' -t ');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('targets only the new and tracked sessions on tmux 3.7+', async () => {
+      mockedExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === 'string' && cmd.endsWith(' -V')) return 'tmux 3.7b\n';
+        if (typeof cmd === 'string' && cmd.includes('which tmux')) return '/usr/bin/tmux\n';
+        if (typeof cmd === 'string' && cmd.includes('display-message') && cmd.includes('#{pane_pid}')) return '4242\n';
+        return '';
+      });
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+
+      try {
+        await nonTestManager.createSession({
+          sessionId: 'def67890-1234-5678-90ab-cdef12345678',
+          workingDir: '/project',
+          mode: 'shell',
+          historyLimit: 250_000,
+        });
+        const newSessionCall = mockedExecSync.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' new-session ')
+        );
+        expect(newSessionCall?.[0]).toBe(
+          `tmux -L 'codeman' new-session -ds "codeman-def67890" -c /tmp \\; set-option -t "codeman-def67890" history-limit 250000`
+        );
+        expect(newSessionCall?.[0]).not.toContain('set-option -g');
+
+        mockedExec.mockClear();
+        await nonTestManager.setHistoryLimit(200_000);
+        const historyCall = mockedExec.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' history-limit ')
+        );
+        expect(historyCall?.[0]).toBe(`tmux -L 'codeman' set-option -t 'codeman-def67890' history-limit 200000`);
+        expect(historyCall?.[0]).not.toContain('set-option -g');
       } finally {
         nonTestManager.destroy();
       }
@@ -591,6 +849,52 @@ describe('TmuxManager (unit)', () => {
           .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abcd1234"`);
         expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project\\" &&');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('unsets retired env keys on the tmux session BEFORE re-applying the live overrides', async () => {
+      // `tmux setenv` persists at the session level and is inherited by `respawn-pane`, so
+      // a key that merely disappears from envOverrides comes back in the relaunched CLI
+      // (measured: `setenv FOO bar` survived two `respawn-pane -k`). Clearing a custom-model
+      // selection names the keys to drop; a key both dropped and re-set must end up SET.
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      nonTestManager.registerSession({
+        sessionId: 'respawn5678',
+        muxName: 'codeman-abcd5678',
+        pid: 1000,
+        createdAt: Date.now(),
+        workingDir: '/tmp',
+        mode: 'shell',
+        attached: false,
+      });
+
+      try {
+        const pid = await nonTestManager.respawnPane({
+          sessionId: 'respawn5678',
+          workingDir: '/tmp',
+          mode: 'shell',
+          envOverrides: { CLAUDE_CODE_KEEP: '1', ANTHROPIC_API_KEY: 'again' },
+          unsetEnvKeys: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'not-a-key; rm -rf /'],
+        });
+        expect(pid).toBe(4242);
+
+        const setenvCalls = mockedExecSync.mock.calls
+          .map(([cmd]) => cmd)
+          .filter((cmd): cmd is string => typeof cmd === 'string' && cmd.includes(" setenv -t 'codeman-abcd5678'"));
+        const unsetBase = setenvCalls.findIndex((cmd) => cmd.endsWith(' -u ANTHROPIC_BASE_URL'));
+        const unsetKey = setenvCalls.findIndex((cmd) => cmd.endsWith(' -u ANTHROPIC_API_KEY'));
+        const setKeep = setenvCalls.findIndex((cmd) => cmd.includes(' CLAUDE_CODE_KEEP '));
+        const setKey = setenvCalls.findIndex((cmd) => cmd.includes(' ANTHROPIC_API_KEY ') && !cmd.includes(' -u '));
+        expect(unsetBase).toBeGreaterThanOrEqual(0);
+        expect(unsetKey).toBeGreaterThanOrEqual(0);
+        expect(setKeep).toBeGreaterThan(unsetBase);
+        // Re-set AFTER its own unset, so the live value wins.
+        expect(setKey).toBeGreaterThan(unsetKey);
+        // The shell-metachar key never reaches tmux at all.
+        expect(setenvCalls.some((cmd) => cmd.includes('rm -rf'))).toBe(false);
       } finally {
         nonTestManager.destroy();
       }

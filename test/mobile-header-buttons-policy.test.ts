@@ -10,7 +10,7 @@
 //
 // Policy: every header button that is VISIBLE BY DEFAULT on desktop must have an
 // explicit decision for phones — either it's hidden via an @media (max-width:
-// 430px) display:none rule in mobile.css, or it's added to MOBILE_VISIBLE_ALLOWLIST
+// 600px) display:none rule in mobile.css, or it's added to MOBILE_VISIBLE_ALLOWLIST
 // below with a reason. A new default-visible header button with neither fails this
 // test, forcing the author to decide its mobile behavior.
 //
@@ -38,7 +38,7 @@ const MOBILE_VISIBLE_ALLOWLIST = new Set<string>([]);
 // that removes a hide rule fails loudly (not silently). The attachments button is
 // NOT here: it's opt-in (default-hidden everywhere via its own --hidden marker), so
 // it's excluded from the default-visible enumeration rather than mobile-hidden.
-const KNOWN_PHONE_HIDDEN = ['btn-settings', 'btn-lifecycle-log'];
+const KNOWN_PHONE_HIDDEN = ['btn-settings', 'btn-lifecycle-log', 'btn-session-manager', 'btn-file-viewer'];
 
 function attrOf(openTag: string, name: string): string {
   const m = openTag.match(new RegExp(`${name}="([^"]*)"`));
@@ -123,7 +123,7 @@ describe('Mobile header button policy (static guard)', () => {
         hidden || allowed,
         `Header button .${btn.distinguishing.join('.')} (id=${btn.id || '?'}) is VISIBLE BY DEFAULT but has ` +
           `no mobile-visibility decision.\n` +
-          `  → To hide it on phones: add it to the @media (max-width: 430px) "display: none" block in ` +
+          `  → To hide it on phones: add it to the @media (max-width: 599px) "display: none" block in ` +
           `src/web/public/mobile.css (next to .btn-settings / .btn-lifecycle-log).\n` +
           `  → To keep it visible on phones: add '${btn.distinguishing[0]}' to MOBILE_VISIBLE_ALLOWLIST in ` +
           `this test, with a reason.\n` +
@@ -137,9 +137,54 @@ describe('Mobile header button policy (static guard)', () => {
     for (const cls of KNOWN_PHONE_HIDDEN) {
       expect(
         phoneHidden.has(cls),
-        `${cls} must stay hidden on phones — restore its rule in the @media (max-width: 430px) ` +
+        `${cls} must stay hidden on phones — restore its rule in the @media (max-width: 599px) ` +
           `display:none block in src/web/public/mobile.css.`
       ).toBe(true);
     }
+  });
+});
+
+// The flip side of the policy above: the ONE header control phones do keep has
+// to be pressable. The brand "C" is the way back to the home screen and was a
+// 0.85rem inline span — roughly a 12x13px target, well under the 44px minimum.
+describe('Phone home button tap target (static guard)', () => {
+  const css = readFileSync(join(PUBLIC, 'mobile.css'), 'utf-8');
+
+  /** Declarations applying to `.header-brand .logo` inside a phone media query. */
+  function phoneLogoDecls(): Map<string, string> {
+    const decls = new Map<string, string>();
+    postcss.parse(css).walkAtRules('media', (atRule) => {
+      if (!appliesToPhone(atRule.params)) return;
+      atRule.walkRules((rule) => {
+        if (!/\.header-brand\s+\.logo\s*$/.test(rule.selector)) return;
+        rule.walkDecls((decl) => decls.set(decl.prop, decl.value));
+      });
+    });
+    return decls;
+  }
+
+  it('gives the brand button a 44x44 hit area on phones', () => {
+    const decls = phoneLogoDecls();
+    expect(decls.get('min-width'), 'the "C" home button needs an explicit 44px min-width on phones').toBe('44px');
+    // A bare inline span ignores width entirely — the box only exists once it
+    // stops being inline.
+    expect(decls.get('display')).toBe('inline-flex');
+    // The other axis is the header's, so the two have to be read together: the
+    // button is only 44 tall because the phone header is.
+    expect(decls.get('height')).toBe('var(--header-height)');
+  });
+
+  it('keeps the phone header at 44px, the height that makes that target square', () => {
+    // The bar was 36px. Shrinking it again silently takes 8px back off every
+    // header touch target, the home button included.
+    let phoneHeaderHeight: string | undefined;
+    postcss.parse(css).walkAtRules('media', (atRule) => {
+      if (!appliesToPhone(atRule.params)) return;
+      atRule.walkRules((rule) => {
+        if (rule.selector.trim() !== ':root') return;
+        rule.walkDecls('--header-height', (decl) => (phoneHeaderHeight = decl.value.trim()));
+      });
+    });
+    expect(phoneHeaderHeight, '--header-height must be redefined for phones in mobile.css').toBe('44px');
   });
 });

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { WebServer } from '../src/web/server.js';
-import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { safeRmHomeTree } from './mocks/index.js';
 
 const TEST_PORT = 3110;
 const CASES_DIR = join(homedir(), 'codeman-cases');
@@ -19,13 +19,12 @@ describe('Edge Cases and Error Handling', () => {
   });
 
   afterEach(() => {
-    // Clean up cases created during this test
+    // Clean up cases created during this test. SAFETY: CASES_DIR is
+    // homedir()-derived, which on some platforms ignores the test HOME — the
+    // containment gate refuses to delete anything not under the temp HOME.
     while (createdCases.length > 0) {
       const caseName = createdCases.pop()!;
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, caseName));
     }
   });
 
@@ -221,7 +220,10 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Respawn controller not found');
+      // respawn/stop now owner-gates via findSessionOrFail first (multi-user #18), so a
+      // non-existent session id 404s as "Session ... not found" (same not-found semantics,
+      // matching the sibling start/config/enable handlers).
+      expect(data.error).toContain('not found');
     });
 
     it('should handle updating config on non-existent session', async () => {
@@ -346,15 +348,9 @@ describe('Concurrent Session Handling', () => {
       }
     }
 
-    // Cleanup
-    const { rmSync, existsSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const { homedir } = await import('node:os');
+    // Cleanup (containment-gated: never touch prod ~/codeman-cases)
     for (const name of createdCases) {
-      const path = join(homedir(), 'codeman-cases', name);
-      if (existsSync(path)) {
-        rmSync(path, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(homedir(), 'codeman-cases', name));
     }
   });
 });

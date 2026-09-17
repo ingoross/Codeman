@@ -17,8 +17,11 @@
 
 import type { FastifyReply } from 'fastify';
 import type { BackgroundTask } from '../session.js';
+import type { SessionOrderProjectionChange } from '../tab-layout-service.js';
+import type { AuthUser } from '../types.js';
 import { CleanupManager, StaleExpirationMap } from '../utils/index.js';
 import { SseEvent } from './sse-events.js';
+import { sessionOrderPayloadFor } from './session-order-sse.js';
 import {
   TERMINAL_BATCH_INTERVAL,
   TASK_UPDATE_BATCH_INTERVAL,
@@ -33,11 +36,32 @@ import {
 // Appending SSE comment padding (ignored by EventSource) forces the proxy to flush.
 // Pre-computed once at startup to avoid repeated string allocation.
 const SSE_PADDING = ':' + 'p'.repeat(SSE_PADDING_SIZE) + '\n';
+const UNROUTED_TAB_LAYOUT = Symbol('unrouted-tab-layout');
 
 /** Dependencies injected by WebServer — keeps SseStreamManager decoupled from session/respawn state. */
 interface SseStreamManagerDeps {
   /** Get session state with respawn info for session:updated broadcasts */
   getSessionStateWithRespawn(sessionId: string): unknown;
+  /** Resolve a session's owner (multi-user) for SSE routing; undefined = unknown. */
+  resolveSessionOwner?(sessionId: string): string | undefined;
+}
+
+/**
+ * Optional per-broadcast routing hint (multi-user). Resolved by WebServer.broadcast
+ * before delegation. When absent, an event is delivered to all clients (global).
+ */
+export interface SseRoutingHint {
+  /** Deliver only to this session's owner (+ admins). */
+  owner?: string;
+  /** Deliver only to admins (machine-level events: docker builds, tunnel, update). */
+  adminOnly?: boolean;
+  /** Deliver only to this exact user (+ admins). */
+  username?: string;
+  /**
+   * The event is session-scoped but the owner could not be resolved — non-admins
+   * are starved (fail closed) rather than leaked to.
+   */
+  sessionScoped?: boolean;
 }
 
 export class SseStreamManager {
@@ -50,10 +74,16 @@ export class SseStreamManager {
   private sseClients: Map<FastifyReply, Set<string> | null> = new Map();
   /** Optional client-supplied IDs → reply, for live filter updates without reconnecting */
   private sseClientsById: Map<string, FastifyReply> = new Map();
+  /** Per-client identity (multi-user); absent for single-user clients → no filtering. */
+  private sseClientIdentity: Map<FastifyReply, AuthUser> = new Map();
   /** SSE clients connecting from non-localhost (i.e. through tunnel) */
   private remoteSseClients: Set<FastifyReply> = new Set();
   /** Clients with backpressure — skip writes until 'drain' fires */
   private backpressuredClients: Set<FastifyReply> = new Set();
+  /** Latest already recipient-filtered legacy order frame awaiting a client's drain. */
+  private pendingSessionOrderFrames: Map<FastifyReply, string> = new Map();
+  /** Latest owner-filtered tab-layout invalidation per affected owner awaiting a client's drain. */
+  private pendingTabLayoutFrames: Map<FastifyReply, Map<string | symbol, string>> = new Map();
 
   // ─── Tunnel State ───────────────────────────────────────
   /** Cached tunnel active state — updated on TunnelStarted/TunnelStopped to avoid getUrl() on every broadcast */
@@ -105,8 +135,15 @@ export class SseStreamManager {
     this._isTunnelActive = active;
   }
 
-  addClient(reply: FastifyReply, sessionFilter: Set<string> | null, isRemote: boolean, clientId?: string): void {
+  addClient(
+    reply: FastifyReply,
+    sessionFilter: Set<string> | null,
+    isRemote: boolean,
+    clientId?: string,
+    identity?: AuthUser
+  ): void {
     this.sseClients.set(reply, sessionFilter);
+    if (identity) this.sseClientIdentity.set(reply, identity);
     if (isRemote) {
       this.remoteSseClients.add(reply);
     }
@@ -114,9 +151,7 @@ export class SseStreamManager {
       // If a previous reply registered the same id (reconnect), drop the old one.
       const prev = this.sseClientsById.get(clientId);
       if (prev && prev !== reply) {
-        this.sseClients.delete(prev);
-        this.remoteSseClients.delete(prev);
-        this.backpressuredClients.delete(prev);
+        this.removeClient(prev);
       }
       this.sseClientsById.set(clientId, reply);
     }
@@ -126,10 +161,31 @@ export class SseStreamManager {
     this.sseClients.delete(reply);
     this.remoteSseClients.delete(reply);
     this.backpressuredClients.delete(reply);
+    this.pendingSessionOrderFrames.delete(reply);
+    this.pendingTabLayoutFrames.delete(reply);
+    this.sseClientIdentity.delete(reply);
     // Clear any clientId mappings pointing at this reply
     for (const [id, r] of this.sseClientsById) {
       if (r === reply) this.sseClientsById.delete(id);
     }
+  }
+
+  /**
+   * Whether an SSE event carrying `hint` may be delivered to `reply`. Clients with
+   * no identity (single-user) always receive everything. Admins receive everything.
+   * A non-admin receives an event only when the hint targets them (owner/username)
+   * or the event is unrouted/global; session-scoped events with an unresolved owner
+   * are withheld (fail closed).
+   */
+  private canDeliver(reply: FastifyReply, hint?: SseRoutingHint): boolean {
+    const identity = this.sseClientIdentity.get(reply);
+    if (!identity || identity.role === 'admin') return true;
+    if (!hint) return true;
+    if (hint.adminOnly) return false;
+    if (hint.username !== undefined) return hint.username === identity.username;
+    if (hint.owner !== undefined) return hint.owner === identity.username;
+    if (hint.sessionScoped) return false; // session-scoped but owner unknown → fail closed
+    return true;
   }
 
   /**
@@ -149,8 +205,7 @@ export class SseStreamManager {
     try {
       reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     } catch {
-      this.sseClients.delete(reply);
-      this.remoteSseClients.delete(reply);
+      this.removeClient(reply);
     }
   }
 
@@ -160,7 +215,44 @@ export class SseStreamManager {
     try {
       reply.raw.write(SSE_PADDING);
     } catch {
-      /* client gone */
+      this.removeClient(reply);
+    }
+  }
+
+  private markBackpressured(reply: FastifyReply): void {
+    this.backpressuredClients.add(reply);
+    reply.raw.once('drain', () => this.flushBackpressuredClient(reply));
+  }
+
+  private flushBackpressuredClient(reply: FastifyReply): void {
+    if (!this.sseClients.has(reply)) return;
+    this.backpressuredClients.delete(reply);
+    try {
+      const drainPadding = this._isTunnelActive ? SSE_PADDING : '';
+      const recovered = reply.raw.write(`event: ${SseEvent.SessionNeedsRefresh}\ndata: {}\n\n${drainPadding}`);
+      if (!recovered) {
+        this.markBackpressured(reply);
+        return;
+      }
+      const pendingLayouts = this.pendingTabLayoutFrames.get(reply);
+      if (pendingLayouts) {
+        for (const [owner, pendingLayout] of pendingLayouts) {
+          pendingLayouts.delete(owner);
+          this.sendSSEPreformatted(reply, pendingLayout);
+          if (!this.sseClients.has(reply)) return;
+          if (this.backpressuredClients.has(reply)) {
+            if (pendingLayouts.size === 0) this.pendingTabLayoutFrames.delete(reply);
+            return;
+          }
+        }
+        this.pendingTabLayoutFrames.delete(reply);
+      }
+      const pendingOrder = this.pendingSessionOrderFrames.get(reply);
+      if (!pendingOrder) return;
+      this.pendingSessionOrderFrames.delete(reply);
+      this.sendSSEPreformatted(reply, pendingOrder);
+    } catch {
+      this.removeClient(reply);
     }
   }
 
@@ -174,30 +266,17 @@ export class SseStreamManager {
     try {
       const ok = reply.raw.write(message);
       if (!ok) {
-        // Buffer is full — mark as backpressured, resume on drain
-        this.backpressuredClients.add(reply);
-        reply.raw.once('drain', () => {
-          this.backpressuredClients.delete(reply);
-          // Client may have missed terminal data during backpressure.
-          // Tell it to reload the active session's buffer to recover.
-          try {
-            const drainPadding = this._isTunnelActive ? SSE_PADDING : '';
-            reply.raw.write(`event: ${SseEvent.SessionNeedsRefresh}\ndata: {}\n\n${drainPadding}`);
-          } catch {
-            /* client gone */
-          }
-        });
+        // Buffer is full — mark as backpressured, resume on drain.
+        this.markBackpressured(reply);
       }
     } catch {
-      this.sseClients.delete(reply);
-      this.remoteSseClients.delete(reply);
-      this.backpressuredClients.delete(reply);
+      this.removeClient(reply);
     }
   }
 
   // ========== Broadcasting ==========
 
-  broadcast(event: string, data: unknown): void {
+  broadcast(event: string, data: unknown, hint?: SseRoutingHint): void {
     // Skip serialization entirely when no clients are listening
     if (this.sseClients.size === 0) return;
 
@@ -224,6 +303,38 @@ export class SseStreamManager {
     // active session's terminal output. Terminal events bypass this method
     // entirely (see flushSessionTerminalBatch — it applies the filter).
     for (const [client] of this.sseClients) {
+      // Multi-user ownership routing (no-op for identity-less single-user clients).
+      if (!this.canDeliver(client, hint)) continue;
+      if (event === SseEvent.TabLayoutChanged && this.backpressuredClients.has(client)) {
+        const owner =
+          data !== null &&
+          typeof data === 'object' &&
+          Object.hasOwn(data, 'owner') &&
+          typeof (data as { owner?: unknown }).owner === 'string'
+            ? (data as { owner: string }).owner
+            : (hint?.username ?? hint?.owner ?? UNROUTED_TAB_LAYOUT);
+        let pending = this.pendingTabLayoutFrames.get(client);
+        if (!pending) {
+          pending = new Map();
+          this.pendingTabLayoutFrames.set(client, pending);
+        }
+        pending.set(owner, message);
+        continue;
+      }
+      this.sendSSEPreformatted(client, message);
+    }
+  }
+
+  /** Dispatch the legacy order projection selected from each trusted client identity. */
+  broadcastSessionOrder(change: SessionOrderProjectionChange): void {
+    for (const [client] of this.sseClients) {
+      const payload = sessionOrderPayloadFor(this.sseClientIdentity.get(client), change);
+      if (!payload) continue;
+      const message = `event: ${SseEvent.SessionOrderChanged}\ndata: ${JSON.stringify(payload)}\n\n`;
+      if (this.backpressuredClients.has(client)) {
+        this.pendingSessionOrderFrames.set(client, message);
+        continue;
+      }
       this.sendSSEPreformatted(client, message);
     }
   }
@@ -314,9 +425,15 @@ export class SseStreamManager {
       // terminal data is high-frequency and latency-sensitive.
       const padding = this._isTunnelActive ? SSE_PADDING : '';
       const message = `event: session:terminal\ndata: {"id":"${sessionId}","data":${escapedData}}\n\n` + padding;
+      // Raw terminal bytes are the highest-value payload: resolve the session owner
+      // ONCE and withhold the batch from any non-admin who is not the owner (fail
+      // closed if the owner is unknown). No-op for identity-less single-user clients.
+      const owner = this.deps.resolveSessionOwner?.(sessionId);
+      const termHint: SseRoutingHint = { owner, sessionScoped: true };
       for (const [client, filter] of this.sseClients) {
         // Skip clients that have a session filter and aren't subscribed to this session
         if (filter && !filter.has(sessionId)) continue;
+        if (!this.canDeliver(client, termHint)) continue;
         this.sendSSEPreformatted(client, message);
       }
     }
@@ -355,7 +472,11 @@ export class SseStreamManager {
       return;
     }
     for (const [, { sessionId, task }] of this.taskUpdateBatches) {
-      this.broadcast(SseEvent.TaskUpdated, { sessionId, task });
+      // Multi-user: batched task updates carry session state — route to the owner
+      // only (fail closed if unknown), matching flushSessionTerminalBatch. No-op for
+      // identity-less single-user clients (canDeliver short-circuits on no identity).
+      const owner = this.deps.resolveSessionOwner?.(sessionId);
+      this.broadcast(SseEvent.TaskUpdated, { sessionId, task }, { owner, sessionScoped: true });
     }
     this.taskUpdateBatches.clear();
   }
@@ -395,7 +516,11 @@ export class SseStreamManager {
       // Single expensive serialization per batch interval
       const state = this.deps.getSessionStateWithRespawn(sessionId);
       if (state) {
-        this.broadcast(SseEvent.SessionUpdated, state);
+        // Multi-user: the debounced session:updated blob carries name/workingDir/
+        // tokens/cost — route to the session owner only (fail closed if unknown),
+        // matching flushSessionTerminalBatch. No-op for single-user clients.
+        const owner = this.deps.resolveSessionOwner?.(sessionId);
+        this.broadcast(SseEvent.SessionUpdated, state, { owner, sessionScoped: true });
       }
     }
     this.stateUpdatePending.clear();
@@ -404,12 +529,20 @@ export class SseStreamManager {
   // ========== Client Health ==========
 
   /**
-   * Clean up dead SSE clients and send keep-alive comments.
+   * Clean up dead SSE clients and send the liveness heartbeat.
    * Keep-alive prevents proxy/load-balancer timeouts on idle connections.
    * Dead client cleanup prevents memory leaks from abruptly terminated connections.
+   *
+   * The heartbeat is a NAMED event, not the `:keepalive` comment it used to be:
+   * comments are invisible to `EventSource` by spec, so a stream that stopped
+   * delivering without erroring was undetectable to the client (see
+   * `SseEvent.Heartbeat`). Written per-client rather than through `broadcast()`
+   * deliberately: the frame carries no session data, so it needs no owner
+   * routing, and this loop is already walking every client to check its socket.
    */
   cleanupDeadClients(): void {
     const deadClients: FastifyReply[] = [];
+    const heartbeat = `event: ${SseEvent.Heartbeat}\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`;
 
     for (const [client] of this.sseClients) {
       try {
@@ -418,11 +551,9 @@ export class SseStreamManager {
         if (!socket || socket.destroyed || !socket.writable) {
           deadClients.push(client);
         } else {
-          // Send SSE comment as keep-alive. Only add padding when tunnel is
-          // active — it flushes Cloudflare proxy buffers but wastes bandwidth
-          // for direct/Tailscale connections.
-          const ka = this._isTunnelActive ? ':keepalive\n' + SSE_PADDING : ':keepalive\n\n';
-          client.raw.write(ka);
+          // Only add padding when tunnel is active: it flushes Cloudflare
+          // proxy buffers but wastes bandwidth for direct/Tailscale connections.
+          client.raw.write(this._isTunnelActive ? heartbeat + SSE_PADDING : heartbeat);
         }
       } catch {
         // Error accessing socket means client is dead
@@ -432,9 +563,7 @@ export class SseStreamManager {
 
     // Remove dead clients
     for (const client of deadClients) {
-      this.sseClients.delete(client);
-      this.remoteSseClients.delete(client);
-      this.backpressuredClients.delete(client);
+      this.removeClient(client);
     }
 
     if (deadClients.length > 0) {
@@ -481,6 +610,8 @@ export class SseStreamManager {
     this.sseClients.clear();
     this.remoteSseClients.clear();
     this.backpressuredClients.clear();
+    this.pendingSessionOrderFrames.clear();
+    this.pendingTabLayoutFrames.clear();
 
     // Clear per-session batch timers
     for (const timer of this.terminalBatchTimers.values()) {

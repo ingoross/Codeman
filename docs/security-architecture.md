@@ -30,7 +30,8 @@ an explicit, guided opt‑in.
 7. [Supply‑chain & build‑asset hardening](#7-supplychain--buildasset-hardening-cod28)
 8. [Multi‑instance isolation](#8-multiinstance-isolation)
 9. [Transport security headers](#9-transport-security-headers)
-10. [Quick reference](#10-quick-reference)
+10. [Docker container isolation](#10-docker-container-isolation)
+11. [Quick reference](#11-quick-reference)
 
 ---
 
@@ -124,7 +125,9 @@ loopback bind matters. The auth pipeline (`src/web/middleware/auth.ts`,
 `onRequest` hook) runs in this order:
 
 1. **Localhost‑only exemptions** (always first): `POST /api/hook-event` and the QR
-   `/q/` short‑code path are exempt when `req.ip` is loopback (see §3). While the
+   `/q/` short‑code path are exempt when `req.ip` is loopback (see §3). The three
+   web‑tab exemptions (§10b: the capability in the path, the `Referer` form, and
+   the lost‑frame recovery page) sit in this same slot, ahead of the credential checks. While the
    **managed tunnel is running**, the hook‑event exemption additionally requires
    the per‑instance `X-Codeman-Hook-Secret` header (COD‑54); failed presentations
    are rate‑limited in a **dedicated bucket** (separate from Basic‑Auth failures)
@@ -248,16 +251,28 @@ Ordered most‑to‑least recommended:
 
 ### A. Tailscale serve (recommended)
 
-Bind loopback, let Tailscale front it on your tailnet with a real cert:
+Bind loopback, let Tailscale front it on your tailnet with a real cert. **The
+installer sets this up for you**: choose **Tailscale** at the network-access
+prompt, or retrofit an existing install with:
 
 ```bash
-codeman web --https            # binds 127.0.0.1:3000
-tailscale serve --bg https / http://127.0.0.1:3000
+bash ~/.codeman/app/install.sh tailscale
 ```
 
-Only devices on your tailnet can reach it; Tailscale handles identity. No app
-password and no `0.0.0.0` bind required. (This is the maintainer's production
-setup.)
+The guided flow installs Tailscale if needed, walks through login and the
+tailnet HTTPS-certificates toggle, and configures the equivalent of:
+
+```bash
+codeman web                    # binds 127.0.0.1:3000 (plain HTTP is fine here)
+tailscale serve --bg 3000      # HTTPS at https://<node>.<tailnet>.ts.net
+```
+
+Only devices on your tailnet can reach it; Tailscale handles identity and
+terminates TLS with a real Let's Encrypt certificate (so PWA install and web
+push work). No app password and no `0.0.0.0` bind required. (This is the
+maintainer's production setup.) `CODEMAN_TAILSCALE=1` presets the choice for
+automation; the installer never runs `tailscale serve reset` and never touches
+serve mappings other than `443 -> Codeman's port`.
 
 ### B. Authenticated cloudflared tunnel + password
 
@@ -299,8 +314,8 @@ TOCTOU window.
 | Route | Cap | Notes |
 |-------|-----|-------|
 | `file-content` | 10 MB | text preview |
-| `file-raw` | 50 MB | inline MIME map; **`X-Content-Type-Options: nosniff` on all responses** |
-| `POST /api/download` | 50 MB | forced `attachment`; sensitive‑path blocklist |
+| `file-raw` | 2 GB (`CODEMAN_MAX_DOWNLOAD_BYTES`, `0` = unlimited) | inline MIME map; **`X-Content-Type-Options: nosniff` on all responses**; streamed, `Range`-aware (206 slices come from the same validated path, and the cap is checked before the range) |
+| `GET /api/download` | same cap | forced `attachment`; sensitive‑path blocklist; streamed, `Range`-aware |
 
 ### SVG / content‑type XSS
 
@@ -327,7 +342,7 @@ the attachment guard below.
 
 Live external attachments (`src/attachment-registry.ts`) mint an `att_<uuid>` id
 for a host file so browser requests carry the id, never an absolute path. Serving
-is by id (`GET /api/sessions/:id/attachments/:attachmentId/raw`, 50 MB cap,
+is by id (`GET /api/sessions/:id/attachments/:attachmentId/raw`, same download cap,
 `nosniff`) and re‑resolves the symlink + re‑checks the **attachment guard**
 (`src/config/attachment-guard.ts`: the shared sensitive‑path blocklist **plus**
 the `/root` and `/etc` trees, extendable via `attachmentBlockedPaths` /
@@ -471,17 +486,59 @@ production layout (`~/.codeman`, `-L codeman`, port 3000).
 
 ---
 
-## 10. Quick reference
+## 10. Docker container isolation
+
+Docker cases (1.4.0) run a session inside a per‑case container instead of on the host. The security posture:
+
+- **Hardened create flags, always** — `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit` (fork‑bomb guard), `--memory` == `--memory-swap` (a real OOM cap), `--init`, and non‑root: `--user <hostUid>:0` on Linux (host uid → workspace files stay host‑owned; GID 0 keeps `$HOME` writable), `--userns=keep-id` on rootless Podman. **Never** `--privileged`, and **never** the docker socket — the pure builder in `docker-hosts.ts` cannot emit them and the schema cannot represent them.
+- **Credentials never enter an image** — the convenient default bind‑mounts host cred dirs (`~/.claude`, `~/.codex`, `~/.gemini` — which also carries Antigravity's `antigravity-cli/` state — `~/.config/{gcloud,opencode}`, five seeded files from `~/.pi/agent`, and three from `~/.grok`) read‑write. Bind mounts are physically excluded from `docker commit`, so exported images are secret‑free. API‑key CLIs get their key as an exec‑time NAME‑ONLY `--env OPENAI_API_KEY` (no `=value`, no `ps` leak, never committed); a create‑time `-e` for a secret is never used. The **sealed** profile (`mountCredentials:false` + `network:none`) drops the host mounts; full‑image export is then refused (an in‑container login would ride the committed layer) unless a pre‑commit scrub is opted into.
+- **Blast radius — accept it explicitly** — the convenient profile mounts an arbitrary host workspace RW plus the host credential dirs RW into a network‑enabled container, so container‑run agent code can read/modify those host trees and reach the network at once. Still a net improvement over today's on‑host `--dangerously-skip-permissions` execution; use the sealed profile for genuinely untrusted work.
+- **Import is untrusted‑bundle‑safe** — `/api/docker-cases/import` validates the manifest + per‑member SHA‑256 before extraction, rejects absolute / `..` tar members (traversal guard), and re‑tags the loaded image into a quarantined namespace so it can never overwrite `codeman/agent:base` or a pre‑existing tag.
+- **Host guard & the bridge‑hooks listener** — in‑container hook callbacks carry `Host: host.docker.internal` / `host.containers.internal`; both are on the always‑on host‑header allowlist (`DOCKER_HOST_GATEWAY_ALIASES`) and resolve to the host only from inside a container netns, so they are not a browser DNS‑rebinding surface. On a loopback‑only server, in‑container hooks are opt‑in via `CODEMAN_DOCKER_BRIDGE_HOOKS=1`, which binds a SECOND listener on the docker bridge gateway serving **only** the hook endpoints (every other path → `403`) into the same hook‑secret‑gated pipeline. The bridge is host‑internal (containers + host), not the LAN, so it does not widen network exposure; the hook secret is bind‑mounted read‑only and referenced by path.
+- **Instance isolation** — every managed container is labeled `codeman.instance=<CODEMAN_INSTANCE>`; the boot reaper reaps orphans of its OWN instance only, so a beta never removes a prod container. The in‑container tmux socket (`-L codeman-docker`) + session name (`codeman-dkr-*`) deliberately fail a nested Codeman's discovery pattern.
+
+Full feature guide: [`docker-cases.md`](docker-cases.md).
+
+---
+
+## 10a. Multi‑user mode (opt‑in)
+
+`codeman web --multiuser` (or `CODEMAN_MULTIUSER=1`) turns on named users with individually scrypt‑hashed passwords in `~/.codeman/users.json` (mode 0600). OFF by default; when off, nothing here applies and behavior is byte‑identical to single‑user. Design + phase status: [`multi-user-plan.md`](multi-user-plan.md).
+
+- **It is workspace separation, NOT a security boundary between users.** Every session still runs as the SAME OS account with agent code that can read the whole host. Any user can ask their agent to `cat` another user's files; the WEB layer enforces scoping, the AGENT layer cannot. Mitigations: give non‑admins the default `auto` permission mode (classifier‑guarded), pair users with **Docker cases** (container per case) for real isolation, or run separate Codeman instances under separate OS accounts. Stated loudly in the admin panel and the plan's threat model (section 2).
+- **It strictly improves network posture.** It removes the single shared `CODEMAN_PASSWORD` and gives each person a revocable credential; a non‑loopback bind and the tunnel‑enable guard are satisfied by "multi‑user with ≥1 enabled user" without a shared password.
+- **Auth is a parallel branch** (`middleware/auth.ts`) that leaves the single‑user path untouched: per‑user scrypt verify (`timingSafeEqual`, timing‑equalized against user enumeration), identity‑carrying cookies, a per‑username failure bucket (a botnet can't brute one account across IPs; one NATed user can't lock out the rest), and a `mustChangePassword` lockbox. The hook‑secret loopback bypass, host guard, and Origin/CSRF guard are unchanged (hooks authenticate the INSTANCE, not a user).
+- **Ownership is enforced server‑side only** and fails closed: `req.authUser` (a synthetic admin in single‑user), `findSessionOrFail` returns NOT_FOUND (never 403) for a foreign session, list/SSE/WS/file‑preview/search all filter by `session.owner`, and SSE routing defaults session‑scoped events to their owner (unresolved owner → withheld). The load‑bearing rule is **non‑admin `workingDir` confinement**: a non‑admin's session/one‑shot working dir must realpath‑resolve inside `~/codeman-users/<name>/cases`, checked BEFORE any disk write.
+- **Privileged actions are a one‑bit grant** (`canBypassPermissions`, default off): only granted users (and admins) get `--dangerously-skip-permissions` (others are silently downgraded to `--permission-mode auto`), shell‑mode sessions, cron `launchCommand`, and other CLIs' bypass flags. Machine‑level resources (remote/Docker host definitions, tunnel, self‑update, settings writes) are admin‑only.
+- **Admin actions are audited** append‑only to `~/.codeman/admin-audit.jsonl` (acting admin, action, target, IP). Passwords set by an admin create/reset are one‑time (returned once, force change). Under Basic auth, `logout` only truly ends QR‑issued sessions — to lock someone out, disable the account or reset the password (a proper login form is a deferred Phase 6).
+
+---
+
+## 10b. Web tabs (dashboard proxy)
+
+A saved dashboard URL renders as a tab, served through Codeman's own origin at `/webview/<capability>/`. User guide: [`web-tabs.md`](web-tabs.md). Four properties carry the security weight:
+
+- **The proxy is exempt from cookie auth and the Origin/CSRF guard, and that is deliberate.** The iframe is sandboxed without `allow-same-origin`, so it is opaque‑origin: its requests are cross‑site, meaning the `SameSite=lax` session cookie is never attached and its writes and WS upgrades arrive with `Origin: null`. The credential is instead a 192‑bit capability in the path, minted only by an authenticated `POST /api/webviews/:id/open`, held in memory (a restart invalidates every one), rolling TTL, bound to the minting user, and granting nothing but "relay bytes to this one saved URL". ⚠️ **The Host allowlist is NOT bypassed**, so DNS‑rebinding protection is unaffected. A second `Referer`‑keyed form exists for root‑absolute assets and is the only exemption decided by a request‑supplied header, so it is fenced to safe methods on non‑`/api`, non‑`/ws`, non‑`/q` paths. Edges pinned by `test/webview-auth-exemption.test.ts`.
+- **The lost‑frame recovery page is the third unauthenticated 200, and the only one decided by request headers alone.** The proxy's runtime shim masks `/webview/<cap>/` off the page's own URL so a single‑page app routes on the path it expects; a navigation the page then starts itself (`location.reload()`, a root‑absolute `location.href`) lands on Codeman's root with no capability anywhere, no cookie (opaque origin) and a Referer naming the masked page. `serveLostWebviewFrame()` in `middleware/auth.ts` recognises it by shape (`GET`/`HEAD`, `Sec-Fetch-Dest: iframe` or `frame`, `Accept: text/html`, `Sec-Fetch-Mode: navigate` or absent) and answers, BEFORE the credential checks and without counting an auth failure, with a static page whose only content is a `postMessage` of the lost path to the parent tab (`default-src 'none'` plus the hash of that one script, `no-store`, `referrer: no-referrer`, no reflected input). It is fenced to paths that are NOT registered routes and never `/api/`, `/ws/` or `/q/`, with one carve‑out: `/` itself, because the landing page masks to exactly `/` and its reload otherwise rendered Codeman's app shell inside the web tab. `/` is admitted only when the request carries neither the `codeman_session` cookie nor an `Authorization` header: nothing in Codeman frames its own root and a sandboxed frame has neither, while a framed `/` that does carry credentials still gets the shell. On a passwordless install no auth hook runs, so the index route applies the same test itself (`isLostWebviewRootFrame`). ⚠️ Known property, accepted rather than mitigated: those headers are trivially set by a non‑browser client, so an unauthenticated caller can distinguish a registered route (401) from a non‑route (200) and enumerate the route table; the routes are public in `docs/api-reference.md`, so nothing is learned. Pinned by `test/webview-auth-exemption.test.ts` (password) and `test/webview-lost-root-frame.test.ts` (passwordless).
+- **Sandboxed by default; `allow-same-origin` is an explicit per‑dashboard opt‑in.** A proxied page is same‑origin with Codeman, so without the sandbox its JavaScript could read the Codeman document and call the agent‑spawning API. ⚠️ In BOTH modes the `Authorization` header and the `codeman_session` cookie are stripped before the upstream request, because a trusted (same‑origin) frame makes the browser attach Codeman's own Basic‑auth credentials to every proxied request; forwarding them would hand `CODEMAN_PASSWORD` to the dashboard.
+- **Not an open relay, and not a privilege boundary.** `resolveUpstreamUrl()` refuses anything leaving the saved origin, and cross‑origin redirects are handed back unchanged rather than followed. The proxy does reach whatever the SERVER can reach, which is not an escalation for someone who already commands `--dangerously-skip-permissions` agents, but in multi‑user mode it means a non‑admin's dashboard is fetched from the server's network position. Saved URLs are validated to plain http(s) with no embedded credentials, and there is deliberately **no magic‑link path**: terminal output can never create a webview (the mistake the attachment scanner had to be walled off from). The one refused destination class is link‑local and cloud‑metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `168.63.129.16`, `100.100.100.200`, `metadata.google.internal`): `webview-egress-policy.ts` refuses them at save time, and `webview-egress.ts` re‑judges the RESOLVED address at connect time through a `lookup` hook on the proxy's undici Agent and on its WebSocket client, so a DNS name pointing into those ranges is refused as well. Loopback and RFC1918 stay allowed on purpose. Capabilities are revoked on logout, admin logout and user deletion, and proxied responses carry `Referrer-Policy: same-origin` so a dashboard cannot hand the capability‑bearing URL to a third‑party host it links.
+
+---
+
+## 11. Quick reference
 
 | Env / flag | Effect |
 |------------|--------|
 | `CODEMAN_PASSWORD` (+ `CODEMAN_USERNAME`) | Enable HTTP Basic auth |
 | `--host` / `CODEMAN_HOST` | Bind host (default `127.0.0.1`) |
 | `CODEMAN_ALLOWED_HOSTS` | Extra `Host`/`Origin` allowlist entries for reverse proxies (comma‑separated; exact host, or leading‑dot `.suffix` for subdomains) — see §3 |
+| `--base-url` / `CODEMAN_BASE_URL` | Sub‑path prefix Codeman is mounted under behind a reverse proxy, e.g. `/codeman` (default `/`); the proxy must forward the prefix unchanged. Independent of `CODEMAN_ALLOWED_HOSTS` |
 | `--allow-unauthenticated-network` / `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` | Acknowledge an unauthenticated non‑loopback bind (downgrades the warning) |
 | `--https` | Enable TLS (adds HSTS) |
 | `CODEMAN_INSTANCE` | Scope tmux socket + data dir for isolation |
 | `CODEMAN_GESTURE=1` | Make the gesture overlay available (widens CSP) |
+| `CODEMAN_DOCKER_BRIDGE_HOOKS=1` | Serve the hook endpoints on the docker bridge gateway (host‑internal, hooks‑only, `403` elsewhere) so in‑container hooks reach a loopback‑bound server — see §10 |
+| `CODEMAN_DOCKER_BRIDGE_HOST` | Override the bridge gateway IP the hooks listener binds (default: auto‑detect) |
 
 **Audit log:** session lifecycle and server start are recorded in
 `~/.codeman/session-lifecycle.jsonl`.

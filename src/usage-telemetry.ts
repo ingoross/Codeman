@@ -1,5 +1,5 @@
 /**
- * @fileoverview Pure parsing + formatting of Claude Code statusline telemetry.
+ * @fileoverview Pure parsing + formatting of Claude and Codex plan telemetry.
  *
  * Claude Code (v2.1.80+) pipes a JSON blob to a configured `statusLine.command`
  * on each render. On Pro/Max subscriptions that blob carries a `rate_limits`
@@ -15,7 +15,10 @@
  * Only those two windows exist (no Opus-weekly field). `rate_limits` is absent
  * before the first API response and for non-subscriber auth — both yield null.
  *
- * All functions are pure for testability. See `test/usage-telemetry.test.ts`.
+ * The Codex parser consumes the read-only `account/rateLimits/read` app-server
+ * response and selects only the main `codex` bucket, excluding model-specific
+ * buckets. All functions are pure for testability. See
+ * `test/usage-telemetry.test.ts` and `test/codex-plan-usage.test.ts`.
  *
  * @module usage-telemetry
  */
@@ -49,6 +52,22 @@ export interface RawStatuslinePayload {
   context_window?: { used_percentage?: number; total_input_tokens?: number; total_output_tokens?: number };
   cost?: { total_cost_usd?: number };
   model?: { display_name?: string };
+}
+
+interface RawCodexRateLimitWindow {
+  usedPercent?: unknown;
+  windowDurationMins?: unknown;
+  resetsAt?: unknown;
+}
+
+interface RawCodexRateLimitSnapshot {
+  primary?: RawCodexRateLimitWindow | null;
+  secondary?: RawCodexRateLimitWindow | null;
+}
+
+interface RawCodexRateLimitsResponse {
+  rateLimits?: RawCodexRateLimitSnapshot | null;
+  rateLimitsByLimitId?: Record<string, RawCodexRateLimitSnapshot | null> | null;
 }
 
 function clampPct(n: number): number {
@@ -86,6 +105,29 @@ export function parseStatusTelemetry(data: RawStatuslinePayload | undefined): St
     t.modelDisplayName = data.model.display_name.slice(0, 60);
   }
   return t;
+}
+
+/** Normalize the main Codex app-server bucket into the chip's two known windows. */
+export function parseCodexRateLimitsResponse(value: unknown): StatusTelemetry | null {
+  if (!value || typeof value !== 'object') return null;
+  const response = value as RawCodexRateLimitsResponse;
+  const snapshot = response.rateLimitsByLimitId?.codex ?? response.rateLimits;
+  if (!snapshot || typeof snapshot !== 'object') return null;
+
+  const telemetry: StatusTelemetry = {};
+  for (const window of [snapshot.primary, snapshot.secondary]) {
+    if (!window || typeof window.usedPercent !== 'number' || !Number.isFinite(window.usedPercent)) continue;
+    if (window.windowDurationMins !== 300 && window.windowDurationMins !== 10_080) continue;
+    const resetsAt =
+      typeof window.resetsAt === 'number' && Number.isFinite(window.resetsAt) && window.resetsAt > 0
+        ? Math.round(window.resetsAt * 1000)
+        : 0;
+    const normalized = { usedPercentage: clampPct(window.usedPercent), resetAt: resetsAt };
+    if (window.windowDurationMins === 300) telemetry.fiveHour = normalized;
+    if (window.windowDurationMins === 10_080) telemetry.sevenDay = normalized;
+  }
+
+  return telemetry.fiveHour || telemetry.sevenDay ? telemetry : null;
 }
 
 /**
@@ -131,10 +173,13 @@ export function parseSessionStatus(data: RawStatuslinePayload | undefined): Sess
  * Format the in-terminal statusline footer: the CURRENT SESSION's status —
  * `Opus 4.8 (1M context)  in:562,411 out:1,188  ctx:56%` — NOT the plan limits,
  * which live in the Codeman header chip. Claude requires a statusLine command to
- * emit the rate_limits JSON at all, so this is what that command prints back.
+ * emit the rate_limits JSON at all, so this is what that command prints back
+ * when it has no statusline of the user's own to wrap. With nothing to show it
+ * returns '' rather than a brand word: a bare `codeman` on the statusline is
+ * the symptom discussion #405 opened with.
  */
 export function formatSessionStatusText(s: SessionStatus | null): string {
-  if (!s) return 'codeman';
+  if (!s) return '';
   const groups: string[] = [];
   if (s.modelDisplayName) groups.push(s.modelDisplayName);
   const tok: string[] = [];
@@ -142,7 +187,7 @@ export function formatSessionStatusText(s: SessionStatus | null): string {
   if (s.outputTokens != null) tok.push(`out:${withCommas(s.outputTokens)}`);
   if (tok.length) groups.push(tok.join(' '));
   if (s.contextUsedPercentage != null) groups.push(`ctx:${Math.round(clampPct(s.contextUsedPercentage))}%`);
-  return groups.length ? groups.join('  ') : 'codeman';
+  return groups.length ? groups.join('  ') : '';
 }
 
 /**

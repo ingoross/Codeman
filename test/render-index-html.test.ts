@@ -12,6 +12,73 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
+import { isClaudeAvailable } from '../src/utils/claude-cli-resolver.js';
+import { isOpenCodeAvailable } from '../src/utils/opencode-cli-resolver.js';
+import { isCodexAvailable } from '../src/utils/codex-cli-resolver.js';
+import { isGeminiAvailable } from '../src/utils/gemini-cli-resolver.js';
+import { isAntigravityAvailable } from '../src/utils/antigravity-cli-resolver.js';
+import { isPiAvailable } from '../src/utils/pi-cli-resolver.js';
+import { isGrokAvailable } from '../src/utils/grok-cli-resolver.js';
+import { isDeepSeekAvailable, isDeepSeekRunnable } from '../src/utils/deepseek-cli-resolver.js';
+import { isOmpAvailable } from '../src/utils/omp-cli-resolver.js';
+import { isCloudflaredAvailable } from '../src/utils/cloudflared-resolver.js';
+import { isGitAvailable } from '../src/git-clone.js';
+
+// renderIndexHtml probes the real PATH for every CLI, which would make the
+// assertions below depend on whatever happens to be installed on the machine
+// running the suite. Default them all to "not installed" and opt in per test.
+vi.mock('../src/utils/claude-cli-resolver.js', () => ({
+  isClaudeAvailable: vi.fn(() => false),
+  findClaudeDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/opencode-cli-resolver.js', () => ({
+  isOpenCodeAvailable: vi.fn(() => false),
+  resolveOpenCodeDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/codex-cli-resolver.js', () => ({
+  isCodexAvailable: vi.fn(() => false),
+  resolveCodexDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/gemini-cli-resolver.js', () => ({
+  isGeminiAvailable: vi.fn(() => false),
+  resolveGeminiDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/antigravity-cli-resolver.js', () => ({
+  isAntigravityAvailable: vi.fn(() => false),
+  resolveAntigravityDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/pi-cli-resolver.js', () => ({
+  isPiAvailable: vi.fn(() => false),
+  resolvePiDir: vi.fn(() => null),
+  getPiCliVersion: vi.fn(() => null),
+}));
+vi.mock('../src/utils/grok-cli-resolver.js', () => ({
+  isGrokAvailable: vi.fn(() => false),
+  resolveGrokDir: vi.fn(() => null),
+  getGrokCliVersion: vi.fn(() => null),
+}));
+// DeepSeek is the one mode with a two-part availability answer (binary AND a
+// pane-capable profile), so both probes are mocked independently.
+vi.mock('../src/utils/deepseek-cli-resolver.js', () => ({
+  isDeepSeekAvailable: vi.fn(() => false),
+  isDeepSeekRunnable: vi.fn(() => false),
+  resolveDeepSeekDir: vi.fn(() => null),
+  getDeepSeekCliVersion: vi.fn(() => null),
+  listDeepSeekProfiles: vi.fn(() => []),
+  resolveDefaultDeepSeekProfile: vi.fn(() => null),
+}));
+vi.mock('../src/utils/omp-cli-resolver.js', () => ({
+  isOmpAvailable: vi.fn(() => false),
+  resolveOmpDir: vi.fn(() => null),
+}));
+vi.mock('../src/utils/cloudflared-resolver.js', () => ({
+  isCloudflaredAvailable: vi.fn(() => false),
+  resolveCloudflaredPath: vi.fn(() => null),
+}));
+// git gates the Add Case -> Clone Repo tab (#236), so it rides in the same object.
+vi.mock('../src/git-clone.js', () => ({
+  isGitAvailable: vi.fn(() => false),
+}));
 
 const TEMPLATE = [
   '<head>',
@@ -86,11 +153,117 @@ describe('WebServer.renderIndexHtml', () => {
     expect(html).toContain('gesture-codeman.js');
   });
 
+  it('reports every tool the welcome buttons, run menu and Codex tab gate on', async () => {
+    vi.mocked(isClaudeAvailable).mockReturnValue(true);
+    vi.mocked(isOpenCodeAvailable).mockReturnValue(false);
+    vi.mocked(isCodexAvailable).mockReturnValue(true);
+    vi.mocked(isGeminiAvailable).mockReturnValue(false);
+    vi.mocked(isAntigravityAvailable).mockReturnValue(false);
+    vi.mocked(isPiAvailable).mockReturnValue(true);
+    vi.mocked(isGrokAvailable).mockReturnValue(false);
+    vi.mocked(isDeepSeekAvailable).mockReturnValue(false);
+    vi.mocked(isDeepSeekRunnable).mockReturnValue(false);
+    vi.mocked(isOmpAvailable).mockReturnValue(true);
+    vi.mocked(isCloudflaredAvailable).mockReturnValue(true);
+    vi.mocked(isGitAvailable).mockReturnValue(true);
+    const { server } = makeServer({});
+    const html = await render(server);
+    const flags = JSON.parse(html.match(/window\.__codemanCliAvailable=(\{.*?\});/)![1]);
+    // Every key must be PRESENT, not merely truthy where installed: the client
+    // treats a missing key as available, so a dropped key silently un-gates.
+    expect(flags).toEqual({
+      claude: true,
+      opencode: false,
+      codex: true,
+      gemini: false,
+      antigravity: false,
+      pi: true,
+      grok: false,
+      deepseek: false,
+      deepseekBinary: false,
+      omp: true,
+      cloudflared: true,
+      git: true,
+    });
+  });
+
+  it('still emits the object when nothing at all is installed', async () => {
+    // The all-false case is the one that matters most and the easiest to get
+    // wrong by only injecting when something resolves.
+    for (const probe of [
+      isClaudeAvailable,
+      isOpenCodeAvailable,
+      isCodexAvailable,
+      isGeminiAvailable,
+      isAntigravityAvailable,
+      isPiAvailable,
+      isGrokAvailable,
+      isDeepSeekAvailable,
+      isDeepSeekRunnable,
+      isOmpAvailable,
+      isCloudflaredAvailable,
+      isGitAvailable,
+    ]) {
+      vi.mocked(probe).mockReturnValue(false);
+    }
+    const { server } = makeServer({});
+    const html = await render(server);
+    expect(html).toContain('window.__codemanCliAvailable=');
+    const flags = JSON.parse(html.match(/window\.__codemanCliAvailable=(\{.*?\});/)![1]);
+    expect(Object.values(flags).every((v) => v === false)).toBe(true);
+  });
+
+  it('skips the probe for a solo window, which has no welcome screen or run menu', async () => {
+    vi.mocked(isCodexAvailable).mockReturnValue(true);
+    const { server } = makeServer({});
+    const html = await render(server, 'sess-123');
+    expect(html).not.toContain('__codemanCliAvailable');
+  });
+
   it('does not expose gesture at all when CODEMAN_GESTURE is unset', async () => {
     delete process.env.CODEMAN_GESTURE;
     const { server } = makeServer({ gestureControlEnabled: true });
     const html = await render(server);
     expect(html).not.toContain('__codemanGestureAvailable');
     expect(html).not.toContain('gesture-codeman.js');
+  });
+});
+
+describe('WebServer.renderIndexHtml reverse-proxy base path', () => {
+  const BASE_TEMPLATE = ['<head>', '<base href="/">', '<title>Codeman</title>', '</head>', '<body></body>'].join('\n');
+
+  function makeBaseServer(basePath: string) {
+    // constructor: (port, https, testMode, host, titleHostname, allowUnauth, basePath)
+    const server = new WebServer(0, false, true, '127.0.0.1', undefined, false, basePath);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (server as any).indexHtmlTemplate = BASE_TEMPLATE;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (server as any).readSettings = vi.fn(async () => ({}));
+    return server;
+  }
+
+  it('is inert at root — base tag unchanged and no base global injected', async () => {
+    const server = makeBaseServer('');
+    const html = await render(server);
+    expect(html).toContain('<base href="/">');
+    // At root the frontend reads a MISSING __CODEMAN_BASE__ as root, so nothing is
+    // injected and the historical output is byte-identical.
+    expect(html).not.toContain('__CODEMAN_BASE__');
+  });
+
+  it('points the base tag and the base global at a sub-path mount', async () => {
+    const server = makeBaseServer('/codeman');
+    const html = await render(server);
+    expect(html).toContain('<base href="/codeman/">');
+    expect(html).toContain('window.__CODEMAN_BASE__="/codeman"');
+    // The global rides right after <base>, before any (deferred) script.
+    expect(html.indexOf('window.__CODEMAN_BASE__')).toBeLessThan(html.indexOf('</head>'));
+  });
+
+  it('normalizes a raw operator prefix passed to the constructor', async () => {
+    const server = makeBaseServer('codeman/');
+    const html = await render(server);
+    expect(html).toContain('<base href="/codeman/">');
+    expect(html).toContain('window.__CODEMAN_BASE__="/codeman"');
   });
 });

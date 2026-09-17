@@ -5,27 +5,35 @@
  * and referenced by the frontend (`SSE_EVENTS` in `constants.js`).
  * Both files MUST be kept in sync.
  *
- * 120 event constants organized by category:
+ * 158 event constants organized by category:
  * - **Core** (1): init
- * - **Session lifecycle** (17): created, updated, deleted, terminal, idle, working, ...
+ * - **Transport** (1): sse:heartbeat
+ * - **Session lifecycle** (23): created, updated, deleted, terminal, idle, working, ...
  * - **Session: Ralph** (6): ralphLoopUpdate, todoUpdate, completionDetected, ...
  * - **Session: Bash tools** (3): bashToolStart, bashToolEnd, bashToolsUpdate
  * - **Session: Plan** (4): planTaskUpdate, planCheckpoint, planRollback, planTaskAdded
  * - **Tasks** (4): created, completed, failed, updated
  * - **Mux** (4): created, killed, died, statsUpdated
+ * - **Remote auto-reconnect** (3): sessionDropped, sessionReconnected, reconnectExhausted
  * - **Respawn** (24): stateChanged, cycleStarted/Completed, step*, aiCheck*, planCheck*, timer*, log, ...
  * - **Subagents** (7): discovered, updated, tool_call, tool_result, progress, message, completed
  * - **Workflow runs** (3): run_discovered, run_updated, run_removed (ultracode / Workflow tool)
  * - **Scheduled** (6): created, updated, completed, stopped, log, deleted
+ * - **Cron jobs** (4): jobsChanged, jobDeleted, runCreated, runUpdated
  * - **Teams** (4): created, updated, removed, taskUpdated
  * - **Transcript** (4): complete, plan_mode, tool_start, tool_end
  * - **Plan orchestration** (5): started, progress, subagent, completed, cancelled
  * - **Tunnel** (7): started, stopped, progress, error, qrRotated, qrRegenerated, qrAuthUsed
- * - **Image** (1): detected
- * - **Hooks** (6): idle_prompt, permission_prompt, elicitation_dialog, stop, teammate_idle, task_completed
+ * - **Image / attachments** (2): image:detected, attachment:detected
+ * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
+ *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook)
+ * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
  * - **Orchestrator** (12): stateChanged, planProgress, planReady, phase*, verification, task*, completed, error
  * - **Clipboard** (1): write
  * - **Cases** (4): created, linked, deleted, order-changed
+ * - **Docker cases** (8): exportComplete/Failed, importComplete, imageBuild*, containerRecreated
+ * - **Multi-user** (3): admin:usersChanged, auth:passwordChangeRequired, session:orderChanged
+ * - **Web tabs** (2): webview:changed, tab:layoutChanged
  *
  * Naming convention: `domain:action` (e.g., `session:created`, `respawn:stateChanged`)
  *
@@ -45,6 +53,22 @@
 
 /** Sent to each SSE client on initial connection with full app state. */
 export const Init = 'init' as const;
+
+// ─── Transport ───────────────────────────────────────────────────────────────
+
+/**
+ * Liveness frame written to every SSE client every `SSE_HEARTBEAT_INTERVAL`.
+ * Payload: `{ t: <epoch ms> }`.
+ *
+ * Carries no application data; its only job is to be *observable*. This was a
+ * `:keepalive` SSE **comment**, and comments are invisible to `EventSource` by
+ * spec, so a stream that stopped delivering without erroring (a proxy that
+ * idle-closed it, a laptop resumed from sleep, a tailnet reconnect) was
+ * undetectable to the client: `onerror` never fires and the UI freezes until a
+ * reload. A named event reaches a listener, which is what lets the client's
+ * staleness watchdog notice the silence and force a reconnect.
+ */
+export const Heartbeat = 'sse:heartbeat' as const;
 
 // ─── Session Lifecycle ───────────────────────────────────────────────────────
 
@@ -80,15 +104,19 @@ export const SessionLimitPauseScheduled = 'session:limitPauseScheduled' as const
 export const SessionLimitResume = 'session:limitResume' as const;
 /** Pending usage-limit auto-resume cancelled (session resumed or feature disabled). */
 export const SessionLimitResumeCancelled = 'session:limitResumeCancelled' as const;
+/** Interactive-PTY exit circuit breaker tripped (COD-118): repeated non-zero exits; respawn blocked, session errored. */
+export const SessionRespawnBreakerTripped = 'session:respawnBreakerTripped' as const;
 /** CLI version/model info detected from session output. */
 export const SessionCliInfo = 'session:cliInfo' as const;
+/** Session pin state changed (COD-139): pinned/unpinned in the session manager list. */
+export const SessionPinned = 'session:pinned' as const;
 /** General session message (e.g. status text). */
 export const SessionMessage = 'session:message' as const;
 /** Session entered interactive mode (claude or shell). */
 export const SessionInteractive = 'session:interactive' as const;
 /** Prompt sent to session for execution. */
 export const SessionRunning = 'session:running' as const;
-/** Claude plan-usage telemetry (5-hour + weekly limits) parsed from the statusline. */
+/** Combined Claude and main Codex plan-usage telemetry for the shared header chip. */
 export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 
 // ─── Session: Ralph ──────────────────────────────────────────────────────────
@@ -147,6 +175,15 @@ export const MuxKilled = 'mux:killed' as const;
 export const MuxDied = 'mux:died' as const;
 /** tmux session stats refreshed. */
 export const MuxStatsUpdated = 'mux:statsUpdated' as const;
+
+// ─── Remote auto-reconnect (COD-108) ─────────────────────────────────────────
+
+/** A remote session's local ssh pane died; an auto-reconnect attempt is starting. */
+export const RemoteSessionDropped = 'remote:sessionDropped' as const;
+/** A dropped remote session was successfully re-established (reattached). */
+export const RemoteSessionReconnected = 'remote:sessionReconnected' as const;
+/** Auto-reconnect gave up after the bounded backoff cap — manual reconnect needed. */
+export const RemoteReconnectExhausted = 'remote:reconnectExhausted' as const;
 
 // ─── Respawn ─────────────────────────────────────────────────────────────────
 
@@ -240,6 +277,17 @@ export const ScheduledLog = 'scheduled:log' as const;
 /** Scheduled run deleted. */
 export const ScheduledDeleted = 'scheduled:deleted' as const;
 
+// ─── Cron Jobs ───────────────────────────────────
+
+/** The scheduled-jobs list changed (created/updated/enabled/run-status). Payload: { jobs }. */
+export const CronJobsChanged = 'cron:jobsChanged' as const;
+/** A scheduled job was deleted. Payload: { id }. */
+export const CronJobDeleted = 'cron:jobDeleted' as const;
+/** A scheduled-job run (history record) was created. Payload: CronJobRun. */
+export const CronRunCreated = 'cron:runCreated' as const;
+/** A scheduled-job run (history record) was updated. Payload: CronJobRun. */
+export const CronRunUpdated = 'cron:runUpdated' as const;
+
 // ─── Teams ───────────────────────────────────────────────────────────────────
 
 /** Agent team created. */
@@ -307,12 +355,34 @@ export const HookIdlePrompt = 'hook:idle_prompt' as const;
 export const HookPermissionPrompt = 'hook:permission_prompt' as const;
 /** Claude Code hook: elicitation dialog (Claude asking a question). */
 export const HookElicitationDialog = 'hook:elicitation_dialog' as const;
+/** Claude Code hook: elicitation dialog closed (question answered in the terminal). */
+export const HookElicitationComplete = 'hook:elicitation_complete' as const;
+/** Claude Code hook: elicitation answer submitted. */
+export const HookElicitationResponse = 'hook:elicitation_response' as const;
 /** Claude Code hook: response complete. */
 export const HookStop = 'hook:stop' as const;
+/**
+ * Agent started a turn. NOT a Claude Code hook: this one is reported by the
+ * DeepSeek Harness status bridge, which is why the name is agent-generic. It
+ * exists so a dialog answered in the terminal clears its alert immediately
+ * instead of waiting for the turn to end.
+ */
+export const HookAgentWorking = 'hook:agent_working' as const;
 /** Claude Code hook: teammate went idle. */
 export const HookTeammateIdle = 'hook:teammate_idle' as const;
 /** Claude Code hook: teammate task completed. */
 export const HookTaskCompleted = 'hook:task_completed' as const;
+/** UserPromptSubmit fired in a Claude pane (#367): the pane learned its live conversation id first-hand. */
+export const HookPromptSubmitted = 'hook:prompt_submitted' as const;
+
+// ─── Approvals Inbox ─────────────────────────────────────────────────────────
+
+/** A prompt is waiting on a human (permission dialog, question, idle prompt). */
+export const ApprovalPending = 'approval:pending' as const;
+/** A pending approval's captured context/options were refreshed. */
+export const ApprovalUpdated = 'approval:updated' as const;
+/** A pending approval left the inbox (answered, superseded, expired, ...). */
+export const ApprovalResolved = 'approval:resolved' as const;
 
 // ─── Orchestrator ────────────────────────────────────────────────────────────
 
@@ -357,6 +427,41 @@ export const CaseDeleted = 'case:deleted' as const;
 /** Case ordering changed. */
 export const CaseOrderChanged = 'case:order-changed' as const;
 
+// ─── Docker cases ────────────────────────────────────────────────────────────
+/** A docker case export bundle finished writing. */
+export const DockerExportComplete = 'docker:exportComplete' as const;
+/** A docker case export failed. */
+export const DockerExportFailed = 'docker:exportFailed' as const;
+/** A docker bundle was imported into a new case. */
+export const DockerImportComplete = 'docker:importComplete' as const;
+/** The agent base image started building (first Docker case; auto-build on first use). */
+export const DockerImageBuildStarted = 'docker:imageBuildStarted' as const;
+/** A line of agent base-image build output (progress surfacing). */
+export const DockerImageBuildProgress = 'docker:imageBuildProgress' as const;
+/** The agent base image finished building successfully. */
+export const DockerImageBuildComplete = 'docker:imageBuildComplete' as const;
+/** The agent base image build failed. */
+export const DockerImageBuildFailed = 'docker:imageBuildFailed' as const;
+/** A case container was removed after a config-drift confirm (recreated with the new config on next launch). */
+export const DockerContainerRecreated = 'docker:containerRecreated' as const;
+
+// ─── Multi-user (admin-only / targeted) ──────────────────────────────────────
+
+/** The user roster changed (admin-only); the Users panel re-fetches. */
+export const AdminUsersChanged = 'admin:usersChanged' as const;
+/** A user must change their password (targeted); the frontend shows the modal. */
+export const AuthPasswordChangeRequired = 'auth:passwordChangeRequired' as const;
+
+/** Global session tab order changed (synced across devices). COD-131. */
+export const SessionOrderChanged = 'session:orderChanged' as const;
+
+/** A saved web tab (dashboard URL) was created, updated or deleted.
+ *  Payload: `{ action: 'created' | 'updated' | 'deleted', id }`. The client
+ *  re-fetches the list rather than patching from the payload. */
+export const WebviewChanged = 'webview:changed' as const;
+/** Owner-scoped layout invalidation. Payload contains only `{ owner, version }`. */
+export const TabLayoutChanged = 'tab:layoutChanged' as const;
+
 // ─── Namespace Re-export ─────────────────────────────────────────────────────
 
 /**
@@ -366,6 +471,9 @@ export const CaseOrderChanged = 'case:order-changed' as const;
 export const SseEvent = {
   // Core
   Init,
+
+  // Transport
+  Heartbeat,
 
   // Session lifecycle
   SessionCreated,
@@ -384,7 +492,9 @@ export const SseEvent = {
   SessionLimitPauseScheduled,
   SessionLimitResume,
   SessionLimitResumeCancelled,
+  SessionRespawnBreakerTripped,
   SessionCliInfo,
+  SessionPinned,
   SessionMessage,
   SessionInteractive,
   SessionRunning,
@@ -420,6 +530,11 @@ export const SseEvent = {
   MuxKilled,
   MuxDied,
   MuxStatsUpdated,
+
+  // Remote auto-reconnect (COD-108)
+  RemoteSessionDropped,
+  RemoteSessionReconnected,
+  RemoteReconnectExhausted,
 
   // Respawn
   RespawnStarted,
@@ -469,6 +584,12 @@ export const SseEvent = {
   ScheduledLog,
   ScheduledDeleted,
 
+  // Cron jobs
+  CronJobsChanged,
+  CronJobDeleted,
+  CronRunCreated,
+  CronRunUpdated,
+
   // Teams
   TeamCreated,
   TeamUpdated,
@@ -505,9 +626,17 @@ export const SseEvent = {
   HookIdlePrompt,
   HookPermissionPrompt,
   HookElicitationDialog,
+  HookElicitationComplete,
+  HookElicitationResponse,
   HookStop,
+  HookAgentWorking,
   HookTeammateIdle,
   HookTaskCompleted,
+
+  // Approvals Inbox
+  ApprovalPending,
+  ApprovalUpdated,
+  ApprovalResolved,
 
   // Orchestrator
   OrchestratorStateChanged,
@@ -531,4 +660,23 @@ export const SseEvent = {
   CaseLinked,
   CaseDeleted,
   CaseOrderChanged,
+
+  // Docker cases
+  DockerExportComplete,
+  DockerExportFailed,
+  DockerImportComplete,
+  DockerImageBuildStarted,
+  DockerImageBuildProgress,
+  DockerImageBuildComplete,
+  DockerImageBuildFailed,
+  AdminUsersChanged,
+  AuthPasswordChangeRequired,
+  DockerContainerRecreated,
+
+  // Session order (global tab order sync)
+  SessionOrderChanged,
+
+  // Web tabs (dashboard URLs)
+  WebviewChanged,
+  TabLayoutChanged,
 } as const;

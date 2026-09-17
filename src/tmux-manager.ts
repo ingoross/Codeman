@@ -22,14 +22,22 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { execSync, exec } from 'node:child_process';
+import { collectDescendants } from './proc-tree.js';
+import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { dataPath, DEFAULT_TMUX_SOCKET } from './config/instance.js';
+import { homedir } from 'node:os';
+import {
+  dataPath,
+  DEFAULT_TMUX_SOCKET,
+  CODEMAN_INSTANCE,
+  SAFE_TMUX_SOCKET_PATTERN,
+  resolveTmuxSocketName,
+} from './config/instance.js';
 import {
   ProcessStats,
   PersistedRespawnConfig,
@@ -41,22 +49,92 @@ import {
   type OpenCodeConfig,
   type CodexConfig,
   type EffortLevel,
+  type GeminiConfig,
+  type AntigravityConfig,
+  type PiConfig,
+  type GrokConfig,
+  type DeepSeekConfig,
+  type OmpConfig,
+  type SessionRemote,
+  type SessionDocker,
+  type DockerCommandMode,
 } from './types.js';
-import { buildEffortCliArgs } from './session-cli-builder.js';
-import { wrapWithNice, SAFE_PATH_PATTERN, findClaudeDir, resolveOpenCodeDir, resolveCodexDir } from './utils/index.js';
+import { getCli } from './config/cli-registry/registry.js';
+import { missingCliMessage, resolveCliBinDir } from './utils/cli-resolver.js';
+import {
+  buildSpawnCommandFromRegistry,
+  configSetenvValues,
+  legacyConfigForMode,
+} from './session-cli-registry-bridge.js';
+import type { CliEntry } from './config/cli-registry/types.js';
+import {
+  resolveStatusLineCliCommand,
+  readPlanUsageTelemetryEnabled,
+  findEffectiveUserStatusLineCommand,
+} from './hooks-config.js';
+import {
+  buildSshConnectionArgs,
+  defaultRemoteCommandForMode,
+  remoteLoginShellCommand,
+  remoteSshTarget,
+  remoteTmuxSessionAlive,
+} from './remote-hosts.js';
+import {
+  buildDockerBaseArgs,
+  buildDockerCreateArgs,
+  containerApiUrl,
+  CONTAINER_HOME,
+  defaultDockerCommandForMode,
+  hostGatewayAlias,
+  resolveDockerClaudeArtifacts,
+  resolveDockerCredentialArtifacts,
+  resolveDockerDaemonMountSource,
+  type DockerCreateContext,
+  type DockerMount,
+  type DockerSeedCopy,
+} from './docker-hosts.js';
+import { wrapWithNice, SAFE_PATH_PATTERN, resolveLocalShell, loginShellArgs } from './utils/index.js';
 import type {
   TerminalMultiplexer,
   MuxSession,
   MuxSessionWithStats,
   CreateSessionOptions,
   RespawnPaneOptions,
+  PaneCaptureOptions,
 } from './mux-interface.js';
+import {
+  decideReconnect,
+  advanceBackoff,
+  freshReconnectState,
+  resetReconnectState,
+  type RemoteReconnectState,
+} from './remote-reconnect.js';
 
 // ============================================================================
 // Timing Constants
 // ============================================================================
 
 import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
+import { ensureDeepSeekStatusShim } from './deepseek-status-shim.js';
+
+/** How long a cached process snapshot stays usable. */
+const PROC_SNAPSHOT_TTL_MS = 2000;
+
+/**
+ * How long the kill path waits for a fresh snapshot before giving up on it.
+ * Shorter than EXEC_TIMEOUT_MS on purpose: killSession has two further strategies
+ * (process group, tmux kill-session) and must reach them even when `ps` is wedged.
+ */
+const PROC_SNAPSHOT_WAIT_MS = 1500;
+import { DEFAULT_TMUX_HISTORY_LIMIT, DEFAULT_TERMINAL_BUFFER_MAX_BYTES } from './config/terminal-history.js';
+
+/**
+ * Extra stdout headroom for the full-history `capture-pane` child process on
+ * top of the consumer's byte cap: raw scrollback carries per-line SGR/ANSI
+ * overhead that the route pipeline strips before applying its cap, so the
+ * capture must be allowed to exceed the final payload size.
+ */
+const FULL_HISTORY_CAPTURE_SLACK_BYTES = 8 * 1024 * 1024;
 
 /** Delay after tmux session creation — enough for detached tmux to be queryable */
 const TMUX_CREATION_WAIT_MS = 100;
@@ -73,6 +151,9 @@ const GRACEFUL_SHUTDOWN_WAIT_MS = 100;
 
 /** Default stats collection interval (2 seconds) */
 const DEFAULT_STATS_INTERVAL_MS = 2000;
+
+/** Default remote-reconnect watcher poll interval (5 seconds) — COD-108 */
+const DEFAULT_REMOTE_RECONNECT_INTERVAL_MS = 5000;
 
 /** Stable cwd for tmux server/pane launch; actual session cwd is reached inside the pane. */
 const TMUX_LAUNCH_CWD = '/tmp';
@@ -98,6 +179,20 @@ const IS_TEST_MODE = !!process.env.VITEST;
 /** Path to persisted mux session metadata */
 const MUX_SESSIONS_FILE = dataPath('mux-sessions.json');
 
+/**
+ * COD-108 kill-switch: `remoteAutoReconnect` app setting (default ON). Read at
+ * call time (like headroom routing) so a settings change takes effect without a
+ * restart. Absent/non-boolean ⇒ true (feature on).
+ */
+function isRemoteAutoReconnectEnabled(): boolean {
+  try {
+    const s = JSON.parse(readFileSync(dataPath('settings.json'), 'utf8')) as Record<string, unknown>;
+    return typeof s.remoteAutoReconnect === 'boolean' ? s.remoteAutoReconnect : true;
+  } catch {
+    return true;
+  }
+}
+
 /** Regex to validate tmux session names (only allow safe characters) */
 const SAFE_MUX_NAME_PATTERN = /^codeman-[a-f0-9-]+$/;
 
@@ -110,9 +205,6 @@ const SAFE_PANE_TARGET_PATTERN = /^(%\d+|\d+)$/;
 /** Dedicated tmux socket for new Codeman-owned sessions (instance-scoped:
  *  `codeman` for prod, `codeman-beta` on the beta branch). */
 const DEFAULT_CODEMAN_TMUX_SOCKET = DEFAULT_TMUX_SOCKET;
-
-/** Regex to validate tmux socket names passed to `tmux -L`. */
-const SAFE_TMUX_SOCKET_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 /**
  * Separator used in `tmux list-panes -F` output between session name and pid.
@@ -421,6 +513,93 @@ function truncatePaneLineByVisibleColumns(line: string, maxColumns: number): str
   return result;
 }
 
+/**
+ * Normalize scrollback line endings to `\r\n` so a fresh xterm replays each line
+ * at column 0 (COD-138).
+ *
+ * `capture-pane -p -e -S -` (full-history capture) joins scrollback rows with a
+ * BARE `\n`. The browser xterm is created with the default `convertEol: false`
+ * (correct for the live PTY stream, which already carries real `\r\n`), so a bare
+ * `\n` drops a row without returning the cursor to column 0. Replaying that raw
+ * buffer on a full page reload makes every line start one column further right —
+ * the diagonal "staircase". The visible/tab-switch path avoids this by repainting
+ * each row with an absolute cursor CSI (`formatPaneSnapshot`); the full-history
+ * path returns raw scrollback, so it must be CRLF-normalized here.
+ *
+ * `\r?\n → \r\n` is idempotent on already-CRLF input and leaves a lone `\r` (an
+ * intentional in-line column reset / overwrite) untouched.
+ */
+export function normalizeScrollbackEol(buffer: string): string {
+  return buffer.replace(/\r?\n/g, '\r\n');
+}
+
+/** Pane geometry and caret position, as `display-message` reports them. */
+interface PaneCursorGeometry {
+  cols: number;
+  rows: number;
+  cursorX: number;
+  cursorY: number;
+}
+
+/**
+ * Read the pane's cursor and size, or null when tmux cannot say.
+ *
+ * Every field is validated together: a caller that gets a value back can place
+ * a caret with it, and one that gets null must not try.
+ */
+export function queryPaneCursor(run: () => string): PaneCursorGeometry | null {
+  let raw: string;
+  try {
+    raw = run().trim();
+  } catch (cursorErr) {
+    console.error('[TmuxManager] Failed to query pane cursor after capture:', cursorErr);
+    return null;
+  }
+  const [cursorX, cursorY, cols, rows] = raw.split(/\s+/).map((value) => parseInt(value, 10));
+  if (
+    !Number.isFinite(cursorX) ||
+    !Number.isFinite(cursorY) ||
+    !Number.isFinite(cols) ||
+    !Number.isFinite(rows) ||
+    cursorX < 0 ||
+    cursorY < 0 ||
+    cols <= 0 ||
+    rows <= 0
+  ) {
+    return null;
+  }
+  return { cols, rows, cursorX, cursorY };
+}
+
+/** SGR attributes, which is all `capture-pane -e` emits. */
+// eslint-disable-next-line no-control-regex
+const CAPTURE_STYLE_SEQUENCE = /\x1b\[[0-9;:]*m/g;
+
+/** Whether a capture holds anything a reader would see, styles discounted. */
+export function hasVisibleContent(capture: string): boolean {
+  return /\S/.test(capture.replace(CAPTURE_STYLE_SEQUENCE, ''));
+}
+
+/**
+ * Put the caret back where the pane has it, counting UP from the bottom of what
+ * was just replayed.
+ *
+ * Relative rather than absolute (`CUP`) on purpose. `\x1b[<row>;<col>H` numbers
+ * rows from the top of the browser's screen, so it only lands correctly while
+ * the browser's row count equals the pane's — and it need not, because
+ * `resizeWindow` fires its tmux resize without waiting, so a capture can be
+ * taken before a requested resize has been applied. Counting up from the last
+ * replayed row is anchored to the content instead, which is the thing both ends
+ * genuinely share.
+ */
+export function formatCursorRestore(geometry: PaneCursorGeometry): string {
+  const up = Math.max(0, geometry.rows - 1 - geometry.cursorY);
+  const right = Math.max(0, geometry.cursorX);
+  // `\r` first so the column is known: the replay leaves the caret wherever the
+  // last row's text ended.
+  return `${up > 0 ? `\x1b[${up}A` : ''}\r${right > 0 ? `\x1b[${right}C` : ''}`;
+}
+
 export function formatPaneSnapshot(
   lines: string[],
   geometry: { cols: number; rows: number; cursorX: number; cursorY: number }
@@ -488,9 +667,8 @@ function resolveConfiguredTmuxSocket(): string {
   const raw = process.env.CODEMAN_TMUX_SOCKET ?? DEFAULT_CODEMAN_TMUX_SOCKET;
   if (!SAFE_TMUX_SOCKET_PATTERN.test(raw)) {
     console.warn(`[TmuxManager] Ignoring invalid CODEMAN_TMUX_SOCKET: ${JSON.stringify(raw)}`);
-    return DEFAULT_CODEMAN_TMUX_SOCKET;
   }
-  return raw;
+  return resolveTmuxSocketName();
 }
 
 /** Build the `tmux -L <socket>` command prefix. Socket name is shell-escaped. */
@@ -507,6 +685,8 @@ function buildClaudePermissionFlags(claudeMode?: ClaudeMode, allowedTools?: stri
   switch (mode) {
     case 'dangerously-skip-permissions':
       return ' --dangerously-skip-permissions';
+    case 'auto':
+      return ' --permission-mode auto';
     case 'allowedTools':
       if (allowedTools) {
         // Sanitize: allow tool names with patterns like Bash(git:*), space/comma-separated
@@ -524,72 +704,20 @@ function buildClaudePermissionFlags(claudeMode?: ClaudeMode, allowedTools?: stri
 }
 
 /**
- * Build the opencode CLI command with appropriate flags.
- */
-function buildOpenCodeCommand(config?: OpenCodeConfig): string {
-  const parts = ['opencode'];
-
-  // Model selection — allow provider/model format (alphanumeric, dots, hyphens, slashes)
-  if (config?.model) {
-    const safeModel = /^[a-zA-Z0-9._\-/]+$/.test(config.model) ? config.model : undefined;
-    if (safeModel) parts.push('--model', safeModel);
-  }
-
-  // Continue existing session
-  if (config?.continueSession) {
-    const safeId = /^[a-zA-Z0-9_-]+$/.test(config.continueSession) ? config.continueSession : undefined;
-    if (safeId) parts.push('--session', safeId);
-    if (safeId && config.forkSession) parts.push('--fork');
-  }
-
-  return parts.join(' ');
-}
-
-/**
- * Build the codex CLI command with appropriate flags.
+ * Build the codex CLI command.
  *
- * Codeman launches Codex's native TUI and handles replay/scrollback by
- * stripping destructive terminal sequences before xterm.js sees them.
+ * Kept as a named wrapper purely because callers (and `test/tmux-manager.test.ts`) reach for
+ * it directly; the command itself is registry data now, like every other CLI's. The `??`
+ * fallback covers a registry in which codex has been disabled or removed — this function
+ * promises a string, so it degrades to the bare binary rather than throwing.
  */
 export function buildCodexCommand(config?: CodexConfig): string {
-  const parts = ['codex'];
-
-  if (config?.dangerouslyBypassApprovals) {
-    parts.push('--dangerously-bypass-approvals-and-sandbox');
-  }
-
-  if (config?.model) {
-    const safeModel = /^[a-zA-Z0-9._\-/]+$/.test(config.model) ? config.model : undefined;
-    if (safeModel) parts.push('--model', safeModel);
-  }
-
-  if (config?.resumeSessionId) {
-    const safeId = /^[a-zA-Z0-9_-]+$/.test(config.resumeSessionId) ? config.resumeSessionId : undefined;
-    if (safeId) parts.push('resume', safeId);
-  }
-
-  return parts.join(' ');
+  const entry = getCli('codex');
+  if (!entry) return 'codex';
+  return buildSpawnCommandFromRegistry(entry, { mode: 'codex', sessionId: '', codexConfig: config }) ?? 'codex';
 }
 
-/**
- * Build the spawn command for any session mode.
- * Shared by createSession() and respawnPane() to avoid duplication.
- */
-/**
- * Build the shell fragment carrying the effort level as a SOFT default
- * (see buildEffortCliArgs — `--effort <level>` for regular levels incl. max,
- * `--settings '{"ultracode":true}'` for ultracode; deliberately not the
- * CLAUDE_CODE_EFFORT_LEVEL env var, which hard-locks /effort switching).
- *
- * Injection-safe: effort is validated against the EFFORT_LEVELS allowlist inside
- * buildEffortCliArgs, so the single-quoted values contain no user-controlled characters.
- */
-function buildEffortSettingsFlag(effort?: EffortLevel): string {
-  const [flag, value] = buildEffortCliArgs(effort);
-  return flag && value ? ` ${flag} '${value}'` : '';
-}
-
-function buildSpawnCommand(options: {
+export function buildSpawnCommand(options: {
   mode: SessionMode;
   sessionId: string;
   model?: string;
@@ -597,88 +725,751 @@ function buildSpawnCommand(options: {
   allowedTools?: string;
   openCodeConfig?: OpenCodeConfig;
   codexConfig?: CodexConfig;
+  geminiConfig?: GeminiConfig;
+  antigravityConfig?: AntigravityConfig;
+  piConfig?: PiConfig;
+  grokConfig?: GrokConfig;
+  deepSeekConfig?: DeepSeekConfig;
+  ompConfig?: OmpConfig;
   resumeSessionId?: string;
   effort?: EffortLevel;
+  /** Resolved by resolveStatusLineCliCommand (hooks-config.ts) — undefined skips the exporter. Claude only. */
+  statusLineCommand?: string;
+  /** Codeman session name, passed to claude as `--name` (version-gated, sanitized; local spawns only). */
+  sessionName?: string;
+  /**
+   * Claude CLI version for the `--name` gate. Omitted = probe the local CLI
+   * (getClaudeCliVersion; null under vitest). Tests inject a value here; the
+   * docker/remote paths never see this builder's output, which is what keeps the
+   * gate measuring the RIGHT binary, the local one.
+   */
+  claudeCliVersion?: string | null;
 }): string {
-  if (options.mode === 'claude') {
-    // Validate model to prevent command injection
-    const safeModel = options.model && /^[a-zA-Z0-9._\-[\]]+$/.test(options.model) ? options.model : undefined;
-    const modelFlag = safeModel ? ` --model "${safeModel}"` : '';
-    const effortFlag = buildEffortSettingsFlag(options.effort);
-    // Use --resume to restore a previous conversation, otherwise --session-id for new sessions.
-    // Wrap --resume in a fallback: if it exits non-zero (session not found, corrupt, etc.),
-    // fall back to a new session with --session-id so the pane doesn't die.
-    const safeResumeId =
-      options.resumeSessionId && /^[a-f0-9-]+$/.test(options.resumeSessionId) ? options.resumeSessionId : undefined;
-    const permFlags = buildClaudePermissionFlags(options.claudeMode, options.allowedTools);
-    if (safeResumeId) {
-      const resumeCmd = `claude${permFlags} --resume "${safeResumeId}"${modelFlag}${effortFlag}`;
-      const fallbackCmd = `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}${effortFlag}`;
-      return `${resumeCmd} || ${fallbackCmd}`;
-    }
-    return `claude${permFlags} --session-id "${options.sessionId}"${modelFlag}${effortFlag}`;
+  // Every CLI's command shape is registry DATA, rendered by the argv engine — see
+  // config/cli-registry/argv.ts for why config can never contain shell text. A `shell`-kind
+  // entry (or an unregistered mode) renders `undefined` and falls through to the local
+  // login-shell resolution below, which cannot be templated because it varies per user.
+  const entry = getCli(options.mode);
+  if (entry) {
+    const rendered = buildSpawnCommandFromRegistry(entry, options);
+    if (rendered !== undefined) return rendered;
   }
-  if (options.mode === 'opencode') {
-    return buildOpenCodeCommand(options.openCodeConfig);
-  }
-  if (options.mode === 'codex') {
-    return buildCodexCommand(options.codexConfig);
-  }
-  return '$SHELL';
+  // #208: NOT the literal '$SHELL'. This string is embedded in the `bash -c "…"`
+  // argument of the respawn-pane line, which execSync runs through `/bin/sh -c`,
+  // so a `$SHELL` here is expanded by the SERVER process's shell against the
+  // SERVER process's env — empty in containers and system systemd units, leaving
+  // the pane command ending in a dangling `&&` ("syntax error: unexpected end of
+  // file", pane dead on arrival). Resolve it in Node and quote the result.
+  // #209: launch it as a LOGIN shell, which is what tmux itself does for a pane
+  // with no `default-command`, so a Codeman shell tab matches a hand-started tmux
+  // one. That is what picks up /etc/profile and /etc/profile.d/* — a systemd
+  // --user service never sourced them, so its PATH is what every pane inherited.
+  // The flags come from loginShellArgs() rather than being hardcoded: they are
+  // appended to a path that ultimately comes from the passwd entry, and a shell
+  // that rejects an unknown flag exits on the spot, which is #208 all over again.
+  const shell = resolveLocalShell();
+  return `${shellescape(shell)}${loginShellArgs(shell)}`;
 }
 
 /**
- * Set sensitive environment variables on a tmux session via setenv.
- * These are inherited by panes but not visible in ps output or tmux history.
+ * Dedicated socket for Codeman-launched REMOTE tmux servers, distinct from the
+ * canonical local `-L codeman` socket. A remote host that runs its OWN Codeman
+ * would otherwise share the `-L codeman` socket AND the `codeman-<hex>` discovery
+ * name, so its `reconcileSessions()` would ADOPT our session (attach a PTY,
+ * resize, respawn-pane it locally) — the cross-machine form of the "2nd instance
+ * attaches live sessions" hazard. A private socket keeps our remote sessions off
+ * that instance's radar entirely.
  */
-function setOpenCodeEnvVars(tmuxCmd: string, muxName: string): void {
-  const sensitiveVars = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_API_KEY'];
-  for (const key of sensitiveVars) {
+const REMOTE_TMUX_SOCKET = 'codeman-remote';
+
+/**
+ * Deterministic, reattach-stable remote tmux session name for a Codeman session.
+ *
+ * Derived from the same stable field the LOCAL muxName uses (the first 8 chars of
+ * the sessionId), so reconnecting (which re-issues the exact same
+ * `ssh … new-session -A`) lands back in the SAME remote session. Must NOT be
+ * random/time-based — it has to be stable across reconnects.
+ *
+ * The `codeman-ssh-` prefix is deliberately chosen to FAIL a remote Codeman's
+ * `SAFE_MUX_NAME_PATTERN` (`^codeman-[a-f0-9-]+$`) — the `s`/`h` letters mean a
+ * remote instance's discovery never treats this as one of its own sessions (belt
+ * to the dedicated-socket suspenders above).
+ */
+export function remoteTmuxSessionName(sessionId: string): string {
+  return `codeman-ssh-${sessionId.slice(0, 8)}`;
+}
+
+/**
+ * COD-104 — build the SSH command that launches (or reattaches) a remote
+ * session INSIDE a tmux server on the remote host, so the remote agent survives
+ * an SSH drop.
+ *
+ * Emits:
+ *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
+ *     'tmux -L codeman-remote new-session -A -s codeman-ssh-<id> -c <path> "cd <path> && exec <cli>" \
+ *        \; set -t codeman-ssh-<id> status off \; set -t codeman-ssh-<id> mouse off \
+ *        \; set -t codeman-ssh-<id> prefix C-q \; set -s escape-time 0'
+ *
+ * COD-107 — the connection options (`-p`, `-i`, `-J`, SOCKS `-o ProxyCommand`,
+ * arbitrary `-o`) come from the shared `buildSshConnectionArgs(remote)`, so the
+ * prereq tmux probe and this launch connect with identical options.
+ *
+ * - `new-session -A -s codeman-ssh-<id>` = attach-if-exists-else-create
+ *   (idempotent), so reconnect re-runs the same command and reattaches the
+ *   still-running agent.
+ * - `-L codeman-remote` = a DEDICATED socket, NOT the canonical `-L codeman` a
+ *   remote Codeman would use, so our session never collides with / gets adopted by
+ *   an instance running on the remote host.
+ * - The `set` options are scoped per-session (`set -t <name>` / server-level
+ *   `set -s`), never `-g`, so they never mutate other sessions' prefix/mouse.
+ * - The whole tmux invocation is a SINGLE ssh argument (the remote login shell
+ *   runs it), so it is shell-quoted as one unit; the `cd && exec` command is in
+ *   turn a single tmux argument (tmux runs it via `/bin/sh -c`), so the path is
+ *   shell-quoted inside it too. This keeps escaping correct through every layer
+ *   even when the remote path contains spaces.
+ */
+export function buildRemoteLaunchCommand(options: {
+  mode: SessionMode;
+  remote: SessionRemote;
+  sessionId: string;
+  claudeMode?: ClaudeMode;
+  allowedTools?: string;
+  /** OMP only — resume/continue overrides for the remote omp relaunch (dead-pane respawn). */
+  ompConfig?: OmpConfig;
+  resumeSessionId?: string;
+}): string {
+  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId } = options;
+  // §6.3: honor the session's EFFECTIVE claude permission mode on remote instead of
+  // hardcoding --dangerously-skip-permissions, so a non-granted multi-user user's
+  // downgraded 'auto' actually reaches the remote agent (the default command otherwise
+  // ignored claudeMode). A per-host `commands.claude` override stays authoritative
+  // (admin's explicit choice). Wrapped in `$SHELL -i -l -c` for the same reason as
+  // `defaultRemoteCommandForMode`: `claude` lives under a per-user PATH entry that
+  // only an interactive login shell resolves (see that function's comment).
+  const override = remote.commands?.[mode];
+  let modeCommand: string;
+  if (override) {
+    modeCommand = override;
+  } else if (mode === 'claude') {
+    // Deterministic conversation pinning for SSH-remote claude (mirrors the
+    // docker-claude shape in claudeDockerPaneCommand, INCLUDING the distinct
+    // resumeId branch it declares — this used to only mirror the same-id
+    // fallback shape, silently dropping an explicit resumeSessionId that
+    // differs from sessionId, e.g. a resume-from-history launch): the FIRST
+    // run creates the conversation under --session-id <sessionId>; a respawn
+    // / reattach re-runs the same idempotent command, --session-id exits
+    // non-zero ("already in use"), and the `||` fallback RESUMES that same
+    // conversation. Without a pinned id, every reattach relaunched a bare
+    // `claude` and started a NEW conversation (found live 2026-08-29: remote
+    // claude ctrl-d / ctrl-c relaunched a fresh session). A per-host
+    // `commands.claude` override stays authoritative (admin's explicit
+    // choice) and skips this entirely.
+    const permFlags = buildClaudePermissionFlags(claudeMode, allowedTools);
+    const cmd = `claude${permFlags}`;
+    // Defense in depth, mirroring claudeDockerPaneCommand's own belt-and-braces check:
+    // sessionId is server-minted and always safe in practice, but this command is built
+    // as a single shellescaped string and then executed as shell code on the remote
+    // host, so an unsafe value here is validated rather than trusted.
+    if (!RESUME_ID_SAFE.test(sessionId)) {
+      modeCommand = remoteLoginShellCommand(cmd);
+    } else {
+      const rid = resumeSessionId && RESUME_ID_SAFE.test(resumeSessionId) ? resumeSessionId : undefined;
+      modeCommand = remoteLoginShellCommand(
+        rid && rid !== sessionId
+          ? `${cmd} --resume ${rid} || ${cmd} --session-id ${sessionId}`
+          : `${cmd} --session-id ${sessionId} || ${cmd} --resume ${sessionId}`
+      );
+    }
+  } else if (mode === 'omp') {
+    // Remote OMP respawn must RESUME the same conversation instead of
+    // relaunching fresh (found live 2026-08-29: remote ctrl-c/ctrl-d relaunched
+    // a brand-new omp session). The pinned id, when known, is passed as an
+    // explicit --resume; otherwise fall back to omp's own "most recent"
+    // --continue so a dead-pane respawn still lands back in the conversation.
+    // Rendered through the CLI registry (buildSpawnCommandFromRegistry), the
+    // SAME mode-agnostic path local/docker spawns use — not appendResumeFlag(),
+    // which would hand the id to the login shell as $0 after the quoted `-c
+    // 'omp'`, and not a raw buildOmpCommand() call, which the registry refactor
+    // (#347) deleted. Gives every registry CLI with a resume form this
+    // behaviour for free, and the flags can't drift from the local builder.
+    const ompEntry = getCli('omp');
+    const ompCmd = ompEntry
+      ? (buildSpawnCommandFromRegistry(ompEntry, {
+          mode: 'omp',
+          sessionId,
+          ompConfig: {
+            ...ompConfig,
+            resumeSessionId: resumeSessionId || ompConfig?.resumeSessionId,
+          },
+        }) ?? 'omp')
+      : 'omp';
+    modeCommand = remoteLoginShellCommand(ompCmd);
+  } else {
+    modeCommand = defaultRemoteCommandForMode(mode);
+  }
+  const remoteName = remoteTmuxSessionName(sessionId);
+
+  // Innermost: the command tmux runs in the new pane. Run via `/bin/sh -c` by
+  // tmux, so the path needs shell-quoting here. `exec` replaces the shell with
+  // the CLI so the pane PID is the agent itself.
+  const paneCommand = `cd ${shellescape(remote.remotePath)} && ${modeCommand}`;
+
+  // The tmux command line, with `\;` separating commands so the config `set`s
+  // apply on the SAME connection (and are idempotent on reattach). Options are
+  // scoped per-session (`set -t <name>` / server `set -s`), NEVER `-g`, so a
+  // shared remote tmux server's other sessions keep their own prefix/mouse.
+  const tmuxInvocation = [
+    `tmux -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${shellescape(paneCommand)}`,
+    `set -t ${remoteName} status off`,
+    `set -t ${remoteName} mouse off`,
+    `set -t ${remoteName} prefix C-q`,
+    'set -s escape-time 0',
+    // COD-106 — shared/collaborative sessions: tmux defaults to sizing a window
+    // to the SMALLEST attached client, so two Codemans at different viewports
+    // would fight (clamp to the smaller). `window-size latest` sizes to the
+    // most-recently-active client instead, so concurrent clients coexist.
+    // Per-session scoped (`set -t <name>`, matching #145's hardening) so a shared
+    // remote tmux server's other sessions keep their own sizing behavior.
+    `set -t ${remoteName} window-size latest`,
+    // #210: keep a CRASHED pane so the failure is still on screen. Without this,
+    // tmux destroys the pane -> window -> session (and, being the only session,
+    // the whole remote server) the instant the pane command exits, which tears the
+    // local `ssh -t` attach down with it; reconnect's `-A` then builds a fresh
+    // session and the cycle can repeat as a flap loop with no evidence surviving.
+    // That is how the exit-127 PATH bug fixed above stayed invisible.
+    //
+    // `failed`, NOT `on`: `on` keeps the pane on a CLEAN exit too, so typing
+    // `exit` in a remote shell leaves a dead pane behind, the session outlives it,
+    // and the next launch's `-A` reattaches to that corpse ("Pane is dead (status
+    // 0)") instead of starting a shell — verified against a real tmux. `failed`
+    // keeps the pane only on a non-zero exit, which is exactly the diagnostic case.
+    //
+    // LAST in the chain on purpose: tmux aborts the remaining commands of a `\;`
+    // sequence once one errors (also verified), and `failed` needs tmux >= 3.2 on
+    // the REMOTE host. Trailing, a rejection costs only this option; leading, it
+    // would silently drop status/mouse/prefix/escape-time/window-size with it.
+    `set -t ${remoteName} remain-on-exit failed`,
+  ].join(' \\; ');
+
+  // ssh runs its trailing args through the remote login shell, so the entire
+  // tmux invocation is passed as one shell-quoted argument.
+  //
+  // COD-107 — connection options (port, identity, SOCKS ProxyCommand, jump host,
+  // arbitrary -o) come from the shared `buildSshConnectionArgs` so the launch and
+  // the tmux-prereq probe connect IDENTICALLY. `-t` is inserted right after
+  // `ssh -o BatchMode=yes` (preserving the historical token order), then the rest
+  // of the connection args, then the target and the quoted tmux invocation.
+  const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
+  const sshParts = [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)];
+  return sshParts.join(' ');
+}
+
+/**
+ * Build the SSH command that kills the durable remote tmux session created by
+ * `buildRemoteLaunchCommand`. Because that session lives on a private socket
+ * (`-L codeman-remote`) under a stable name, killing the LOCAL ssh wrapper alone
+ * would orphan the remote agent forever (invisible to Codeman, still burning plan
+ * quota). This is fired best-effort on session kill; the shared connection args
+ * carry the default `-o ConnectTimeout=10` so an unreachable host fails fast.
+ */
+export function buildRemoteKillCommand(options: { remote: SessionRemote; sessionId: string }): string {
+  const { remote, sessionId } = options;
+  const remoteName = remoteTmuxSessionName(sessionId);
+  const killCmd = `tmux -L ${REMOTE_TMUX_SOCKET} kill-session -t ${shellescape(remoteName)}`;
+  const [ssh, ...connectionArgs] = buildSshConnectionArgs(remote);
+  return [ssh, ...connectionArgs, remoteSshTarget(remote), shellescape(killCmd)].join(' ');
+}
+
+// ========== Docker cases (COD-Docker) ==========
+//
+// The docker analog of the remote-SSH launch above. Instead of a local tmux pane
+// running `ssh -t host 'tmux new-session …'`, it runs `docker exec -it <container>
+// sh -lc 'tmux new-session …'` into a DURABLE in-container tmux server. The
+// container is per-CASE, so many sessions `docker exec` into the same one. See
+// docs/docker-cases-plan.md.
+
+/**
+ * DEDICATED in-container tmux socket. A Codeman running INSIDE the container uses
+ * `-L codeman`; ours is `-L codeman-docker` with a `codeman-dkr-*` session name
+ * that deliberately FAILS SAFE_MUX_NAME_PATTERN, so an in-container Codeman never
+ * adopts/resizes/respawns our session (same defence as the remote socket).
+ */
+const DOCKER_TMUX_SOCKET = 'codeman-docker';
+/**
+ * Deterministic, reattach-stable in-container tmux session name. Derived from the
+ * same stable field the local muxName uses (first 8 chars of the sessionId), so a
+ * reconnect re-issues the exact same `new-session -A` and lands back in the SAME
+ * in-container session. The `dkr` letters make it fail SAFE_MUX_NAME_PATTERN.
+ */
+export function dockerTmuxSessionName(sessionId: string): string {
+  return `codeman-dkr-${sessionId.slice(0, 8)}`;
+}
+
+/** Resume ids are UUID-ish; reject anything with shell metacharacters (defensive). */
+const RESUME_ID_SAFE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Append the CLI-specific resume flag to a pane command (codex/gemini/antigravity). Only fires
+ * when the in-container tmux is RE-CREATED (`new-session -A` makes the flag inert
+ * on a live reattach), i.e. exactly when the previous live agent was lost and we
+ * want to resume the conversation from the bind-mounted transcript. Claude mode
+ * uses claudeDockerPaneCommand instead.
+ */
+function appendResumeFlag(modeCommand: string, mode: SessionMode, resumeId: string): string {
+  if (!RESUME_ID_SAFE.test(resumeId)) return modeCommand;
+  // The append-only sibling of the full launch spec: this bolts a resume onto an ALREADY
+  // built command, for the docker "the in-container tmux was re-created" path. An entry with
+  // no `resumeAppend` has no resume form to append (shell, opencode — opencode's docker
+  // resume rides its own config object instead).
+  const append = getCli(mode)?.launch.resumeAppend;
+  if (!append) return modeCommand;
+  return append.style === 'flag'
+    ? `${modeCommand} ${append.flag} ${resumeId}`
+    : `${modeCommand} ${append.token} ${resumeId}`;
+}
+
+/**
+ * Claude-mode pane command with a DETERMINISTIC conversation id (the docker analog
+ * of buildSpawnCommand's --resume/--session-id logic). A fresh launch passes
+ * `--session-id <sessionId>`, so the in-container conversation id is knowable
+ * host-side (resume-id capture + subagent/workflow correlation) WITHOUT relying on
+ * hook reachability. When the in-container tmux was re-created after a container
+ * stop/reboot, the same command re-runs against the surviving transcript:
+ * `--session-id` exits 1 ("already in use") and the `||` fallback RESUMES that
+ * conversation (verified CLI behavior). An explicit resumeId gets the local
+ * builder's shape — resume first, session-id fallback — so a stale id never
+ * dead-panes. The leading `exec ` is stripped: an exec'd first branch could never
+ * fall back.
+ */
+function claudeDockerPaneCommand(modeCommand: string, sessionId: string, resumeId?: string): string {
+  if (!RESUME_ID_SAFE.test(sessionId)) return modeCommand; // defensive — ids are server-minted uuids
+  const cmd = modeCommand.replace(/^exec\s+/, '');
+  const rid = resumeId && RESUME_ID_SAFE.test(resumeId) ? resumeId : undefined;
+  if (rid && rid !== sessionId) {
+    return `${cmd} --resume ${rid} || ${cmd} --session-id ${sessionId}`;
+  }
+  const cid = rid ?? sessionId;
+  return `${cmd} --session-id ${cid} || ${cmd} --resume ${cid}`;
+}
+
+/** Fully-resolved inputs for buildDockerLaunchCommand (pure). */
+export interface DockerLaunchOptions {
+  mode: SessionMode;
+  docker: SessionDocker;
+  sessionId: string;
+  resumeSessionId?: string;
+  createContext: DockerCreateContext;
+  /** exec-time inline env (non-secret): TERM, COLORTERM, CODEMAN_SESSION_ID, CODEMAN_MUX */
+  execEnv: Record<string, string>;
+  /** exec-time NAME-ONLY env forwarded from Codeman's process env (codex/gemini keys) */
+  execEnvNames: string[];
+  /**
+   * Files to copy from read-only seed mounts into the container's writable HOME once
+   * before launch (guarded so reconnects never clobber). Isolates Claude state: the
+   * merged `~/.claude.json`, plus `~/.claude/.credentials.json` + `settings.json`,
+   * are writable copies (not host mounts), so the container never re-auths and never
+   * writes its runtime state back into the host `~/.claude`.
+   */
+  seedCopies?: DockerSeedCopy[];
+}
+
+/**
+ * Build the ONE `bash -c` launch string for a docker session: image-check ->
+ * ensure (inspect-or-create) -> start -> `exec docker exec -it` into the durable
+ * in-container tmux (resume-aware). PURE and unit-testable. The escaping survives
+ * four layers: outer `bash -c "…"` (JSON.stringify at respawn-pane) -> the joined
+ * command -> `docker exec … sh -lc '<tmux>'` -> tmux `'<paneCommand>'`.
+ */
+export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
+  const { mode, docker, sessionId, resumeSessionId, createContext, execEnv, execEnvNames, seedCopies } = opts;
+  const base = buildDockerBaseArgs(docker).join(' ');
+  // ADOPTED container (docker.owned === false): the user built it and runs it, so
+  // this chain may only LOOK and then exec. No image check (the image is theirs),
+  // no create, and above all no `start` — starting a container we do not own is
+  // exactly the lifecycle mutation adoption promises never to perform. A missing
+  // or stopped container fails closed with an actionable message instead.
+  const adopted = docker.owned === false;
+  // Built lazily: an adopted case has no meaningful create-config, so computing
+  // create args for it would demand a context the adopt path never assembles.
+  const createArgs = adopted ? '' : buildDockerCreateArgs(createContext).join(' ');
+  const name = shellescape(docker.containerName);
+  const workdir = shellescape(docker.containerWorkdir);
+  const image = shellescape(docker.image);
+  const dkrName = dockerTmuxSessionName(sessionId);
+  const sid = sessionId.slice(0, 8);
+
+  let modeCommand =
+    docker.commands?.[mode as DockerCommandMode] || defaultDockerCommandForMode(mode, !!docker.runsAsRoot);
+  if (mode === 'claude') {
+    modeCommand = claudeDockerPaneCommand(modeCommand, sessionId, resumeSessionId);
+  } else if (resumeSessionId) {
+    modeCommand = appendResumeFlag(modeCommand, mode, resumeSessionId);
+  }
+  // Run by tmux via /bin/sh -c, so the path is shell-quoted here. `exec` makes the
+  // pane PID the agent itself.
+  const paneCommand = `cd ${workdir} && ${modeCommand}`;
+
+  // `setenv -g` primes the session id so reattaches / newly-created panes inherit
+  // it. `new-session -A` = attach-or-create (idempotent + resume-aware). Options
+  // are scoped per-session (`set -t`) or server (`set -s`), never `-g`, so a shared
+  // in-container tmux server's other sessions keep their own prefix/mouse.
+  const tmuxInvocation = [
+    `tmux -L ${DOCKER_TMUX_SOCKET} setenv -g CODEMAN_SESSION_ID ${shellescape(sid)}`,
+    'setenv -g CODEMAN_MUX 1',
+    `new-session -A -s ${dkrName} -c ${workdir} ${shellescape(paneCommand)}`,
+    `set -t ${dkrName} status off`,
+    `set -t ${dkrName} mouse off`,
+    `set -t ${dkrName} prefix C-q`,
+    'set -s escape-time 0',
+  ].join(' \\; ');
+
+  const execEnvFlags: string[] = [];
+  for (const [k, v] of Object.entries(execEnv)) execEnvFlags.push('--env', shellescape(`${k}=${v}`));
+  // NAME-ONLY forwards: docker reads the VALUE from Codeman's own process env, so
+  // the secret never appears in argv (no `ps` leak) and is not committed.
+  for (const n of execEnvNames) execEnvFlags.push('--env', n);
+  for (const extra of docker.extraExecArgs ?? []) execEnvFlags.push(shellescape(extra));
+
+  const imageMissingMsg = shellescape(
+    `Codeman: base image ${docker.image} not present (it is normally auto-built on first use)`
+  );
+  const startFailMsg = shellescape(`Codeman: container ${docker.containerName} failed to start (docker daemon down?)`);
+
+  const notFoundMsg = shellescape(
+    `Codeman: container ${docker.containerName} not found. Adopted containers are never created by Codeman - start it yourself, then reopen this session.`
+  );
+  const notRunningMsg = shellescape(
+    `Codeman: container ${docker.containerName} is not running. Codeman never starts a container it does not own - start it yourself, then reopen this session.`
+  );
+
+  const imageCheck = adopted
+    ? ''
+    : `${base} image inspect ${image} >/dev/null 2>&1 || { echo ${imageMissingMsg}; exit 1; }`;
+  // create-if-missing (idempotent): reconnect / boot recovery re-runs this exact
+  // chain. A daemon without swap accounting warns whenever --memory is present,
+  // even when --memory-swap is omitted. In compatibility mode, retain the memory
+  // cap and filter ONLY that exact warning; all other stdout/stderr and the real
+  // create exit status are preserved so mount/config failures remain visible.
+  // A session-unique file avoids shell variables and command substitution, both
+  // of which would be expanded too early by the nested bash/tmux launch layers.
+  const createOutputPath = shellescape(`/tmp/codeman-create-${sessionId}.log`);
+  const filteredCreateOutput = `sed '/^WARNING: Your kernel does not support swap limit capabilities or the cgroup is not mounted\\. Memory limited without swap\\.$/d' ${createOutputPath}`;
+  const removeCreateOutput = `rm -f ${createOutputPath}`;
+  const createCommand = createContext.disableSwapLimit
+    ? `{ if ${base} ${createArgs} >${createOutputPath} 2>&1; ` +
+      `then ${filteredCreateOutput}; ${removeCreateOutput}; ` +
+      `elif ${base} inspect ${name} >/dev/null 2>&1; then ${removeCreateOutput}; ` +
+      `else ${filteredCreateOutput} >&2; ${removeCreateOutput}; false; fi; }`
+    : `${base} ${createArgs}`;
+  const ensure = adopted
+    ? `${base} inspect ${name} >/dev/null 2>&1 || { echo ${notFoundMsg}; exit 1; }`
+    : `${base} inspect ${name} >/dev/null 2>&1 || ${createCommand}`;
+  // ⚠️ No double quotes and no `$(…)` in the ADOPTED arms. This whole chain is
+  // embedded in an outer `bash -c "…"`, so an unescaped `"` closes that string early,
+  // the rest is re-tokenized, and tmux fails to exec with a bare `execvp(3) failed`.
+  // A `grep -qx` pipeline reads the same answer using only the single-quoted form
+  // every other line in this builder already uses.
+  const start = adopted
+    ? `${base} inspect -f ${shellescape('{{.State.Running}}')} ${name} 2>/dev/null | grep -qx true || { echo ${notRunningMsg}; exit 1; }`
+    : `${base} start ${name} >/dev/null 2>&1 || { echo ${startFailMsg}; exit 1; }`;
+  // Seed writable credential config from read-only host mounts ONCE per container
+  // (guarded by [ -e ] so reconnects never clobber in-container config; `cp -a` for
+  // whole-dir credential seeds). mkdir -p the parent so a file seed works even when
+  // no sibling share-mount pre-created the dir. Paths are fixed CONTAINER_HOME
+  // constants (no shell metachars), so the whole inner command is shell-quoted once.
+  // An ADOPTED container gets NO seed copies: those read from create-time
+  // read-only mounts that do not exist here, and writing host credentials into a
+  // container the user owns is a mutation adoption does not permit. Its CLIs must
+  // already be authenticated inside it.
+  const seedSteps = (adopted ? [] : (seedCopies ?? [])).map((s) => {
+    const cp = s.recursive ? 'cp -a' : 'cp';
+    const parent = s.to.slice(0, s.to.lastIndexOf('/'));
+    return `mkdir -p ${parent} 2>/dev/null; [ -e ${s.to} ] || ${cp} ${s.from} ${s.to} 2>/dev/null || true`;
+  });
+  const innerCmd = seedSteps.length ? `${seedSteps.join(' ; ')} ; ${tmuxInvocation}` : tmuxInvocation;
+  const execCmd = `exec ${base} exec -it --workdir ${workdir} ${execEnvFlags.join(' ')} ${name} sh -lc ${shellescape(innerCmd)}`;
+
+  return [imageCheck, ensure, start, execCmd].filter(Boolean).join(' ; ');
+}
+
+/**
+ * Kill ONLY this session's in-container tmux session. The container is shared by
+ * the case's other sessions, so this NEVER `docker stop`s it — stopping/removing
+ * the container is an explicit teardown (buildDockerStopCommand) or case-delete
+ * (buildDockerRemoveCommand). Fired best-effort on session kill.
+ */
+export function buildDockerKillCommand(options: { docker: SessionDocker; sessionId: string }): string {
+  const { docker, sessionId } = options;
+  const base = buildDockerBaseArgs(docker).join(' ');
+  const dkrName = dockerTmuxSessionName(sessionId);
+  return `${base} exec ${shellescape(docker.containerName)} tmux -L ${DOCKER_TMUX_SOCKET} kill-session -t ${shellescape(dkrName)}`;
+}
+
+/**
+ * Guard for the two builders that mutate CONTAINER lifecycle. They are pure
+ * string builders, so refusing here means an adopted container cannot even have
+ * a stop/remove command constructed for it — there is no shape of caller bug
+ * that turns into a `docker stop`/`rm` on something we do not own.
+ */
+function assertOwnedContainer(docker: SessionDocker, action: string): void {
+  if (docker.owned === false) {
+    throw new Error(
+      `Refusing to ${action} adopted container "${docker.containerName}": Codeman does not own its lifecycle.`
+    );
+  }
+}
+
+/** Explicit container stop (frees RAM/CPU; conversation resumes on next launch via --resume). */
+export function buildDockerStopCommand(docker: SessionDocker): string {
+  assertOwnedContainer(docker, 'stop');
+  return `${buildDockerBaseArgs(docker).join(' ')} stop -t 10 ${shellescape(docker.containerName)}`;
+}
+
+/** Explicit container removal (case-delete). Destroys in-image state; bind mounts survive. */
+export function buildDockerRemoveCommand(docker: SessionDocker): string {
+  assertOwnedContainer(docker, 'remove');
+  return `${buildDockerBaseArgs(docker).join(' ')} rm -f ${shellescape(docker.containerName)}`;
+}
+
+/**
+ * Resolve the environment-dependent bits of a docker launch (host uid, existing
+ * credential mounts, derived api url, hook-secret mount, Desktop detection) into
+ * the pure buildDockerLaunchCommand inputs. IO; only ever called from the real
+ * launch path (createSession/respawnPane no-op under VITEST).
+ */
+export function resolveDockerLaunchOptions(
+  mode: SessionMode,
+  docker: SessionDocker,
+  sessionId: string,
+  resumeSessionId?: string
+): DockerLaunchOptions {
+  const home = homedir();
+  const isDesktop = process.platform === 'darwin'; // Docker Desktop translates uids + native host.docker.internal
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+  const userArgs: string[] =
+    docker.engine === 'podman'
+      ? ['--userns=keep-id'] // rootless podman: map host uid to the image `agent` uid
+      : isDesktop
+        ? [] // Desktop: run as the image's baked uid (a mac uid wouldn't own /home/agent)
+        : ['--user', `${uid}:0`]; // Linux: host uid + GID 0 (OpenShift arbitrary-uid writable HOME)
+  const gatewayAlias = hostGatewayAlias(docker.engine);
+
+  const credentialMounts: DockerMount[] = [];
+  const extraMounts: DockerMount[] = [];
+  // Isolated credential state (Claude + codex/gemini/gcloud/opencode): each store
+  // shares ONLY what a host feature / --resume needs (Claude projects/, codex
+  // sessions/+history) and seeds everything else (tokens, settings, configs) as
+  // writable copies, so the container is authed WITHOUT re-auth and WITHOUT writing
+  // its runtime state back into the host dirs. Only when credentials are mounted.
+  let seedCopies: DockerSeedCopy[] = [];
+  if (docker.mountCredentials) {
+    const claudeArtifacts = resolveDockerClaudeArtifacts(home, docker.containerName, docker.containerWorkdir);
+    const credArtifacts = resolveDockerCredentialArtifacts(home);
+    extraMounts.push(...claudeArtifacts.mounts, ...credArtifacts.mounts);
+    seedCopies = [...claudeArtifacts.seedCopies, ...credArtifacts.seedCopies];
+  }
+  const envCreate: Record<string, string> = {
+    HOME: CONTAINER_HOME,
+    TERM: 'xterm-256color',
+    COLORTERM: 'truecolor',
+    // Force a UTF-8 locale (the base image defaults to POSIX/C). Without this, tmux
+    // runs in non-UTF-8 mode and renders Claude's Unicode box-drawing (─│┌┐) as raw
+    // VT100 ACS glyphs (`qqqq…`). `C.UTF-8` is built into glibc (no locale-gen).
+    LANG: 'C.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    // Give claude a temp dir it will own inside HOME. Its default `/tmp/claude-<uid>`
+    // is refused when that path pre-exists root-owned — which happens when the
+    // workspace bind-mount path traverses it (e.g. a workspace under /tmp/claude-<uid>).
+    // A nonexistent HOME subpath is created+owned by the running uid, so this is robust
+    // to any workspace location. Non-secret path, safe to be committed on export.
+    CLAUDE_CODE_TMPDIR: `${CONTAINER_HOME}/.cache/codeman-claude-tmp`,
+  };
+  if (docker.hooksEnabled) {
+    // Derive a container-reachable API url (scheme + port preserved; host swapped
+    // for the engine gateway alias). Prod is HTTPS on 3000.
+    envCreate.CODEMAN_API_URL = containerApiUrl(process.env.CODEMAN_API_URL, docker.engine);
+    const hookSecretPath = dataPath('hook-secret');
+    if (existsSync(hookSecretPath)) {
+      const dst = `${CONTAINER_HOME}/.codeman/hook-secret`;
+      extraMounts.push({ src: hookSecretPath, dst, readonly: true });
+      envCreate.CODEMAN_HOOK_SECRET_FILE = dst; // a path is non-secret; the bytes ride the bind mount
+    }
+  }
+
+  const createContext: DockerCreateContext = {
+    docker,
+    sessionId,
+    instance: CODEMAN_INSTANCE,
+    userArgs,
+    credentialMounts: credentialMounts.map((mount) => ({
+      ...mount,
+      src: resolveDockerDaemonMountSource(mount.src, home, process.env.CODEMAN_DOCKER_HOST_HOME),
+    })),
+    extraMounts: extraMounts.map((mount) => ({
+      ...mount,
+      src: resolveDockerDaemonMountSource(mount.src, home, process.env.CODEMAN_DOCKER_HOST_HOME),
+    })),
+    envCreate,
+    addHostGateway: !isDesktop,
+    gatewayAlias,
+    disableSwapLimit: process.env.CODEMAN_DOCKER_DISABLE_SWAP_LIMIT === '1',
+  };
+
+  const execEnv: Record<string, string> = {
+    TERM: 'xterm-256color',
+    COLORTERM: 'truecolor',
+    // UTF-8 at exec time too, so the tmux CLIENT this exec launches is UTF-8 and
+    // renders box-drawing correctly even when reattaching to a container created
+    // before this fix (client_utf8 is per-client, resolved from the exec's locale).
+    LANG: 'C.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    CODEMAN_SESSION_ID: sessionId.slice(0, 8),
+    CODEMAN_MUX: '1',
+  };
+  // NAME-ONLY exec env forwarded from Codeman's process env (the docker client
+  // inherits it), so API-key CLIs get their key without it appearing in argv.
+  const execEnvNames = getCli(mode)?.env.dockerExecEnvNames ?? [];
+
+  return { mode, docker, sessionId, resumeSessionId, createContext, execEnv, execEnvNames, seedCopies };
+}
+
+/**
+ * COD-105 — build the SSH command that ATTACHES to an EXISTING `codeman-*` tmux
+ * session on the remote host (one this Codeman didn't create — discovered via
+ * `listRemoteCodemanSessions`). Sibling of `buildRemoteLaunchCommand`.
+ *
+ * Emits:
+ *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
+ *     'tmux -L codeman attach -t <session>'
+ *
+ * - `attach` (NOT `new-session -A`) so we only join an existing session; the
+ *   remote session keeps running independent of us, which is exactly why the
+ *   resulting Codeman session is NON-OWNED (see `SessionRemote.owned`): closing
+ *   the local tab must detach, never `kill-session` the remote.
+ * - The remote session name is shell-escaped so a value with metachars stays a
+ *   single token inside the quoted tmux invocation.
+ * - COD-107 — connection options (`-p`, `-i`, `-J`, SOCKS `-o ProxyCommand`,
+ *   arbitrary `-o`) come from the shared `buildSshConnectionArgs`, so attach
+ *   connects identically to launch / discovery / the prereq probe. `-t` sits
+ *   right after `ssh -o BatchMode=yes` (a PTY is required for interactive tmux).
+ */
+export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionName: string): string {
+  const tmuxInvocation = `tmux -L codeman attach -t ${shellescape(remoteSessionName)}`;
+  const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
+  const sshParts = [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)];
+  return sshParts.join(' ');
+}
+
+/**
+ * COD-105 — choose the right remote ssh command for a session's ownership:
+ *   - NON-owned (`remote.owned === false`): ATTACH to a discovered remote tmux
+ *     session by its EXISTING name (`remote.remoteSessionName`, falling back to
+ *     this session's deterministic name). We only join — never create.
+ *   - owned (default): LAUNCH/attach-or-create via `buildRemoteLaunchCommand`
+ *     (COD-104), which we then own and may explicitly kill.
+ */
+function buildRemoteSessionCommand(options: {
+  mode: SessionMode;
+  remote: SessionRemote;
+  sessionId: string;
+  claudeMode?: ClaudeMode;
+  allowedTools?: string;
+  /** OMP only — resume/continue overrides for a remote omp relaunch. */
+  ompConfig?: OmpConfig;
+  resumeSessionId?: string;
+}): string {
+  const { remote, sessionId } = options;
+  if (remote.owned === false) {
+    const target = remote.remoteSessionName || remoteTmuxSessionName(sessionId);
+    return buildRemoteAttachCommand(remote, target);
+  }
+  return buildRemoteLaunchCommand(options);
+}
+
+/**
+ * Push one environment variable into a tmux session with `setenv`.
+ *
+ * ⚠️ `setenv` rather than the spawn command line is the whole point: a value set this way is
+ * inherited by panes but never appears in `ps` output or tmux history, so an API key cannot
+ * be read by every other process on the box. Nothing that carries a secret may move to the
+ * command line.
+ *
+ * A failure is deliberately swallowed — a key the CLI does not need is not an error, and a
+ * CLI that does need it will say so far more usefully than a spawn failure here would.
+ */
+function setTmuxEnvVar(tmuxCmd: string, muxName: string, key: string, value: string): void {
+  // Shell-escape: wrap in single quotes, escape any inner single quotes.
+  const escaped = value.replace(/'/g, "'\\''");
+  try {
+    execSync(`${tmuxCmd} setenv -t '${muxName}' ${key} '${escaped}'`, {
+      encoding: 'utf8',
+      timeout: EXEC_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    /* Non-critical — key may not be needed */
+  }
+}
+
+/**
+ * Forward this CLI's declared sensitive env vars from the SERVER's own environment into the
+ * tmux session. Names come from `env.tmuxSetenvKeys`; values are never in config.
+ *
+ * Was three near-identical per-CLI functions whose only difference was the key list.
+ */
+function setCliSensitiveEnvVars(tmuxCmd: string, muxName: string, keys: readonly string[]): void {
+  for (const key of keys) {
     const val = process.env[key];
-    if (val) {
-      // Shell-escape: wrap in single quotes, escape any inner single quotes
-      const escaped = val.replace(/'/g, "'\\''");
-      try {
-        execSync(`${tmuxCmd} setenv -t '${muxName}' ${key} '${escaped}'`, {
-          encoding: 'utf8',
-          timeout: EXEC_TIMEOUT_MS,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-      } catch {
-        /* Non-critical — key may not be needed */
-      }
-    }
+    if (val) setTmuxEnvVar(tmuxCmd, muxName, key, val);
   }
 }
 
 /**
- * Set sensitive environment variables for Codex on a tmux session via setenv.
- * Codex (OpenAI CLI) needs OPENAI_API_KEY; we also forward CODEX_* keys.
+ * Implementations of the named profiles a CLI may select via `env.setenvProfile` — the escape
+ * hatch for setup that genuinely needs to RUN CODE rather than name a list of env keys.
+ *
+ * Keyed by PROFILE NAME, never by CLI id: a second launcher-style CLI adds an entry here and
+ * names it from its registry entry, and nothing else in this file learns about it. The names
+ * themselves are declared (and schema-validated at load) in `config/cli-registry/profiles.ts`.
+ *
+ * Returns the env vars to set; the caller does the actual `tmux setenv` calls.
  */
-function setCodexEnvVars(tmuxCmd: string, muxName: string): void {
-  const sensitiveVars = ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_HOME'];
-  for (const key of sensitiveVars) {
-    const val = process.env[key];
-    if (val) {
-      const escaped = val.replace(/'/g, "'\\''");
-      try {
-        execSync(`${tmuxCmd} setenv -t '${muxName}' ${key} '${escaped}'`, {
-          encoding: 'utf8',
-          timeout: EXEC_TIMEOUT_MS,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-      } catch {
-        /* Non-critical — key may not be needed */
-      }
-    }
-  }
-}
+const SETENV_PROFILES: Record<
+  string,
+  (sessionId: string, entry: CliEntry, rawConfig?: Record<string, unknown>) => Record<string, string>
+> = {
+  /**
+   * DeepSeek's Herdr-compatible status bridge.
+   *
+   * Pointing `HERDR_BIN_PATH` at our own generated shim is what upgrades this mode from
+   * output-stabilization guessing to DEFINITIVE idle/working/blocked events (see
+   * deepseek-status-shim.ts). The pane id IS the Codeman session id, which is how the shim
+   * attributes a report without trusting anything the agent could influence.
+   *
+   * Needs a profile rather than key names because it writes an executable to disk and then
+   * exports that file's path — neither a name list nor a config value could express it.
+   */
+  'deepseek-status-bridge': (sessionId, entry, rawConfig) => {
+    // Opt-OUT, not opt-in: an absent flag means the bridge is armed, so a caller who says
+    // nothing gets the better signals. Only an explicit `false` disarms it, which is exactly
+    // what `hooksAvailableForMode()` reads to decide whether `stop` can ever fire.
+    const field = entry.launch.legacyConfigAliases?.statusReporting ?? 'statusReporting';
+    if (rawConfig?.[field] === false) return {};
+    const shim = ensureDeepSeekStatusShim();
+    if (!shim) return {};
+    const vars: Record<string, string> = { HERDR_ENV: '1', HERDR_BIN_PATH: shim, HERDR_PANE_ID: sessionId };
+    return vars;
+  },
+};
 
 /**
- * Set OPENCODE_CONFIG_CONTENT on a tmux session via setenv.
- * Uses tmux setenv to avoid shell metacharacter injection from user-supplied JSON.
+ * Set a CLI's JSON config-content env var on a tmux session via setenv.
+ *
+ * The var NAME comes from `env.configContentVar` rather than being hardcoded, so this is not
+ * an opencode special case — but opencode is its only user today. `setenv` (rather than the
+ * command line) is what keeps user-supplied JSON away from shell metacharacter parsing.
  */
-function setOpenCodeConfigContent(tmuxCmd: string, muxName: string, config?: OpenCodeConfig): void {
+function setCliConfigContent(tmuxCmd: string, muxName: string, varName: string, config?: OpenCodeConfig): void {
   if (!config) return;
 
   let jsonContent: string | undefined;
@@ -706,18 +1497,7 @@ function setOpenCodeConfigContent(tmuxCmd: string, muxName: string, config?: Ope
     }
   }
 
-  if (jsonContent) {
-    const escaped = jsonContent.replace(/'/g, "'\\''");
-    try {
-      execSync(`${tmuxCmd} setenv -t '${muxName}' OPENCODE_CONFIG_CONTENT '${escaped}'`, {
-        encoding: 'utf8',
-        timeout: EXEC_TIMEOUT_MS,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch {
-      /* Non-critical */
-    }
-  }
+  if (jsonContent) setTmuxEnvVar(tmuxCmd, muxName, varName, jsonContent);
 }
 
 /**
@@ -748,7 +1528,39 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   /** Track last-known pane count per session to avoid unnecessary tmux set-option calls */
   private lastPaneCount: Map<string, number> = new Map();
 
+  // ── COD-108 remote-reconnect watcher state ────────────────────────────────
+  /** Periodic watcher that re-establishes dropped remote sessions. */
+  private remoteReconnectInterval: NodeJS.Timeout | null = null;
+  /** Per-session backoff/attempt bookkeeping (sessionId → state). */
+  private reconnectState: Map<string, RemoteReconnectState> = new Map();
+  /**
+   * Sessions excluded from auto-reconnect because they are being intentionally
+   * torn down (killed/detached/stopping). A guarded session is NEVER revived.
+   */
+  private reconnectGuard: Set<string> = new Set();
+  /**
+   * Cached result of the remote tmux `has-session` probe (sessionId → alive).
+   * `true` = the durable remote tmux session exists (transport drop → reconnect
+   * is safe); `false` = remote session gone (agent exited cleanly → do NOT
+   * reconnect); `undefined` = not yet probed / probe failed. Only sessions
+   * whose pane is otherwise dead+eligible get probed, so a clean exit tears
+   * down the remote tmux and the probe reports false — killing the auto-revive
+   * (found live 2026-08-29: remote omp/opencode ctrl-c/ctrl-d auto-respawned
+   * fresh agents because the watcher couldn't tell a clean exit from a
+   * transport drop).
+   */
+  private remoteAliveCache: Map<string, boolean | undefined> = new Map();
+  /**
+   * Sessions with a `has-session` probe currently in flight. The probe is a
+   * fire-and-forget ssh round-trip with a 15s timeout against a 5s tick, so
+   * without this an unreachable host would accumulate three overlapping ssh
+   * processes per dead session.
+   */
+  private remoteAliveInFlight: Set<string> = new Set();
+
   private trueColorConfigured = false;
+  /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
+  private liveHistoryResizeSupported: boolean | null = null;
 
   constructor() {
     super();
@@ -765,6 +1577,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   private tmux(): string {
     return tmuxCommand(this.tmuxSocket);
+  }
+
+  private supportsLiveHistoryResize(): boolean {
+    if (this.liveHistoryResizeSupported !== null) return this.liveHistoryResizeSupported;
+
+    try {
+      const output = execSync(`${this.tmux()} -V`, {
+        encoding: 'utf8',
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const match = output.match(/(?:^|\D)(\d+)\.(\d+)/);
+      const major = match ? Number(match[1]) : 0;
+      const minor = match ? Number(match[2]) : 0;
+      this.liveHistoryResizeSupported = major > 3 || (major === 3 && minor >= 7);
+    } catch {
+      // Unknown versions take the legacy path required by tmux <3.7.
+      this.liveHistoryResizeSupported = false;
+    }
+    return this.liveHistoryResizeSupported;
   }
 
   // Load saved sessions from disk (NEVER called in test mode)
@@ -853,22 +1685,48 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * command line (visible in `ps`). This also sidesteps shell-metachar injection via keys.
    */
   private buildEnvExports(sessionId: string, muxName: string, mode: SessionMode): string[] {
-    const exports = [
+    const entry = getCli(mode);
+
+    // Per-CLI colour/identity vars, straight from the entry. `unset` before `export` is
+    // arbitrary: these are independent bash statements joined by ` && `, so nothing here
+    // depends on another's value and the order carries no semantics.
+    const cliEnv: string[] = [];
+    for (const name of entry?.env.unset ?? []) cliEnv.push(`unset ${name}`);
+    for (const item of entry?.env.exports ?? []) {
+      // Values are either literals validated against the shell-token pattern at load, or an
+      // engine value produced here — never free text from config.
+      const value =
+        typeof item.value === 'string'
+          ? item.value
+          : item.value.engine === 'codemanPrefixedSessionId'
+            ? `codeman_${sessionId}`
+            : item.value.engine === 'sessionId'
+              ? sessionId
+              : item.value.engine === 'muxName'
+                ? muxName
+                : undefined;
+      // A CLI stamping a per-pane originator (codex) is what lets the response viewer find
+      // THIS pane's rollout exactly; without it, rollouts are matched by cwd+mtime and two
+      // panes in the same directory bleed into each other.
+      if (value !== undefined) cliEnv.push(`export ${item.name}=${value}`);
+    }
+
+    return [
       'export LANG=en_US.UTF-8',
       'export LC_ALL=en_US.UTF-8',
-      mode === 'codex' ? 'export COLORTERM=truecolor' : 'unset COLORTERM',
-      ...(mode === 'codex' ? ['unset NO_COLOR'] : []),
+      ...cliEnv,
       'export CODEMAN_MUX=1',
       `export CODEMAN_SESSION_ID=${sessionId}`,
       `export CODEMAN_MUX_NAME=${muxName}`,
-      `export CODEMAN_API_URL=${process.env.CODEMAN_API_URL || 'http://localhost:3000'}`,
+      // Only exported when the server has stamped the real URL (scheme+host+port,
+      // set in WebServer.start()). A hardcoded fallback here exported the wrong
+      // scheme on HTTPS installs; leaving the variable unset makes in-session
+      // guards fail closed instead of curling a URL that was never right.
+      ...(process.env.CODEMAN_API_URL ? [`export CODEMAN_API_URL=${process.env.CODEMAN_API_URL}`] : []),
       // Path only (not the secret value): hook curl commands cat the file at
       // execution time, so the COD-54 hook secret stays off the command line.
       `export CODEMAN_HOOK_SECRET_FILE="${dataPath('hook-secret')}"`,
     ];
-    // Only unset CLAUDECODE for Claude sessions
-    if (mode === 'claude') exports.splice(2, 0, 'unset CLAUDECODE');
-    return exports;
   }
 
   /**
@@ -880,21 +1738,34 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * Key validation is strict (`/^[A-Z_][A-Z0-9_]*$/`) as defense-in-depth against
    * shell-metachar injection even if upstream schema check is bypassed.
    */
-  private applyEnvOverrides(muxName: string, envOverrides?: Record<string, string>): void {
+  private applyEnvOverrides(muxName: string, envOverrides?: Record<string, string>, unsetKeys?: string[]): void {
+    const VALID_KEY = /^[A-Z_][A-Z0-9_]*$/;
     // Legacy cleanup: pre-0.7.2 set CLAUDE_CODE_EFFORT_LEVEL via setenv, which persists
     // on the tmux session and hard-locks /effort switching in every respawned pane.
     // Effort now flows as a `--settings` soft default (see buildEffortSettingsFlag),
     // so unconditionally unset the stale var before applying current overrides.
-    try {
-      execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} -u CLAUDE_CODE_EFFORT_LEVEL`, {
-        timeout: EXEC_TIMEOUT_MS,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch {
-      /* Non-critical — var may not exist */
+    //
+    // The caller's own unsets ride the same path, and run BEFORE the overrides are
+    // (re)applied: a key that is both unset and present in `envOverrides` ends up set,
+    // so a stale unset can never clobber a live value. Removing a key from the map is
+    // not enough on its own — `setenv` persists at the tmux-session level and is
+    // inherited by `respawn-pane`, measured: `setenv FOO bar` survived two successive
+    // `respawn-pane -k`. Clearing a custom-model selection is what needs this.
+    for (const key of ['CLAUDE_CODE_EFFORT_LEVEL', ...(unsetKeys ?? [])]) {
+      if (!VALID_KEY.test(key)) {
+        console.warn(`[TmuxManager] Skipping invalid env unset key: ${JSON.stringify(key)}`);
+        continue;
+      }
+      try {
+        execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} -u ${key}`, {
+          timeout: EXEC_TIMEOUT_MS,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch {
+        /* Non-critical — var may not exist */
+      }
     }
     if (!envOverrides) return;
-    const VALID_KEY = /^[A-Z_][A-Z0-9_]*$/;
     for (const [key, value] of Object.entries(envOverrides)) {
       if (!value) continue; // Skip empty — nothing to set
       if (!VALID_KEY.test(key)) {
@@ -918,39 +1789,99 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * In createSession(), a missing binary dir throws — the caller handles that separately.
    */
   private buildPathExport(mode: SessionMode): { pathExport: string; dir: string | null } {
-    if (mode === 'claude') {
-      const dir = findClaudeDir();
-      return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
-    }
-    if (mode === 'opencode') {
-      const dir = resolveOpenCodeDir();
-      return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
-    }
-    if (mode === 'codex') {
-      const dir = resolveCodexDir();
-      return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
-    }
-    return { pathExport: '', dir: null };
+    // Prepending the resolved bin dir is what makes a CLI installed somewhere the server's
+    // own PATH does not cover (nvm, Homebrew, ~/.local/bin under a systemd unit) reachable
+    // from inside the pane. `shell` and any unregistered mode resolve to null and get
+    // nothing prepended.
+    const dir = resolveCliBinDir(mode);
+    return { pathExport: dir ? `export PATH="${dir}:$PATH" && ` : '', dir };
   }
 
   /**
-   * Configure OpenCode-specific environment on a tmux session.
-   * Sets sensitive API keys and config content via tmux setenv
-   * (not visible in ps output or tmux history, inherited by panes).
+   * Configure this CLI's environment on a tmux session, entirely from registry data.
+   *
+   * Four independent pieces, all via `tmux setenv` so they are inherited by the pane without
+   * ever appearing in `ps`:
+   *
+   * 1. `env.tmuxSetenvKeys` — sensitive vars forwarded from the SERVER's own environment
+   *    (API keys, CLI home dirs). Names only ever live in config; values never do.
+   * 2. `env.configSetenv` — vars whose value comes from the caller's config rather than the
+   *    server env. DeepSeek's `DSH_PERMISSION_MODE` is the case this exists for: its
+   *    permission switch is an env var, not a flag. Routing it through a declared launch
+   *    param is what lets the ordinary multi-user clamp reach it.
+   * 3. `env.configContentVar` — a JSON config blob (opencode).
+   * 4. `env.setenvProfile` — genuinely code-shaped setup. DeepSeek's status bridge writes an
+   *    executable shim to disk and exports its path plus this session's pane id, which is
+   *    what upgrades that mode from output-stabilization guessing to definitive hook events.
+   *
+   * Called UNCONDITIONALLY for every mode: an entry with no keys, no config var and no
+   * profile does nothing here, which is a better shape than four `if (mode === ...)` guards
+   * that each had to be remembered at two separate call sites.
    */
-  private _configureOpenCode(muxName: string, openCodeConfig?: OpenCodeConfig): void {
+  private _configureCliEnv(
+    muxName: string,
+    sessionId: string,
+    mode: SessionMode,
+    rawConfig?: Record<string, unknown>
+  ): void {
+    const entry = getCli(mode);
+    if (!entry) return;
     const tmuxCmd = this.tmux();
-    setOpenCodeEnvVars(tmuxCmd, muxName);
-    setOpenCodeConfigContent(tmuxCmd, muxName, openCodeConfig);
+
+    setCliSensitiveEnvVars(tmuxCmd, muxName, entry.env.tmuxSetenvKeys);
+
+    for (const [key, value] of Object.entries(configSetenvValues(entry, rawConfig))) {
+      setTmuxEnvVar(tmuxCmd, muxName, key, value);
+    }
+
+    if (entry.env.configContentVar) {
+      setCliConfigContent(tmuxCmd, muxName, entry.env.configContentVar, rawConfig as OpenCodeConfig | undefined);
+    }
+
+    const profileName = entry.env.setenvProfile;
+    if (profileName) {
+      const profile = SETENV_PROFILES[profileName];
+      // A name the schema accepted but this build does not implement: skip rather than
+      // throw. Losing a status bridge degrades signal quality; failing here would refuse
+      // the session outright.
+      if (profile) {
+        for (const [key, value] of Object.entries(profile(sessionId, entry, rawConfig))) {
+          setTmuxEnvVar(tmuxCmd, muxName, key, value);
+        }
+      }
+    }
   }
 
   /**
-   * Configure Codex-specific environment on a tmux session.
-   * Sets OPENAI_API_KEY (and related keys) via tmux setenv so secrets don't
-   * appear in the bash command line.
+   * Export the user's own REAL statusLine command (found by
+   * findEffectiveUserStatusLineCommand) via tmux setenv, so the shared
+   * exporter script (statusLineExporterScriptContent in hooks-config.ts) can
+   * wrap it. Via setenv rather than embedding it in the spawn command line:
+   * tmux stores a setenv value verbatim and never re-parses it as shell
+   * syntax, so once safely escaped for THIS one command, the command's own
+   * `$`/quotes survive untouched into the claude process's environment — the
+   * same reasoning that made the exporter script itself necessary (see
+   * ensureStatusLineExporterScript's doc comment). Only this ONE line needs
+   * shellescape(); the stored value itself is opaque to tmux from then on.
+   *
+   * With NO user command the variable is UNSET rather than left alone: a tmux
+   * setenv survives respawn-pane, so a user who deleted their own statusline
+   * would otherwise keep getting the stale one wrapped (and lose Codeman's
+   * footer print-through) until the tmux session was recreated. Same shape as
+   * the CLAUDE_CODE_EFFORT_LEVEL cleanup in applyEnvOverrides.
    */
-  private _configureCodex(muxName: string): void {
-    setCodexEnvVars(this.tmux(), muxName);
+  private _configureStatusLineUserCommand(muxName: string, command: string | undefined): void {
+    const setOrUnset = command
+      ? `CODEMAN_USER_STATUSLINE_CMD ${shellescape(command)}`
+      : '-u CODEMAN_USER_STATUSLINE_CMD';
+    try {
+      execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} ${setOrUnset}`, {
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+    } catch {
+      // Non-critical: the exporter prints its own footer, or nothing.
+    }
   }
 
   /**
@@ -969,9 +1900,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       allowedTools,
       openCodeConfig,
       codexConfig,
+      geminiConfig,
+      antigravityConfig,
+      piConfig,
+      grokConfig,
+      deepSeekConfig,
+      ompConfig,
       resumeSessionId,
       envOverrides,
       effort,
+      historyLimit = DEFAULT_TMUX_HISTORY_LIMIT,
+      remote,
+      docker,
+      owner,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
 
@@ -990,6 +1931,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         pid: 99999,
         createdAt: Date.now(),
         workingDir,
+        remote,
+        docker,
+        owner,
         mode,
         attached: false,
         name,
@@ -999,16 +1943,42 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return session;
     }
 
-    // Resolve CLI binary directory based on mode
+    // Resolve CLI binary directory based on mode. The not-found messages come
+    // from the resolvers (formatCliNotFoundMessage) so the error names WHERE it
+    // looked — server PATH, login shell, checked directories — instead of just
+    // asserting the CLI is missing (the classic systemd/launchd PATH trap).
     const { pathExport, dir: cliDir } = this.buildPathExport(mode);
-    if (mode === 'claude' && !cliDir) {
-      throw new Error('Claude CLI not found. Install it with: curl -fsSL https://claude.ai/install.sh | bash');
-    }
-    if (mode === 'opencode' && !cliDir) {
-      throw new Error('OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash');
+    // Refuse the spawn rather than launching a pane that dies on `command not found`.
+    // `missingCliMessage()` returns null for a mode with no binary to find (`shell`), and
+    // carries bounded PATH/login-shell/search-dir diagnostics so the error says where we
+    // actually looked.
+    //
+    // ⚠️ Skipped entirely for a DOCKER session: the CLI runs INSIDE the container, so the
+    // host does not need it at all. Demanding it here threw for a host without the binary,
+    // the catch fell back to a direct PTY, and that PTY tried to exec the CLI on the HOST —
+    // surfacing as a bare `execvp(3) failed: No such file or directory` with nothing
+    // pointing at the real cause. The container's own CLIs are verified by the adoption
+    // preflight / image gate before launch instead.
+    const cliRunsInContainer = !!docker;
+    if (!cliRunsInContainer && !cliDir) {
+      const message = missingCliMessage(mode);
+      if (message) throw new Error(message);
     }
 
     const envExportsStr = this.buildEnvExports(sessionId, muxName, mode).join(' && ');
+
+    // Registry-gated (capabilities.statusLineTelemetry — claude only today), local
+    // spawns only (remote/docker have their own separate command builders — out of
+    // scope here). Also self-heals: strips any legacy disk-written exporter from an
+    // older Codeman build the first time a session starts in that workspace again.
+    const statusLineCommand =
+      getCli(mode)?.capabilities.statusLineTelemetry && !remote && !docker
+        ? await resolveStatusLineCliCommand(workingDir, await readPlanUsageTelemetryEnabled())
+        : undefined;
+    // The user's own REAL statusLine, if any (walked via Claude Code's own
+    // settings precedence) — exported below so the shared exporter script
+    // can wrap it. Only worth discovering when we're actually injecting.
+    const userStatusLineCommand = statusLineCommand ? await findEffectiveUserStatusLineCommand(workingDir) : undefined;
 
     const baseCmd = buildSpawnCommand({
       mode,
@@ -1018,8 +1988,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       allowedTools,
       openCodeConfig,
       codexConfig,
+      geminiConfig,
+      antigravityConfig,
+      piConfig,
+      grokConfig,
+      deepSeekConfig,
+      ompConfig,
       resumeSessionId,
       effort,
+      statusLineCommand,
+      sessionName: name,
     });
 
     const config = niceConfig || DEFAULT_NICE_CONFIG;
@@ -1027,11 +2005,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     try {
       // Build the full command to run inside tmux
-      const fullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
+      const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
+      const fullCmd = docker
+        ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
+        : remote
+          ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+          : localFullCmd;
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
-      // 1. Create session with default shell (starts tmux server, stays alive)
       // 2. Set remain-on-exit (server now exists, session won't vanish on exit)
       // 3. Replace shell with actual command via respawn-pane (no terminal echo)
       // Unset $TMUX so nested sessions work when the dev server itself runs inside tmux.
@@ -1042,7 +2024,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // launched in TMUX_LAUNCH_CWD (/tmp) rather than the real workingDir: a FUSE/rclone
       // mount that isn't ready yet makes `getcwd` fail and breaks the spawn (see #110). The
       // pane cd's into workingDir below via respawn-pane.
-      execSync(`${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}`, {
+      // tmux <3.7 allocates history only at pane creation, so its global default
+      // must be set immediately BEFORE new-session. tmux 3.7+ can resize a pane
+      // after creation; target only the new session there because changing the
+      // global option can resize (and when lowered, trim) unrelated live panes.
+      const safeHistoryLimit =
+        Number.isSafeInteger(historyLimit) && historyLimit > 0 ? Math.trunc(historyLimit) : DEFAULT_TMUX_HISTORY_LIMIT;
+      const createSessionCommand = this.supportsLiveHistoryResize()
+        ? `${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
+        : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
+      execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,
         stdio: 'ignore',
@@ -1060,13 +2051,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         /* Non-critical */
       }
 
-      // For OpenCode: set sensitive env vars and config via tmux setenv
-      // (not visible in ps output or tmux history, inherited by panes)
-      if (mode === 'opencode') {
-        this._configureOpenCode(muxName, openCodeConfig);
-      } else if (mode === 'codex') {
-        this._configureCodex(muxName);
-      }
+      // Per-CLI env: API keys, config blobs, config-sourced vars, status bridges. All of
+      // it is registry data, so this is one unconditional call rather than a per-mode ladder.
+      this._configureCliEnv(
+        muxName,
+        sessionId,
+        mode,
+        legacyConfigForMode(mode, options as unknown as Record<string, unknown>)
+      );
+      this._configureStatusLineUserCommand(muxName, userStatusLineCommand);
 
       // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
       // so secret values stay off the bash command line. Must run before respawn-pane.
@@ -1074,7 +2067,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
-      const launchCmd = `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       execSync(
         `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
@@ -1103,13 +2096,6 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           .catch(() => {
             /* Already set globally as fallback */
           }),
-        // Raise tmux scrollback from its 2000-line default so re-attach preserves
-        // more context. Matches the xterm-side default in constants.js.
-        execAsync(`${this.tmux()} set-option -t "${muxName}" history-limit 50000`, { timeout: EXEC_TIMEOUT_MS })
-          .then(() => {})
-          .catch(() => {
-            /* Non-critical — falls back to tmux default */
-          }),
       ];
 
       // Enable 24-bit true color passthrough — server-wide, set once per lifetime
@@ -1121,24 +2107,6 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             })
             .catch(() => {
               /* Non-critical — colors limited to 256 */
-            }),
-          // Make full-screen TUI output scrollable. With alternate-screen OFF,
-          // apps like Claude Code's Ink UI render into the main buffer, so their
-          // output accumulates in tmux scrollback (history-limit) instead of a
-          // non-scrollable alternate screen — letting the web terminal scroll back
-          // through the conversation. stripInkRedrawBloat() cleans the redraw
-          // debris this produces. Set as GLOBAL defaults so every new session's
-          // pane inherits them at creation (per-session set-option runs too late
-          // to size an already-created scrollback buffer).
-          execAsync(`${this.tmux()} set-window-option -g alternate-screen off`, { timeout: EXEC_TIMEOUT_MS })
-            .then(() => {})
-            .catch(() => {
-              /* Non-critical — falls back to alternate-screen on (not scrollable) */
-            }),
-          execAsync(`${this.tmux()} set-option -g history-limit 50000`, { timeout: EXEC_TIMEOUT_MS })
-            .then(() => {})
-            .catch(() => {
-              /* Non-critical — falls back to tmux 2000-line default */
             })
         );
       }
@@ -1163,6 +2131,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         pid,
         createdAt: Date.now(),
         workingDir,
+        remote,
+        docker,
+        owner,
         mode,
         attached: false,
         name,
@@ -1242,9 +2213,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       allowedTools,
       openCodeConfig,
       codexConfig,
+      geminiConfig,
+      antigravityConfig,
+      piConfig,
+      grokConfig,
+      deepSeekConfig,
+      ompConfig,
       resumeSessionId,
       envOverrides,
+      unsetEnvKeys,
       effort,
+      remote,
+      docker,
+      name,
     } = options;
     const session = this.sessions.get(sessionId);
     if (!session) return null;
@@ -1257,6 +2238,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     const envExportsStr = this.buildEnvExports(sessionId, muxName, mode).join(' && ');
 
+    // See createSession()'s identical resolution for rationale.
+    const statusLineCommand =
+      getCli(mode)?.capabilities.statusLineTelemetry && !remote && !docker
+        ? await resolveStatusLineCliCommand(workingDir, await readPlanUsageTelemetryEnabled())
+        : undefined;
+    const userStatusLineCommand = statusLineCommand ? await findEffectiveUserStatusLineCommand(workingDir) : undefined;
+
     const baseCmd = buildSpawnCommand({
       mode,
       sessionId,
@@ -1265,25 +2253,42 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       allowedTools,
       openCodeConfig,
       codexConfig,
+      geminiConfig,
+      antigravityConfig,
+      piConfig,
+      grokConfig,
+      deepSeekConfig,
+      ompConfig,
       resumeSessionId,
       effort,
+      statusLineCommand,
+      sessionName: name,
     });
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
-    const fullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
+    const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
+    const fullCmd = docker
+      ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
+      : remote
+        ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+        : localFullCmd;
 
     try {
-      // For OpenCode: set sensitive env vars via tmux setenv before respawn
-      if (mode === 'opencode') {
-        this._configureOpenCode(muxName, openCodeConfig);
-      } else if (mode === 'codex') {
-        this._configureCodex(muxName);
-      }
+      // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
+      this._configureCliEnv(
+        muxName,
+        sessionId,
+        mode,
+        legacyConfigForMode(mode, options as unknown as Record<string, unknown>)
+      );
+      this._configureStatusLineUserCommand(muxName, userStatusLineCommand);
 
-      // Re-apply user env overrides before respawn so the new shell inherits them.
-      this.applyEnvOverrides(muxName, envOverrides);
+      // Re-apply user env overrides before respawn so the new shell inherits them,
+      // dropping the ones the caller retired first (see applyEnvOverrides).
+      this.applyEnvOverrides(muxName, envOverrides, unsetEnvKeys);
 
-      const launchCmd = `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
+      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       await execAsync(
         `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
@@ -1316,27 +2321,102 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
-  // Get all child process PIDs recursively
-  private getChildPids(pid: number): number[] {
-    const pids: number[] = [];
-    try {
-      const output = execSync(`pgrep -P ${pid}`, {
-        encoding: 'utf-8',
-        timeout: EXEC_TIMEOUT_MS,
-      }).trim();
-      if (output) {
-        for (const childPid of output
-          .split('\n')
-          .map((p) => parseInt(p, 10))
-          .filter((p) => !Number.isNaN(p))) {
-          pids.push(childPid);
-          pids.push(...this.getChildPids(childPid));
+  /** One `ps` snapshot of the whole process table, cached briefly. */
+  private static procSnapshot: { at: number; byParent: Map<number, number[]> } | null = null;
+  /** Single-flight guard so a hung `ps` cannot pile up parallel refreshes. */
+  private static procRefresh: { started: number; promise: Promise<Map<number, number[]>> } | null = null;
+
+  /**
+   * Fork ONE `ps` asynchronously and cache the parent -> children map.
+   *
+   * Async on purpose: a synchronous fork here would block the event loop on every
+   * stats tick, and under the procfs pathology this module exists to survive,
+   * `execSync`'s timeout cannot return at all (spawnSync waits for the unkillable
+   * child) — freezing the whole server where a hung async poll only costs staleness.
+   */
+  private static refreshProcSnapshot(): Promise<Map<number, number[]>> {
+    const inFlight = TmuxManager.procRefresh;
+    // Reuse an in-flight refresh — unless it is old enough to be presumed stuck.
+    if (inFlight && Date.now() - inFlight.started < EXEC_TIMEOUT_MS * 2) return inFlight.promise;
+
+    const started = Date.now();
+    const promise = new Promise<Map<number, number[]>>((resolve) => {
+      execFile('ps', ['-eo', 'pid=,ppid='], { timeout: EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+        if (TmuxManager.procRefresh?.started === started) TmuxManager.procRefresh = null;
+        if (err) {
+          // ANY error, not just an empty one: a timed-out or truncated `ps` yields
+          // partial output, and caching that as fresh would make whole subtrees
+          // invisible — including to the kill path. Stale beats wrong.
+          console.error('[TmuxManager] process snapshot failed:', err);
+          resolve(TmuxManager.procSnapshot?.byParent ?? new Map());
+          return;
         }
-      }
-    } catch {
-      // No children or command failed
+        const byParent = new Map<number, number[]>();
+        for (const line of String(out).split('\n')) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length < 2) continue;
+          const pid = parseInt(parts[0], 10);
+          const ppid = parseInt(parts[1], 10);
+          if (Number.isNaN(pid) || Number.isNaN(ppid)) continue;
+          const list = byParent.get(ppid);
+          if (list) list.push(pid);
+          else byParent.set(ppid, [pid]);
+        }
+        TmuxManager.procSnapshot = { at: Date.now(), byParent };
+        resolve(byParent);
+      });
+    });
+    TmuxManager.procRefresh = { started, promise };
+    return promise;
+  }
+
+  /**
+   * Best snapshot WITHOUT forking: returns the cache, kicking off a background
+   * refresh when it has gone stale, and never blocks. Stats and window-title
+   * consumers tolerate data one interval old; nothing that KILLS may use this.
+   */
+  private childrenByParent(): Map<number, number[]> {
+    const cached = TmuxManager.procSnapshot;
+    if (!cached || Date.now() - cached.at >= PROC_SNAPSHOT_TTL_MS) {
+      void TmuxManager.refreshProcSnapshot();
     }
-    return pids;
+    return cached?.byParent ?? new Map();
+  }
+
+  /**
+   * Descendants from a snapshot that is not the cached one — the kill path's variant.
+   *
+   * killSession re-scans for survivors between SIGTERM and SIGKILL, and the wait in
+   * between (200ms) sits far inside the cache TTL (2000ms): reading the cache there
+   * returns the pre-SIGTERM state verbatim, so children spawned since are invisible
+   * and SIGKILL aims at stale PIDs, guarded only by kill(pid, 0) — which cannot
+   * detect PID reuse.
+   *
+   * It forces a refresh rather than guaranteeing recency: an already-running refresh
+   * is reused, so the snapshot can predate this call by up to one `ps` runtime. A
+   * strict postdate guarantee would mean chaining a second `ps` behind every
+   * in-flight one, which is the fork storm this code exists to avoid.
+   *
+   * Bounded by design: waiting forever would freeze killSession before it reaches
+   * its process-group and tmux fallbacks.
+   */
+  private async getChildPidsFresh(pid: number): Promise<number[]> {
+    let byParent: ReadonlyMap<number, readonly number[]>;
+    try {
+      byParent = await Promise.race([
+        TmuxManager.refreshProcSnapshot(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('proc snapshot timeout')), PROC_SNAPSHOT_WAIT_MS)
+        ),
+      ]);
+    } catch {
+      console.warn('[TmuxManager] process snapshot did not return in time; using the cached one');
+      byParent = TmuxManager.procSnapshot?.byParent ?? new Map<number, number[]>();
+    }
+    return collectDescendants(pid, byParent, {
+      onTruncated: (root, cap, reason) =>
+        console.warn(`[TmuxManager] descendant walk for ${root} hit the ${cap}-${reason} cap; truncating`),
+    });
   }
 
   // Check if a process is still alive
@@ -1380,9 +2460,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    // COD-108: an intentional kill/detach must NEVER be auto-revived by the
+    // remote-reconnect watcher. Guard BEFORE any teardown so a tick that fires
+    // mid-kill (especially the non-owned DETACH early-return below, where the
+    // dead local pane would otherwise look reconnectable) sees the guard.
+    this.guardRemoteReconnect(sessionId);
+
     // TEST MODE: Remove from memory only — NEVER touch real tmux sessions
     if (IS_TEST_MODE) {
       this.sessions.delete(sessionId);
+      this.clearRemoteReconnectState(sessionId);
       this.emit('sessionKilled', { sessionId });
       return true;
     }
@@ -1394,6 +2481,40 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    // COD-105 — DETACH-NOT-KILL for NON-owned remote sessions.
+    //
+    // When this session was created by ATTACHING a remote tmux session another
+    // Codeman owns (`remote.owned === false`), closing the tab must NOT propagate
+    // a remote `tmux kill-session` — that would nuke work the remote's own
+    // Codeman (or another instance) still relies on. We tear down ONLY the LOCAL
+    // pane that holds the ssh client: killing the local ssh sends SIGHUP to its
+    // remote `tmux attach`, which DETACHES (the durable remote session survives).
+    //
+    // This early return is the structural guarantee: no code below this point
+    // (now or in future for owned sessions) can ever issue a remote kill-session
+    // for a non-owned session. The only `kill-session` we run is on OUR LOCAL
+    // socket (`this.tmux()` = `tmux -L codeman` on THIS host), which kills the
+    // local pane — it does NOT reach the REMOTE socket.
+    if (session.remote && session.remote.owned === false) {
+      console.log(`[TmuxManager] DETACH (non-owned remote): tearing down local pane only for ${session.muxName}`);
+      if (isValidMuxName(session.muxName)) {
+        try {
+          // Local socket only — detaches the remote session by killing the local ssh pane.
+          execSync(`${this.tmux()} kill-session -t "${session.muxName}" 2>/dev/null`, {
+            timeout: EXEC_TIMEOUT_MS,
+          });
+        } catch {
+          // Local pane may already be gone.
+        }
+      }
+      this.lastPaneCount.delete(session.muxName);
+      this.sessions.delete(sessionId);
+      this.clearRemoteReconnectState(sessionId);
+      this.saveSessions();
+      this.emit('sessionKilled', { sessionId });
+      return true;
+    }
+
     // Get current PID (may have changed)
     const currentPid = this.getPanePid(session.muxName) || session.pid;
 
@@ -1402,7 +2523,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const allPids: number[] = [currentPid];
 
     // Strategy 1: Kill all child processes recursively
-    let childPids = this.getChildPids(currentPid);
+    let childPids = await this.getChildPidsFresh(currentPid);
     if (childPids.length > 0) {
       console.log(`[TmuxManager] Found ${childPids.length} child processes to kill`);
       allPids.push(...childPids);
@@ -1419,7 +2540,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       await new Promise((resolve) => setTimeout(resolve, TMUX_KILL_WAIT_MS));
 
-      childPids = this.getChildPids(currentPid);
+      childPids = await this.getChildPidsFresh(currentPid);
       for (const childPid of childPids) {
         if (this.isProcessAlive(childPid)) {
           try {
@@ -1455,6 +2576,32 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
     }
 
+    // Strategy 3b: Remote sessions run a DURABLE tmux server on the remote host
+    // (survives ssh drops), so killing only the local ssh wrapper above would
+    // orphan the remote agent forever. Fire a best-effort `ssh … tmux kill-session`
+    // — fire-and-forget so it NEVER blocks or throws the local kill (bounded by the
+    // shared ConnectTimeout on an unreachable host).
+    if (session.remote) {
+      try {
+        const remoteKillCmd = buildRemoteKillCommand({ remote: session.remote, sessionId });
+        exec(remoteKillCmd, { timeout: EXEC_TIMEOUT_MS }, () => {});
+      } catch {
+        // Best-effort — a failure here must not affect the local kill result.
+      }
+    }
+
+    // Strategy 3c: Docker sessions run a DURABLE in-container tmux session. Kill
+    // ONLY this session's in-container tmux session (best-effort). The container is
+    // PER-CASE and shared by the case's other sessions, so we deliberately do NOT
+    // `docker stop` it here — stopping/removing is an explicit teardown/case-delete.
+    if (session.docker && !IS_TEST_MODE) {
+      try {
+        exec(buildDockerKillCommand({ docker: session.docker, sessionId }), { timeout: EXEC_TIMEOUT_MS }, () => {});
+      } catch {
+        // Best-effort — never affects the local kill result.
+      }
+    }
+
     // Strategy 4: Direct kill by PID as final fallback
     if (this.isProcessAlive(currentPid)) {
       try {
@@ -1472,6 +2619,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     this.lastPaneCount.delete(session.muxName);
     this.sessions.delete(sessionId);
+    this.clearRemoteReconnectState(sessionId);
     this.saveSessions();
     this.emit('sessionKilled', { sessionId });
 
@@ -1538,6 +2686,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } else {
         dead.push(sessionId);
         this.sessions.delete(sessionId);
+        this.clearRemoteReconnectState(sessionId);
         this.emit('sessionDied', { sessionId });
       }
     }
@@ -1605,17 +2754,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       const [rss, cpu] = psOutput.split(/\s+/).map((x) => parseFloat(x) || 0);
 
+      // From the shared snapshot: this runs per session on every stats tick, and a
+      // pgrep per session was a fork per session per interval.
       let childCount = 0;
       try {
-        const childOutput = (
-          await execAsync(`pgrep -P ${session.pid} | wc -l`, {
-            encoding: 'utf-8',
-            timeout: EXEC_TIMEOUT_MS,
-          })
-        ).stdout.trim();
-        childCount = parseInt(childOutput, 10) || 0;
+        childCount = (this.childrenByParent().get(session.pid) ?? []).length;
       } catch {
-        // No children or command failed
+        // No children or snapshot unavailable
       }
 
       return {
@@ -1649,17 +2794,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Step 1: Get descendant PIDs
       const descendantMap = new Map<number, number[]>();
 
-      const pgrepOutput = (
-        await execAsync(
-          `for p in ${sessionPids.join(' ')}; do children=$(pgrep -P $p 2>/dev/null | tr '\\n' ','); echo "$p:$children"; done`,
-          {
-            encoding: 'utf-8',
-            timeout: EXEC_TIMEOUT_MS,
-          }
-        )
-      ).stdout.trim();
+      // Derived from the ONE snapshot instead of a shell loop that forks a pgrep
+      // per session — the shape that turned into a fork storm under load.
+      const byParent = this.childrenByParent();
+      const childLines = sessionPids.map((p) => `${p}:${(byParent.get(p) ?? []).join(',')}`).join('\n');
 
-      for (const line of pgrepOutput.split('\n')) {
+      for (const line of childLines.split('\n')) {
         const [pidStr, childrenStr] = line.split(':');
         const sessionPid = parseInt(pidStr, 10);
         if (!Number.isNaN(sessionPid)) {
@@ -1809,9 +2949,164 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.lastPaneCount.clear();
   }
 
+  // ── COD-108 remote-session auto-reconnect watcher ─────────────────────────
+
+  /**
+   * Start the remote-reconnect watcher (COD-108). Each tick, for every tracked
+   * session with `session.remote` whose local pane is DEAD, not intentionally
+   * guarded, and within its backoff budget, emit `remoteSessionDropped` so the
+   * session owner reattaches (re-running the idempotent remote command rejoins
+   * the durable remote tmux session). After the attempt cap, emit
+   * `remoteReconnectExhausted` once and go quiet.
+   *
+   * No-op tick body under `IS_TEST_MODE` (mirrors `startMouseModeSync`): tests
+   * drive the logic deterministically via {@link runRemoteReconnectTick}.
+   */
+  startRemoteReconnectWatcher(intervalMs: number = DEFAULT_REMOTE_RECONNECT_INTERVAL_MS): void {
+    if (this.remoteReconnectInterval) {
+      clearInterval(this.remoteReconnectInterval);
+    }
+    this.remoteReconnectInterval = setInterval(() => {
+      if (IS_TEST_MODE) return;
+      try {
+        this.runRemoteReconnectTick(Date.now(), isRemoteAutoReconnectEnabled());
+      } catch (err) {
+        console.error('[TmuxManager] Remote reconnect watcher error:', err);
+      }
+    }, intervalMs);
+  }
+
+  stopRemoteReconnectWatcher(): void {
+    if (this.remoteReconnectInterval) {
+      clearInterval(this.remoteReconnectInterval);
+      this.remoteReconnectInterval = null;
+    }
+  }
+
+  /**
+   * Run ONE watcher tick. Extracted (and given an injected `now`/`enabled`) so
+   * the reconnect logic is deterministically testable even though the live
+   * `setInterval` body no-ops under test mode. For each remote session it
+   * applies the pure {@link decideReconnect} decision and translates the result
+   * into events + backoff/state transitions. Public for tests + the watcher.
+   */
+  /**
+   * Refresh the cached remote-tmux liveness for a session whose pane is dead.
+   * Fire-and-forget (async, not awaited by the sync tick): the probe is a slow
+   * ssh round-trip, so it must not block the 5s watcher interval. On success it
+   * writes the cached result; the NEXT tick then makes the revive decision with
+   * fresh data. A clean exit makes the remote tmux session vanish, so the probe
+   * resolves false and the watcher stops reviving it (2026-08-29).
+   */
+  private async refreshRemoteAlive(session: MuxSession): Promise<void> {
+    if (!session.remote) return;
+    if (this.remoteAliveInFlight.has(session.sessionId)) return;
+    this.remoteAliveInFlight.add(session.sessionId);
+    const remoteName = session.remote.remoteSessionName || remoteTmuxSessionName(session.sessionId);
+    try {
+      const alive = await remoteTmuxSessionAlive(session.remote, remoteName);
+      this.remoteAliveCache.set(session.sessionId, alive);
+    } catch {
+      this.remoteAliveCache.set(session.sessionId, undefined);
+    } finally {
+      this.remoteAliveInFlight.delete(session.sessionId);
+    }
+  }
+
+  runRemoteReconnectTick(now: number, enabled: boolean): void {
+    for (const session of this.sessions.values()) {
+      if (!session.remote) continue;
+      const sessionId = session.sessionId;
+      const state = this.reconnectState.get(sessionId);
+      // Only probe when the pane is actually dead — otherwise the ssh round-trip
+      // would run every 5s for every healthy remote session. The cache is
+      // refreshed lazily so a clean exit (remote tmux gone) flips it to false
+      // on the next tick and stops the auto-revive.
+      const paneDead = this.isPaneDead(session.muxName);
+      if (!paneDead) {
+        // A live pane makes whatever the probe last said STALE, so forget it:
+        // after a successful reattach (or a manual restart) the next dead pane
+        // must be probed afresh. A cached `true` from the transport drop would
+        // otherwise revive a later CLEAN exit, the exact bug this cache exists
+        // to prevent, and a cached `false` from a clean exit would leave a
+        // manually restarted session with auto-reconnect permanently off.
+        this.remoteAliveCache.delete(sessionId);
+      } else if (this.remoteAliveCache.get(sessionId) === undefined) {
+        void this.refreshRemoteAlive(session);
+      }
+      const action = decideReconnect({
+        session: {
+          sessionId,
+          isRemote: true,
+          paneDead,
+          remoteAlive: this.remoteAliveCache.get(sessionId),
+        },
+        state,
+        guarded: this.reconnectGuard.has(sessionId),
+        enabled,
+        now,
+      });
+
+      if (action.kind === 'emit') {
+        const base = state ?? freshReconnectState();
+        // Mark in-flight + advance backoff BEFORE emitting so a re-entrant tick
+        // (or a synchronous listener) can never stack a second reconnect.
+        this.reconnectState.set(sessionId, { ...advanceBackoff(base, now), inFlight: true });
+        this.emit('remoteSessionDropped', { sessionId, attempt: action.attempt });
+      } else if (action.kind === 'exhaust') {
+        const base = state ?? freshReconnectState();
+        if (!base.exhaustedEmitted) {
+          this.reconnectState.set(sessionId, { ...base, exhausted: true, exhaustedEmitted: true });
+          this.emit('remoteReconnectExhausted', { sessionId });
+        }
+      }
+      // 'skip' → nothing to do.
+    }
+  }
+
+  /**
+   * Tell the watcher a reattach attempt for `sessionId` finished. On success,
+   * reset the backoff so the session is healthy again; on failure, just clear
+   * the in-flight flag so the next due tick can retry under the existing
+   * backoff schedule. Called by the session owner after `respawnPane`.
+   */
+  noteRemoteReconnect(sessionId: string, success: boolean): void {
+    if (success) {
+      this.reconnectState.set(sessionId, resetReconnectState());
+      return;
+    }
+    const state = this.reconnectState.get(sessionId);
+    if (state) this.reconnectState.set(sessionId, { ...state, inFlight: false });
+  }
+
+  /**
+   * Exclude a session from auto-reconnect (intentional teardown). Adds it to the
+   * guard set and drops any backoff state so a closed/killed tab — especially a
+   * non-owned remote DETACH — is never auto-revived. Idempotent.
+   */
+  guardRemoteReconnect(sessionId: string): void {
+    this.reconnectGuard.add(sessionId);
+    this.reconnectState.delete(sessionId);
+    this.remoteAliveCache.delete(sessionId);
+    this.remoteAliveInFlight.delete(sessionId);
+  }
+
+  /** Clear all per-session reconnect + guard state (e.g. when a session is removed). */
+  clearRemoteReconnectState(sessionId: string): void {
+    this.reconnectState.delete(sessionId);
+    this.reconnectGuard.delete(sessionId);
+    this.remoteAliveCache.delete(sessionId);
+    this.remoteAliveInFlight.delete(sessionId);
+  }
+
   destroy(): void {
     this.stopStatsCollection();
     this.stopMouseModeSync();
+    this.stopRemoteReconnectWatcher();
+    this.reconnectState.clear();
+    this.reconnectGuard.clear();
+    this.remoteAliveCache.clear();
+    this.remoteAliveInFlight.clear();
   }
 
   registerSession(session: MuxSession): void {
@@ -1849,6 +3144,36 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       session.ralphEnabled = enabled;
       this.saveSessions();
     }
+  }
+
+  /**
+   * Apply a tmux history limit. tmux 3.7+ safely targets tracked live sessions;
+   * older releases can only change the global default for future panes. Invalid
+   * limits fall back to the default.
+   */
+  async setHistoryLimit(limit: number): Promise<void> {
+    const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.trunc(limit) : DEFAULT_TMUX_HISTORY_LIMIT;
+
+    if (IS_TEST_MODE) {
+      return;
+    }
+
+    if (this.supportsLiveHistoryResize()) {
+      const updates = Array.from(this.sessions.values()).map((session) =>
+        execAsync(`${this.tmux()} set-option -t ${shellescape(session.muxName)} history-limit ${safeLimit}`, {
+          timeout: EXEC_TIMEOUT_MS,
+        })
+      );
+      await Promise.allSettled(updates);
+      return;
+    }
+
+    await execAsync(`${this.tmux()} set-option -g history-limit ${safeLimit}`, {
+      timeout: EXEC_TIMEOUT_MS,
+    }).catch(() => {
+      // No tmux server yet is fine: legacy createSession sets the same default
+      // immediately before it creates the first pane.
+    });
   }
 
   /**
@@ -2072,57 +3397,128 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
-   * Capture the current visible text and SGR styles of a specific pane.
+   * Capture a pane's text and SGR styles.
    *
-   * `capture-pane -e` is sanitized by `formatPaneSnapshot`: SGR color/style
-   * codes are preserved, while cursor/erase/scroll-region controls are stripped
-   * before rows are repainted at absolute positions in browser xterm.
+   * Two modes:
+   * - Visible (default): `capture-pane -p -e` grabs only the on-screen frame,
+   *   then `formatPaneSnapshot` repaints each row at its absolute position so
+   *   the browser xterm reproduces the live frame. Used for fast tab switches.
+   * - Full history (`opts.fullHistory`): `capture-pane -p -e -J -S -<N>` grabs
+   *   the tmux scrollback (COD-47, bounded to the configured history limit),
+   *   returned as linear scrollback text with SGR codes preserved. Rows are not
+   *   repainted at absolute positions — a multi-screen history can't be painted
+   *   into a single visible frame — but the capture DOES end with a cursor move
+   *   putting the caret back where the pane has it, counted up from the last
+   *   replayed row. `-J` re-joins lines hard-wrapped at the pane width so they
+   *   reflow in the browser xterm. Used for full page reloads so the user gets
+   *   back their scroll history. Returns '' for a pane holding nothing visible,
+   *   so the caller keeps whatever history it already had.
+   *   Caveat: lines tmux has already evicted past its history-limit are gone.
    */
-  capturePaneBuffer(muxName: string, paneTarget: string): string | null {
-    if (IS_TEST_MODE) return '';
-    if (!isValidMuxName(muxName)) {
-      console.error('[TmuxManager] Invalid session name in capturePaneBuffer:', muxName);
-      return null;
-    }
-    if (!SAFE_PANE_TARGET_PATTERN.test(paneTarget)) {
-      console.error('[TmuxManager] Invalid pane target:', paneTarget);
-      return null;
-    }
-
-    const target = paneTarget.startsWith('%') ? `${muxName}.${paneTarget}` : `${muxName}.%${paneTarget}`;
-
+  /**
+   * Plain visible-frame text for the working/idle probe (see `session.ts`).
+   *
+   * One `capture-pane` and nothing else: no `-e` styles, no `display-message`
+   * cursor query, no repaint reconstruction: this feeds a regex, not a
+   * terminal. Returns null in tests (no tmux) so callers fall back to their
+   * stream heuristics rather than reading an empty screen as "not working".
+   */
+  capturePaneText(muxName: string, paneTarget?: string): string | null {
+    if (IS_TEST_MODE) return null;
+    const target = resolveTmuxPaneTarget(muxName, paneTarget);
+    if (!target) return null;
     try {
-      const buffer = execSync(`${this.tmux()} capture-pane -p -e -t ${shellescape(target)}`, {
+      return execSync(`${this.tmux()} capture-pane -p -t ${shellescape(target)}`, {
         encoding: 'utf-8',
         timeout: EXEC_TIMEOUT_MS,
-      }).replace(/\n+$/g, '');
-      try {
-        const cursor = execSync(
-          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height}'`,
-          {
-            encoding: 'utf-8',
-            timeout: EXEC_TIMEOUT_MS,
-          }
-        ).trim();
-        const [cursorX, cursorY, cols, rows] = cursor.split(/\s+/).map((value) => parseInt(value, 10));
-        if (
-          Number.isFinite(cursorX) &&
-          Number.isFinite(cursorY) &&
-          Number.isFinite(cols) &&
-          Number.isFinite(rows) &&
-          cursorX >= 0 &&
-          cursorY >= 0 &&
-          cols > 0 &&
-          rows > 0
-        ) {
-          return formatPaneSnapshot(buffer.split('\n'), { cols, rows, cursorX, cursorY });
-        }
-      } catch (cursorErr) {
-        console.error('[TmuxManager] Failed to query pane cursor after capture:', cursorErr);
+      });
+    } catch {
+      // A dead/renamed pane is an ordinary outcome here, not an error worth logging
+      // on a timer; the caller treats null as "no evidence either way".
+      return null;
+    }
+  }
+
+  capturePaneBuffer(muxName: string, paneTarget?: string, opts?: PaneCaptureOptions): string | null {
+    if (IS_TEST_MODE) return '';
+    const target = resolveTmuxPaneTarget(muxName, paneTarget);
+    if (!target) {
+      console.error('[TmuxManager] Invalid pane target in capturePaneBuffer:', { muxName, paneTarget });
+      return null;
+    }
+
+    const fullHistory = opts?.fullHistory === true;
+
+    try {
+      // `-S -<N>` starts the capture N lines above the visible frame (tmux
+      // clamps to the top of history), so tmux never serializes more scrollback
+      // than the configured history limit retains.
+      const requestedLines = opts?.historyLimitLines;
+      const historyLines =
+        typeof requestedLines === 'number' && Number.isFinite(requestedLines) && requestedLines > 0
+          ? Math.trunc(requestedLines)
+          : DEFAULT_TMUX_HISTORY_LIMIT;
+      const captureFlags = fullHistory ? `capture-pane -p -e -J -S -${historyLines}` : 'capture-pane -p -e';
+      // execSync's default maxBuffer (1MB) kills multi-MB scrollback dumps
+      // (ENOBUFS) and would silently degrade full-history capture to the byte
+      // buffer for exactly the long sessions it exists for — size it from the
+      // consumer's byte cap plus ANSI-overhead slack instead.
+      const execOpts: { encoding: 'utf-8'; timeout: number; maxBuffer?: number } = {
+        encoding: 'utf-8',
+        timeout: EXEC_TIMEOUT_MS,
+      };
+      if (fullHistory) {
+        execOpts.maxBuffer =
+          (opts?.maxCaptureBytes ?? DEFAULT_TERMINAL_BUFFER_MAX_BYTES) + FULL_HISTORY_CAPTURE_SLACK_BYTES;
       }
-      return buffer;
+      const rawCapture = execSync(`${this.tmux()} ${captureFlags} -t ${shellescape(target)}`, execOpts);
+      // Query the cursor BEFORE deciding anything else. On the full-history path
+      // it settles both how the capture is trimmed and whether a cursor move is
+      // appended, and those two have to agree: trailing blank rows are only safe
+      // to keep when a move follows to put the caret back above them.
+      const geometry = queryPaneCursor(() =>
+        execSync(
+          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height}'`,
+          { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS }
+        )
+      );
+
+      if (fullHistory) {
+        // Without geometry there is no cursor move, so fall back to the old trim.
+        // Keeping the blank rows here would park the caret at the bottom of the
+        // pane with nothing to correct it — worse than not trying at all.
+        if (!geometry) return normalizeScrollbackEol(rawCapture.replace(/\n+$/g, ''));
+        // Take the line terminator off and nothing else. The trailing blank rows
+        // that remain are the real bottom of the screen, and the cursor move
+        // below counts up from it. tmux joins rows with a bare `\n`; normalize to
+        // `\r\n` so a fresh xterm (convertEol:false) starts each replayed line at
+        // column 0 instead of staircasing diagonally (COD-138).
+        const trimmed = rawCapture.replace(/\n$/, '');
+        // An all-blank pane has to keep reading as "nothing to replay". The caller
+        // treats an empty string as "capture unavailable" and keeps the byte
+        // history; blank rows plus a cursor move are not empty, so without this a
+        // blank pane REPLACES that history with a blank screen — the downgrade
+        // `_replayWouldShrinkBuffer` exists to refuse, arriving from the server
+        // side where that guard cannot see it.
+        if (!hasVisibleContent(trimmed)) return '';
+        return `${normalizeScrollbackEol(trimmed)}${formatCursorRestore(geometry)}`;
+      }
+
+      const buffer = rawCapture.replace(/\n+$/g, '');
+      if (geometry) return formatPaneSnapshot(buffer.split('\n'), geometry);
+      // Cursor query failed or geometry was invalid, so we skip the absolute-
+      // positioned snapshot repaint and fall back to the raw capture. Normalize
+      // its bare `\n` line endings to `\r\n` so the replay doesn't staircase
+      // diagonally in a fresh xterm (COD-138, same reason as the fullHistory path).
+      return normalizeScrollbackEol(buffer);
     } catch (err) {
-      console.error('[TmuxManager] Failed to capture pane buffer:', err);
+      // ENOBUFS carries the truncated multi-MB stdout on the error object —
+      // log a concise line instead of dumping it into the journal.
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOBUFS') {
+        console.error('[TmuxManager] Pane capture exceeded maxBuffer (ENOBUFS); falling back to byte history');
+      } else {
+        console.error('[TmuxManager] Failed to capture pane buffer:', err);
+      }
       return null;
     }
   }
@@ -2133,7 +3529,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * Pane ids are not stable across respawns or restores, so callers should not
    * assume the first pane remains `%0`.
    */
-  captureActivePaneBuffer(muxName: string): string | null {
+  captureActivePaneBuffer(muxName: string, opts?: PaneCaptureOptions): string | null {
     if (IS_TEST_MODE) return '';
     if (!isValidMuxName(muxName)) {
       console.error('[TmuxManager] Invalid session name in captureActivePaneBuffer:', muxName);
@@ -2146,7 +3542,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         timeout: EXEC_TIMEOUT_MS,
       }).trim();
       const target = resolveActivePaneTarget(output);
-      return target ? this.capturePaneBuffer(muxName, target) : null;
+      return target ? this.capturePaneBuffer(muxName, target, opts) : null;
     } catch (err) {
       console.error('[TmuxManager] Failed to resolve active pane for capture:', err);
       return null;

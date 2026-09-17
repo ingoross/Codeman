@@ -65,10 +65,29 @@ appendFileSync(
   '}\n'
 );
 
+// Predictive echo (codex): separate bundle so the zerolag bundle stays byte-identical
+run('xterm-predictive-echo', 'npx esbuild packages/xterm-zerolag-input/src/predictive-echo-addon.ts --bundle --minify --format=iife --global-name=XtermPredictiveEcho --outfile=dist/web/public/vendor/xterm-predictive-echo.js');
+appendFileSync(
+  join(ROOT, 'dist/web/public/vendor/xterm-predictive-echo.js'),
+  '\n// Global aliases for browser usage\n' +
+  'if(typeof window!=="undefined"){' +
+    'window.PredictiveEchoAddon=XtermPredictiveEcho.PredictiveEchoAddon;' +
+    'window.PredictiveEchoOverlay=class extends XtermPredictiveEcho.PredictiveEchoAddon{' +
+      'constructor(terminal){' +
+        'super({});' +
+        'this.activate(terminal);' +
+      '}' +
+    '};' +
+  '}\n'
+);
+
 // 4. Minify frontend assets
 run('minify input-cjk.js', 'npx esbuild dist/web/public/input-cjk.js --minify --outfile=dist/web/public/input-cjk.js --allow-overwrite');
+run('minify terminal-keycode229-recovery.js', 'npx esbuild dist/web/public/terminal-keycode229-recovery.js --minify --outfile=dist/web/public/terminal-keycode229-recovery.js --allow-overwrite');
+run('minify i18n.js', 'npx esbuild dist/web/public/i18n.js --minify --outfile=dist/web/public/i18n.js --allow-overwrite');
 run('minify sanitize-html.js', 'npx esbuild dist/web/public/sanitize-html.js --minify --outfile=dist/web/public/sanitize-html.js --allow-overwrite');
 run('minify app.js', 'npx esbuild dist/web/public/app.js --minify --outfile=dist/web/public/app.js --allow-overwrite');
+run('minify tab-rail-resize.js', 'npx esbuild dist/web/public/tab-rail-resize.js --minify --outfile=dist/web/public/tab-rail-resize.js --allow-overwrite');
 run('minify terminal-ui.js', 'npx esbuild dist/web/public/terminal-ui.js --minify --outfile=dist/web/public/terminal-ui.js --allow-overwrite');
 run('minify respawn-ui.js', 'npx esbuild dist/web/public/respawn-ui.js --minify --outfile=dist/web/public/respawn-ui.js --allow-overwrite');
 run('minify ralph-panel.js', 'npx esbuild dist/web/public/ralph-panel.js --minify --outfile=dist/web/public/ralph-panel.js --allow-overwrite');
@@ -86,13 +105,16 @@ console.log('\n[build] content-hash cache busting');
     'styles.css',
     'mobile.css',
     'constants.js',
+    'i18n.js',
     'mobile-handlers.js',
     'voice-input.js',
     'notification-manager.js',
     'keyboard-accessory.js',
     'input-cjk.js',
+    'terminal-keycode229-recovery.js',
     'sanitize-html.js',
     'app.js',
+    'tab-rail-resize.js',
     'terminal-ui.js',
     'respawn-ui.js',
     'ralph-panel.js',
@@ -104,6 +126,7 @@ console.log('\n[build] content-hash cache busting');
     'subagent-windows.js',
     'image-input.js',
     'vendor/xterm-zerolag-input.js',
+    'vendor/xterm-predictive-echo.js',
   ];
   const manifest = {};
   for (const file of HASHABLE) {

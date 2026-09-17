@@ -208,6 +208,58 @@ describe('ws-routes', () => {
       }
     });
 
+    it('ACKs a delivered input and burns its seq', async () => {
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        const session = ctx._session;
+        ws.send(JSON.stringify({ t: 'i', d: 'ok\r', cid: 'c1', seq: 1 }));
+
+        expect(await nextMessage(ws)).toEqual({ t: 'ia', seq: 1 });
+        expect(session.shouldApplyInput('c1', 1)).toBe(false);
+      } finally {
+        ws.close();
+      }
+    });
+
+    it('withholds the ACK and re-opens the seq when the write did not land', async () => {
+      // A session whose PTY is gone swallows the write. ACKing anyway told the
+      // client to drop the frame from its durable queue while the seq stayed
+      // burnt, so the retry that reliable delivery exists for was rejected as a
+      // duplicate — the input was lost for good.
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        const session = ctx._session;
+        session.failWrites = true;
+
+        ws.send(JSON.stringify({ t: 'i', d: 'lost\r', cid: 'c1', seq: 1 }));
+
+        await expect(nextMessage(ws, 600)).rejects.toThrow(/timeout/);
+        expect(session.shouldApplyInput('c1', 1)).toBe(true);
+      } finally {
+        ws.close();
+      }
+    });
+
+    it('still ACKs a duplicate frame the server deliberately skipped', async () => {
+      // Dedup must stay silent-but-acknowledged: the client has to be able to
+      // drop a frame it already delivered once.
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        const session = ctx._session;
+        session.shouldApplyInput('c1', 7); // pretend seq 7 already landed
+
+        ws.send(JSON.stringify({ t: 'i', d: 'again\r', cid: 'c1', seq: 7 }));
+
+        // The ACK now SAYS it was a duplicate and hands back the watermark: a bare
+        // ACK is indistinguishable from "applied", and that ambiguity left a client
+        // whose seq counter had rolled back silently unable to type at all.
+        expect(await nextMessage(ws)).toEqual({ t: 'ia', seq: 7, dup: true, last: 7 });
+        expect(session.writeBuffer).not.toContain('again\r');
+      } finally {
+        ws.close();
+      }
+    });
+
     it('ignores input exceeding MAX_INPUT_LENGTH', async () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       try {
@@ -487,6 +539,29 @@ describe('ws-routes', () => {
         const { code, reason } = await waitForClose(ws6);
         expect(code).toBe(4008);
         expect(reason).toBe('Too many connections');
+      } finally {
+        for (const ws of connections) ws.close();
+      }
+    });
+
+    it('reconnecting client (same cid) is admitted at the cap instead of 4008 (COD-137)', async () => {
+      const connections: WebSocket[] = [];
+      try {
+        // Fill all 5 slots with DISTINCT clients, one of which is "alice".
+        for (const c of ['alice', 'b', 'c', 'd', 'e']) {
+          connections.push(await connectWs(`/ws/sessions/ws-test-session/terminal?cid=${c}`));
+        }
+
+        // Alice reconnects WHILE her old socket is still registered (the
+        // over-count window). This must reclaim her slot, not hit the cap.
+        const aliceNew = await connectWs('/ws/sessions/ws-test-session/terminal?cid=alice');
+        connections.push(aliceNew);
+
+        // Sanity: the reconnected socket is live and usable.
+        ctx._session.emit('terminal', 'reconnected-ok');
+        const msg = (await nextMessage(aliceNew)) as { t: string; d: string };
+        expect(msg.t).toBe('o');
+        expect(msg.d).toContain('reconnected-ok');
       } finally {
         for (const ws of connections) ws.close();
       }

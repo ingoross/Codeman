@@ -76,11 +76,37 @@ vi.mock('../../src/utils/opencode-cli-resolver.js', () => ({
   resolveOpenCodeDir: vi.fn(() => null),
 }));
 
+vi.mock('../../src/utils/gemini-cli-resolver.js', () => ({
+  isGeminiAvailable: vi.fn(() => false),
+  resolveGeminiDir: vi.fn(() => null),
+}));
+
+vi.mock('../../src/utils/antigravity-cli-resolver.js', () => ({
+  isAntigravityAvailable: vi.fn(() => false),
+  resolveAntigravityDir: vi.fn(() => null),
+}));
+
+vi.mock('../../src/utils/pi-cli-resolver.js', () => ({
+  isPiAvailable: vi.fn(() => false),
+  resolvePiDir: vi.fn(() => null),
+  getPiCliVersion: vi.fn(() => null),
+}));
+
+vi.mock('../../src/utils/grok-cli-resolver.js', () => ({
+  isGrokAvailable: vi.fn(() => false),
+  resolveGrokDir: vi.fn(() => null),
+  getGrokCliVersion: vi.fn(() => null),
+}));
+
 import fs from 'node:fs/promises';
 import { existsSync, readdirSync } from 'node:fs';
 import { subagentWatcher } from '../../src/subagent-watcher.js';
 import { getLifecycleLog } from '../../src/session-lifecycle-log.js';
 import { isOpenCodeAvailable, resolveOpenCodeDir } from '../../src/utils/opencode-cli-resolver.js';
+import { isGeminiAvailable, resolveGeminiDir } from '../../src/utils/gemini-cli-resolver.js';
+import { isAntigravityAvailable, resolveAntigravityDir } from '../../src/utils/antigravity-cli-resolver.js';
+import { isPiAvailable, resolvePiDir, getPiCliVersion } from '../../src/utils/pi-cli-resolver.js';
+import { isGrokAvailable, resolveGrokDir, getGrokCliVersion } from '../../src/utils/grok-cli-resolver.js';
 
 const mockedReadFile = vi.mocked(fs.readFile);
 const mockedWriteFile = vi.mocked(fs.writeFile);
@@ -90,6 +116,16 @@ const mockedSubagentWatcher = vi.mocked(subagentWatcher);
 const mockedGetLifecycleLog = vi.mocked(getLifecycleLog);
 const mockedIsOpenCodeAvailable = vi.mocked(isOpenCodeAvailable);
 const mockedResolveOpenCodeDir = vi.mocked(resolveOpenCodeDir);
+const mockedIsGeminiAvailable = vi.mocked(isGeminiAvailable);
+const mockedResolveGeminiDir = vi.mocked(resolveGeminiDir);
+const mockedIsAntigravityAvailable = vi.mocked(isAntigravityAvailable);
+const mockedResolveAntigravityDir = vi.mocked(resolveAntigravityDir);
+const mockedIsPiAvailable = vi.mocked(isPiAvailable);
+const mockedResolvePiDir = vi.mocked(resolvePiDir);
+const mockedGetPiCliVersion = vi.mocked(getPiCliVersion);
+const mockedIsGrokAvailable = vi.mocked(isGrokAvailable);
+const mockedResolveGrokDir = vi.mocked(resolveGrokDir);
+const mockedGetGrokCliVersion = vi.mocked(getGrokCliVersion);
 
 describe('system-routes', () => {
   let harness: RouteTestHarness;
@@ -117,6 +153,8 @@ describe('system-routes', () => {
     } as never);
     mockedIsOpenCodeAvailable.mockReturnValue(false);
     mockedResolveOpenCodeDir.mockReturnValue(null);
+    mockedIsGeminiAvailable.mockReturnValue(false);
+    mockedResolveGeminiDir.mockReturnValue(null);
   });
 
   afterEach(async () => {
@@ -194,6 +232,76 @@ describe('system-routes', () => {
     });
   });
 
+  // ========== GET /api/away-digest ==========
+
+  describe('GET /api/away-digest', () => {
+    it('returns a classified digest from lifecycle, active sessions, and token stats', async () => {
+      const lifecycleQuery = vi.fn(async () => [
+        {
+          ts: Date.now() - 1000,
+          event: 'exit',
+          sessionId: harness.ctx._sessionId,
+          name: 'Route Session',
+          exitCode: 7,
+        },
+      ]);
+      mockedGetLifecycleLog.mockReturnValue({
+        log: vi.fn(),
+        query: lifecycleQuery,
+      } as never);
+      harness.ctx._session.name = 'Route Session';
+      harness.ctx._session.status = 'working';
+      harness.ctx.store.getDailyStats.mockReturnValue([
+        {
+          // LOCAL date (not toISOString/UTC): away-digest's dayOverlapsRange parses
+          // the date as local midnight, so a UTC date near the local-midnight boundary
+          // (e.g. running at 01:xx CEST = prior-day UTC) would fall outside the 1h
+          // window and make this assertion TZ/hour-flaky.
+          date: new Date().toLocaleDateString('en-CA'),
+          inputTokens: 100,
+          outputTokens: 200,
+          estimatedCost: 0.02,
+          sessions: 1,
+        },
+      ]);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/away-digest?range=1h' });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.digest.sections.needsAttention[0]).toMatchObject({
+        sessionId: harness.ctx._sessionId,
+        source: 'lifecycle',
+      });
+      expect(body.digest.sections.stillRunning[0]).toMatchObject({
+        sessionId: harness.ctx._sessionId,
+        source: 'status',
+      });
+      expect(body.digest.totals).toMatchObject({
+        activeSessions: 1,
+        needsAttention: 1,
+        inputTokens: 100,
+        outputTokens: 200,
+        tokenWindowPrecision: 'day',
+      });
+      expect(lifecycleQuery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          limit: 1000,
+        })
+      );
+    });
+
+    it('rejects invalid ranges', async () => {
+      const res = await harness.app.inject({ method: 'GET', url: '/api/away-digest?range=forever' });
+
+      expect(res.statusCode).toBe(400);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+      expect(body.message ?? body.error).toMatch(/range/i);
+    });
+  });
+
   // ========== GET /api/debug/memory ==========
 
   describe('GET /api/debug/memory', () => {
@@ -224,11 +332,16 @@ describe('system-routes', () => {
 
   describe('POST /api/cleanup-state', () => {
     it('cleans up stale session state', async () => {
+      const runStaleSessionCleanup = vi.fn(
+        async (_activeIds: Set<string>, action: (ids: ReadonlySet<string>) => unknown) => action(new Set())
+      );
+      harness.ctx.tabLayouts.runStaleSessionCleanup = runStaleSessionCleanup;
       const res = await harness.app.inject({ method: 'POST', url: '/api/cleanup-state' });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.cleanedSessions).toBe(0);
-      expect(harness.ctx.store.cleanupStaleSessions).toHaveBeenCalled();
+      expect(harness.ctx.store.cleanupSessionsByIds).toHaveBeenCalledWith(new Set());
+      expect(runStaleSessionCleanup).toHaveBeenCalledOnce();
     });
   });
 
@@ -298,21 +411,42 @@ describe('system-routes', () => {
   // ========== GET /api/settings ==========
 
   describe('GET /api/settings', () => {
-    it('returns empty object when settings file does not exist', async () => {
+    // A plain read that never writes. The route briefly reconciled an absent
+    // showPlanUsageLimits to true on first read, but readJsonConfig() answers {}
+    // for ANY read failure and every page load hits this route, so one unlucky
+    // read replaced the whole file with a one-key file. The default now lives in
+    // readPlanUsageTelemetryEnabled() (absent means ON); see also
+    // system-routes-settings-get-plan-usage-default.test.ts.
+    it('answers {} for a missing settings file and creates nothing', async () => {
       mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockedWriteFile.mockClear();
 
       const res = await harness.app.inject({ method: 'GET', url: '/api/settings' });
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({});
+      expect(mockedWriteFile).not.toHaveBeenCalled();
     });
 
-    it('returns parsed settings when file exists', async () => {
+    it('returns the file unchanged when showPlanUsageLimits is absent', async () => {
       const settings = { subagentTrackingEnabled: true, showSystemStats: false };
       mockedReadFile.mockResolvedValue(JSON.stringify(settings) as never);
+      mockedWriteFile.mockClear();
 
       const res = await harness.app.inject({ method: 'GET', url: '/api/settings' });
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual(settings);
+      expect(mockedWriteFile).not.toHaveBeenCalled();
+    });
+
+    it('passes an explicit false through untouched', async () => {
+      const settings = { subagentTrackingEnabled: true, showPlanUsageLimits: false };
+      mockedReadFile.mockResolvedValue(JSON.stringify(settings) as never);
+      mockedWriteFile.mockClear();
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/settings' });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(settings);
+      expect(mockedWriteFile).not.toHaveBeenCalled();
     });
   });
 
@@ -696,6 +830,122 @@ describe('system-routes', () => {
       const body = JSON.parse(res.body);
       expect(body.available).toBe(true);
       expect(body.path).toBe('/usr/local/bin');
+    });
+  });
+
+  // ========== GET /api/gemini/status ==========
+
+  describe('GET /api/gemini/status', () => {
+    it('returns unavailable when gemini is not installed', async () => {
+      mockedIsGeminiAvailable.mockReturnValue(false);
+      mockedResolveGeminiDir.mockReturnValue(null);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/gemini/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(false);
+      expect(body.path).toBeNull();
+    });
+
+    it('returns available with path when gemini is installed', async () => {
+      mockedIsGeminiAvailable.mockReturnValue(true);
+      mockedResolveGeminiDir.mockReturnValue('/usr/local/bin');
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/gemini/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(true);
+      expect(body.path).toBe('/usr/local/bin');
+    });
+  });
+
+  // ========== GET /api/antigravity/status ==========
+
+  describe('GET /api/antigravity/status', () => {
+    it('returns unavailable when agy is not installed', async () => {
+      mockedIsAntigravityAvailable.mockReturnValue(false);
+      mockedResolveAntigravityDir.mockReturnValue(null);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/antigravity/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(false);
+      expect(body.path).toBeNull();
+    });
+
+    it('returns available with path when agy is installed', async () => {
+      mockedIsAntigravityAvailable.mockReturnValue(true);
+      mockedResolveAntigravityDir.mockReturnValue('/home/user/.local/bin');
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/antigravity/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(true);
+      expect(body.path).toBe('/home/user/.local/bin');
+    });
+  });
+
+  // ========== GET /api/pi/status ==========
+
+  describe('GET /api/pi/status', () => {
+    it('returns unavailable when pi is not installed', async () => {
+      mockedIsPiAvailable.mockReturnValue(false);
+      mockedResolvePiDir.mockReturnValue(null);
+      mockedGetPiCliVersion.mockReturnValue(null);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/pi/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(false);
+      expect(body.path).toBeNull();
+      expect(body.version).toBeNull();
+    });
+
+    it('returns available with path AND version when pi is installed', async () => {
+      // `version` is pi-specific: `pi` is a generic binary name, so the resolver
+      // version-probes it and this endpoint is where a misresolution shows up.
+      mockedIsPiAvailable.mockReturnValue(true);
+      mockedResolvePiDir.mockReturnValue('/home/user/.local/bin');
+      mockedGetPiCliVersion.mockReturnValue('0.84.1');
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/pi/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(true);
+      expect(body.path).toBe('/home/user/.local/bin');
+      expect(body.version).toBe('0.84.1');
+    });
+  });
+
+  // ========== GET /api/grok/status ==========
+
+  describe('GET /api/grok/status', () => {
+    it('returns unavailable when grok is not installed', async () => {
+      mockedIsGrokAvailable.mockReturnValue(false);
+      mockedResolveGrokDir.mockReturnValue(null);
+      mockedGetGrokCliVersion.mockReturnValue(null);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/grok/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(false);
+      expect(body.path).toBeNull();
+      expect(body.version).toBeNull();
+    });
+
+    it('returns available with path AND version when grok is installed', async () => {
+      // `version` matters for the same reason as pi: `grok` has known squatters,
+      // so this endpoint is where a misresolution shows up.
+      mockedIsGrokAvailable.mockReturnValue(true);
+      mockedResolveGrokDir.mockReturnValue('/home/user/.grok/bin');
+      mockedGetGrokCliVersion.mockReturnValue('1.0.5');
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/grok/status' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.available).toBe(true);
+      expect(body.path).toBe('/home/user/.grok/bin');
+      expect(body.version).toBe('1.0.5');
     });
   });
 

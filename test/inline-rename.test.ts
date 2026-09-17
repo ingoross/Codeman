@@ -125,6 +125,45 @@ describe('Inline rename input', () => {
     expect(renameStillActive).toBe(true);
   });
 
+  it('Escape cancels the rename instead of committing an empty name', async () => {
+    await resetState();
+    expect(await startRename('esc-cancel', 'rail-beta')).toBe(true);
+
+    // Escape used to clear the field and blur, and the blur handler commits —
+    // so cancelling a rename PUT an empty name, and the tab fell back to its
+    // folder label (measured against a live server, in the header strip as well
+    // as both vertical layouts). The observable here is the REQUEST: this
+    // harness's server has no such session, so a failed PUT would leave the
+    // local map looking innocent.
+    const result = await page.evaluate(async () => {
+      const app = (window as unknown as { app: { _activeRename: unknown } }).app;
+      const calls: string[] = [];
+      const origFetch = window.fetch;
+      window.fetch = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response('{"success":true}', { status: 200 });
+      }) as typeof window.fetch;
+
+      const inputEl = document.querySelector('input.tab-rename-input') as HTMLInputElement;
+      inputEl.value = 'typed-but-abandoned';
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      // The blur that follows the input's removal must not resurrect the commit.
+      inputEl.dispatchEvent(new Event('blur'));
+      await new Promise((r) => setTimeout(r, 50));
+
+      window.fetch = origFetch;
+      return {
+        renamePuts: calls.filter((url) => url.includes('/api/sessions/esc-cancel/name')),
+        renameActive: !!app._activeRename,
+        inputStillInDom: document.body.contains(inputEl),
+      };
+    });
+
+    expect(result.renamePuts).toEqual([]);
+    expect(result.renameActive).toBe(false);
+    expect(result.inputStillInDom).toBe(false);
+  });
+
   it('CJK guard: regular Enter (no IME) DOES commit', async () => {
     await resetState();
     expect(await startRename('regular-enter', 'OldName')).toBe(true);
@@ -186,6 +225,9 @@ describe('Inline rename input', () => {
         renameActiveAfter: !!app._activeRename,
         sessionGone: !app.sessions.has('ghost-id'),
         fetchFired,
+        renameClassActive:
+          document.querySelector('.tab-name[data-session-id="ghost-id"]')?.classList.contains('tab-name-renaming') ??
+          false,
       };
     });
 
@@ -194,6 +236,7 @@ describe('Inline rename input', () => {
     expect(result.sessionGone).toBe(true);
     // Cancel path skips the API call — deleting a session shouldn't trigger a stale rename PUT.
     expect(result.fetchFired).toBe(false);
+    expect(result.renameClassActive).toBe(false);
   });
 
   it('Ghost tab: _cleanupSessionData for a DIFFERENT session does NOT cancel rename', async () => {
@@ -245,6 +288,206 @@ describe('Inline rename input', () => {
     expect(result.threw).toBe(false);
   });
 
+  it('Render guard: _renderSessionTabsImmediate() does not destroy an open rename input', async () => {
+    await resetState();
+
+    // The debounced tab render is scheduled by renderSessionTabs() but EXECUTED by
+    // _renderSessionTabsImmediate(). A render queued just before the rename opened
+    // still fires ~100ms later and lands in the executor directly, so the guard has
+    // to live there too, otherwise the incremental branch rewrites .tab-name's
+    // innerHTML and the user's half-typed description is lost.
+    //
+    // The tab MUST live inside the real #sessionTabs container and be the only
+    // session in app.sessions: the renderer walks that container, so a synthetic
+    // node parked on <body> would make this test pass with the guard removed.
+    const result = await page.evaluate(() => {
+      const app = (
+        window as unknown as {
+          app: {
+            sessions: Map<string, { id: string; name: string; status: string }>;
+            sessionOrder: string[];
+            startInlineRename: (id: string) => void;
+            _renderSessionTabsImmediate: () => void;
+            _activeRename: unknown;
+          };
+        }
+      ).app;
+      const id = 'render-race';
+      app.sessions.set(id, { id, name: 'w9-case', status: 'idle' });
+      app.sessionOrder = [id];
+
+      const container = document.getElementById('sessionTabs') as HTMLElement;
+      const tab = document.createElement('div');
+      tab.setAttribute('data-test-tab', '1');
+      tab.className = 'session-tab';
+      tab.dataset.id = id;
+      tab.innerHTML =
+        '<span class="tab-status idle"></span><span class="tab-info"><span class="tab-name-row">' +
+        `<span class="tab-name" data-session-id="${id}">w9-case</span>` +
+        '</span></span>';
+      container.appendChild(tab);
+
+      app.startInlineRename(id);
+      const input = document.querySelector('input.tab-rename-input') as HTMLInputElement | null;
+      if (!input) return { opened: false };
+      input.value = 'half-typed';
+
+      // Exactly what a debounce timer queued before the rename would do.
+      app._renderSessionTabsImmediate();
+
+      const after = document.querySelector('input.tab-rename-input') as HTMLInputElement | null;
+      return {
+        opened: true,
+        stillInDom: !!after && document.body.contains(after),
+        value: after?.value ?? null,
+        renameStillActive: !!app._activeRename,
+      };
+    });
+
+    expect(result.opened).toBe(true);
+    expect(result.stillInDom).toBe(true);
+    expect(result.value).toBe('half-typed');
+    expect(result.renameStillActive).toBe(true);
+  });
+
+  it('Modal: closeSessionOptions() commits the Session Name field before clearing the id', async () => {
+    await resetState();
+
+    // Every autosave handler in the session-options modal bails on a null
+    // editingSessionId, and hiding the modal blurs the focused input. If the id is
+    // cleared first, the blur-driven save is dropped and the typed name vanishes,
+    // which is what Escape and backdrop-click used to do.
+    const result = await page.evaluate(async () => {
+      const app = (
+        window as unknown as {
+          app: {
+            editingSessionId: string | null;
+            sessions: Map<string, { id: string; name: string }>;
+            closeSessionOptions: () => void;
+          };
+        }
+      ).app;
+      app.sessions.set('modal-id', { id: 'modal-id', name: 'w9-case' });
+      app.editingSessionId = 'modal-id';
+
+      const nameInput = document.getElementById('modalSessionName') as HTMLInputElement;
+      const modal = document.getElementById('sessionOptionsModal') as HTMLElement;
+      modal.classList.add('active');
+      // The Session Name field lives on the modal's Context tab, which is hidden
+      // until selected: a hidden input cannot take focus.
+      document.getElementById('context-tab')?.classList.remove('hidden');
+      nameInput.value = 'mydesc';
+      nameInput.focus();
+      const wasFocused = document.activeElement === nameInput;
+
+      let putBody: string | null = null;
+      const origFetch = window.fetch;
+      window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/api/sessions/modal-id/name')) putBody = String(init?.body ?? '');
+        return new Response('{"success":true}', { status: 200 });
+      }) as typeof window.fetch;
+
+      app.closeSessionOptions();
+      await new Promise((r) => setTimeout(r, 30));
+      window.fetch = origFetch;
+      modal.classList.remove('active');
+
+      return { wasFocused, putBody, editingAfter: app.editingSessionId };
+    });
+
+    expect(result.wasFocused).toBe(true);
+    // Prefixed session: the suffix the user typed is appended to the w9-case prefix.
+    expect(result.putBody).toContain('w9-case: mydesc');
+    expect(result.editingAfter).toBe(null);
+  });
+
+  it('Commit writes the confirmed name into app.sessions WITHOUT any session:updated frame', async () => {
+    await resetState();
+    expect(await startRename('no-sse', 'w9-case')).toBe(true);
+
+    // finishRename() re-renders the tab strip from app.sessions, so the rename
+    // used to depend on the session:updated SSE frame to carry its own write
+    // back. On a page whose stream has gone quiet without erroring, the PUT
+    // stored the new name, the re-render repainted the stale one, and the tab
+    // only showed it after a full reload. No SSE is dispatched here at all.
+    const result = await page.evaluate(async () => {
+      const app = (
+        window as unknown as {
+          app: { sessions: Map<string, { id: string; name: string }> };
+        }
+      ).app;
+      const origFetch = window.fetch;
+      window.fetch = (async () =>
+        new Response('{"success":true,"data":{"name":"w9-case: fresh"}}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof window.fetch;
+
+      const inputEl = document.querySelector('input.tab-rename-input') as HTMLInputElement;
+      inputEl.value = 'fresh';
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await new Promise((r) => setTimeout(r, 60));
+
+      window.fetch = origFetch;
+      return {
+        mapName: app.sessions.get('no-sse')?.name ?? null,
+        renameClassActive:
+          document.querySelector('.tab-name[data-session-id="no-sse"]')?.classList.contains('tab-name-renaming') ??
+          false,
+      };
+    });
+
+    expect(result.mapName).toBe('w9-case: fresh');
+    expect(result.renameClassActive).toBe(false);
+  });
+
+  it('A rejected rename restores the old label and leaves app.sessions untouched', async () => {
+    await resetState();
+    expect(await startRename('rename-500', 'w9-case')).toBe(true);
+
+    // _apiPut turns a network error into a null Response and an API-level
+    // failure arrives as a non-ok status, neither of which throws, so a
+    // rejected rename has to be detected from the response, or it reports
+    // success and silently discards the user's edit.
+    const result = await page.evaluate(async () => {
+      const app = (
+        window as unknown as {
+          app: { sessions: Map<string, { id: string; name: string }>; showToast: (m: string, k: string) => void };
+        }
+      ).app;
+      const toasts: string[] = [];
+      const origToast = app.showToast;
+      app.showToast = (msg: string) => void toasts.push(msg);
+      const origFetch = window.fetch;
+      window.fetch = (async () =>
+        new Response('{"success":false,"error":"boom","errorCode":"INTERNAL"}', {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof window.fetch;
+
+      const inputEl = document.querySelector('input.tab-rename-input') as HTMLInputElement;
+      inputEl.value = 'never-stored';
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await new Promise((r) => setTimeout(r, 60));
+
+      window.fetch = origFetch;
+      app.showToast = origToast;
+      return {
+        mapName: app.sessions.get('rename-500')?.name ?? null,
+        label: document.querySelector('.tab-name[data-session-id="rename-500"]')?.textContent ?? null,
+        renameClassActive:
+          document.querySelector('.tab-name[data-session-id="rename-500"]')?.classList.contains('tab-name-renaming') ??
+          false,
+        toasts,
+      };
+    });
+
+    expect(result.mapName).toBe('w9-case');
+    expect(result.label).toBe('w9-case');
+    expect(result.renameClassActive).toBe(false);
+    expect(result.toasts).toContain('Failed to rename');
+  });
+
   it('Re-entry: starting rename while one is active aborts the previous one', async () => {
     await resetState();
     expect(await startRename('first-id', 'First')).toBe(true);
@@ -255,6 +498,7 @@ describe('Inline rename input', () => {
           app: {
             _activeRename: { sessionId: string } | null;
             sessions: Map<string, { id: string; name: string }>;
+            renderSessionTabs: () => void;
             startInlineRename: (id: string) => void;
           };
         }
@@ -271,11 +515,120 @@ describe('Inline rename input', () => {
       tabName.textContent = 'Second';
       wrap.appendChild(tabName);
       document.body.appendChild(wrap);
+
+      // Cancelling the first rename is allowed to repaint the tab list. Model
+      // that synchronously so a target captured before cancel() becomes stale.
+      const originalRenderSessionTabs = app.renderSessionTabs;
+      app.renderSessionTabs = () => {
+        const current = document.querySelector('.tab-name[data-session-id="second-id"]');
+        current?.replaceWith(current.cloneNode(true));
+      };
       app.startInlineRename('second-id');
-      return { firstActive, secondActive: app._activeRename?.sessionId };
+      app.renderSessionTabs = originalRenderSessionTabs;
+      return {
+        firstActive,
+        secondActive: app._activeRename?.sessionId,
+        secondInputVisible: !!document.querySelector('.tab-name[data-session-id="second-id"] input.tab-rename-input'),
+        firstRenameClassActive:
+          document.querySelector('.tab-name[data-session-id="first-id"]')?.classList.contains('tab-name-renaming') ??
+          false,
+      };
     });
 
     expect(result.firstActive).toBe('first-id');
     expect(result.secondActive).toBe('second-id');
+    expect(result.secondInputVisible).toBe(true);
+    expect(result.firstRenameClassActive).toBe(false);
+  });
+
+  it('Session sidebar paints typing without ellipsizing the live editor', async () => {
+    await resetState();
+    const id = 'sidebar-live-input';
+
+    await page.evaluate((sessionId) => {
+      const app = (
+        window as unknown as {
+          app: {
+            sessions: Map<string, { id: string; name: string }>;
+            startInlineRename: (id: string) => void;
+          };
+        }
+      ).app;
+      document.documentElement.dataset.sessionList = 'sidebar';
+      document.documentElement.dataset.sidebar = 'expanded';
+      const list = document.getElementById('sessionSidebarList') as HTMLElement;
+      const tab = document.createElement('div');
+      tab.setAttribute('data-test-tab', '1');
+      tab.className = 'session-tab';
+      tab.innerHTML =
+        '<span class="tab-info"><span class="tab-name-row">' +
+        `<span class="tab-name" data-session-id="${sessionId}">old title</span>` +
+        '</span></span>';
+      list.appendChild(tab);
+      app.sessions.set(sessionId, { id: sessionId, name: 'old title' });
+      app.startInlineRename(sessionId);
+    }, id);
+
+    const label = page.locator(`.tab-name[data-session-id="${id}"]`);
+    const input = label.locator('input.tab-rename-input');
+    await input.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.type('edited title');
+
+    expect(await input.inputValue()).toBe('edited title');
+    expect(await input.evaluate((node) => document.activeElement === node)).toBe(true);
+    expect(await label.evaluate((node) => node.classList.contains('tab-name-renaming'))).toBe(true);
+    expect(await label.evaluate((node) => getComputedStyle(node).overflow)).toBe('visible');
+    expect(await input.evaluate((node) => node.getBoundingClientRect().width)).toBeGreaterThan(0);
+  });
+
+  it('Vertical rail paints typing in an unclamped editor and restores the clamp on cancel', async () => {
+    await resetState();
+    const id = 'vertical-live-input';
+
+    await page.evaluate((sessionId) => {
+      const app = (
+        window as unknown as {
+          app: {
+            sessions: Map<string, { id: string; name: string }>;
+            startInlineRename: (id: string) => void;
+          };
+        }
+      ).app;
+      document.documentElement.dataset.tabOrientation = 'vertical';
+      const rail = document.getElementById('tabRail') as HTMLElement;
+      const tab = document.createElement('div');
+      tab.setAttribute('data-test-tab', '1');
+      tab.className = 'session-tab';
+      tab.innerHTML =
+        `<span class="tab-name" data-session-id="${sessionId}">` +
+        '<span class="tab-name-prefix">w9-case: </span>old</span>';
+      rail.appendChild(tab);
+      app.sessions.set(sessionId, { id: sessionId, name: 'w9-case: old' });
+      app.startInlineRename(sessionId);
+    }, id);
+
+    const label = page.locator(`.tab-name[data-session-id="${id}"]`);
+    const input = label.locator('input.tab-rename-input');
+    await input.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.type('edited title');
+
+    expect(await input.inputValue()).toBe('edited title');
+    expect(await input.evaluate((node) => document.activeElement === node)).toBe(true);
+    expect(await label.evaluate((node) => node.classList.contains('tab-name-renaming'))).toBe(true);
+    expect(await label.evaluate((node) => getComputedStyle(node).webkitLineClamp)).toBe('none');
+    expect(await input.evaluate((node) => node.getBoundingClientRect().width)).toBeGreaterThan(0);
+
+    const settled = await page.evaluate((sessionId) => {
+      const app = (window as unknown as { app: { _activeRename: { cancel: () => void } | null } }).app;
+      app._activeRename?.cancel();
+      const label = document.querySelector(`.tab-name[data-session-id="${sessionId}"]`) as HTMLElement;
+      return {
+        classActive: label.classList.contains('tab-name-renaming'),
+        inputPresent: !!label.querySelector('input.tab-rename-input'),
+        webkitLineClamp: getComputedStyle(label).webkitLineClamp,
+      };
+    }, id);
+
+    expect(settled).toEqual({ classActive: false, inputPresent: false, webkitLineClamp: '2' });
   });
 });

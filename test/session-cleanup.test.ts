@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
-import { existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { safeRmHomeTree } from './mocks/index.js';
 
 const TEST_PORT = 3120;
 const CASES_DIR = join(homedir(), 'codeman-cases');
@@ -15,23 +16,21 @@ const CASES_DIR = join(homedir(), 'codeman-cases');
 describe('Session Cleanup', () => {
   let server: WebServer;
   let baseUrl: string;
+  let testWorkingDir: string;
   const createdCases: string[] = [];
   const createdSessions: string[] = [];
 
   beforeAll(async () => {
+    testWorkingDir = mkdtempSync(join(tmpdir(), 'codeman-cleanup-test-'));
     server = new WebServer(TEST_PORT, false, true);
     await server.start();
     baseUrl = `http://localhost:${TEST_PORT}`;
   });
 
   afterEach(() => {
-    // Clean up cases created during this test
+    // Clean up cases created during this test (containment-gated).
     while (createdCases.length > 0) {
-      const caseName = createdCases.pop()!;
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, createdCases.pop()!));
     }
   });
 
@@ -43,9 +42,36 @@ describe('Session Cleanup', () => {
       } catch {}
     }
     await server.stop();
+    rmSync(testWorkingDir, { recursive: true, force: true });
   }, 60000);
 
   describe('Session Deletion', () => {
+    it('rejects before stopping the session when layout deletion preparation fails', async () => {
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workingDir: testWorkingDir }),
+      });
+      const created = await createRes.json();
+      const id = created.data.session.id;
+      createdSessions.push(id);
+      const internals = server as unknown as {
+        tabLayouts: { runSessionDeletion: (...args: unknown[]) => Promise<unknown> };
+      };
+      const deletionSpy = vi
+        .spyOn(internals.tabLayouts, 'runSessionDeletion')
+        .mockRejectedValueOnce(new Error('layout prune unavailable'));
+      try {
+        const deleteRes = await fetch(`${baseUrl}/api/sessions/${id}`, { method: 'DELETE' });
+        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
+
+        expect(deleteRes.status).toBe(500);
+        expect(getRes.status).toBe(200);
+      } finally {
+        deletionSpy.mockRestore();
+      }
+    });
+
     it('should properly stop and cleanup interactive session', async () => {
       const caseName = `cleanup-test-${Date.now()}`;
       createdCases.push(caseName);
@@ -199,10 +225,7 @@ describe('Resource Management', () => {
 
   afterAll(async () => {
     for (const caseName of createdCases) {
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, caseName));
     }
     await server.stop();
   }, 60000);
