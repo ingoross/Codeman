@@ -5704,6 +5704,24 @@ body.touch-device .terminal-container .xterm .xterm-helper-textarea {
   box-shadow: 0 0 10px rgba(239, 68, 68, 0.25);
 }
 
+/* Attach File Button — same footprint as the mic it sits beside. Hidden on touch
+   devices, where the keyboard accessory's paste dialog carries the picker (its
+   "File" button) and the bottom toolbar sits in the edge-gesture zone. Unlike
+   .btn-voice it is NOT hidden below 1024px: a narrow desktop window has no other
+   visible way to attach, only drag-and-drop. */
+.btn-toolbar.btn-attach {
+  padding: 0.3rem 0.5rem;
+}
+
+.btn-toolbar.btn-attach:hover {
+  color: var(--text);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+body.touch-device .toolbar-center .btn-toolbar.btn-attach {
+  display: none !important;
+}
+
 /* Voice Input Button — desktop only (mobile uses .btn-voice-mobile) */
 .btn-toolbar.btn-voice {
   padding: 0.3rem 0.5rem;
@@ -13700,9 +13718,12 @@ body.touch-device.cjk-input-visible .main {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 10px;
+  /* Four buttons since the File picker joined; on a 320px phone they wrap
+     rather than squeeze Send off the dialog. */
+  flex-wrap: wrap;
 }
 
-.paste-cancel, .paste-new, .paste-send, .paste-image {
+.paste-cancel, .paste-new, .paste-send, .paste-image, .paste-file {
   padding: 8px 18px;
   border: none;
   border-radius: 8px;
@@ -13710,11 +13731,18 @@ body.touch-device.cjk-input-visible .main {
   cursor: pointer;
 }
 
-.paste-image {
-  margin-right: auto;
+/* The two attach buttons group at the LEFT edge, Cancel/Send stay at the right —
+   the auto margin sits on the last of the pair. Tighter horizontal padding than
+   Cancel/Send because they now share the row with them. */
+.paste-image, .paste-file {
+  padding: 8px 12px;
   background: var(--bg-input);
   color: var(--accent);
   border: 1px solid var(--accent);
+}
+
+.paste-file {
+  margin-right: auto;
 }
 
 .paste-cancel {

@@ -110,6 +110,11 @@ readme-preview.mjs
 # Uploaded images land here under each session working dir (runtime artifact)
 .claude-images/
 
+# Uploaded non-image files (pdf/csv/zip/log) land here under each session
+# working dir — same runtime artifact, kept apart so the paste-image GC's
+# 7-day sweep cannot reach a file the user dropped on purpose.
+.claude-files/
+
 # Local-LLM harness smoke-test config (real IPs/keys) — see the .example.json
 # alongside it in scripts/, which IS tracked as the template.
 scripts/local-llm-test.config.json

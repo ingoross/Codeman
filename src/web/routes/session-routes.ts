@@ -4,9 +4,9 @@
  * auto-clear, auto-compact, image watcher, flicker filter, and logout.
  */
 
-import { FastifyInstance, type FastifyReply } from 'fastify';
+import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { join, dirname, extname, basename } from 'node:path';
+import { join, dirname, extname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -127,7 +127,8 @@ import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayout
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
-import { MAX_PASTE_IMAGE_BYTES } from '../../config/buffer-limits.js';
+import { MAX_PASTE_IMAGE_BYTES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOADS_PER_MINUTE } from '../../config/buffer-limits.js';
+import { sanitizeUploadFilename } from '../upload-filename.js';
 import { dataPath, getDataDir } from '../../config/instance.js';
 import {
   checkRemoteTmuxAvailable,
@@ -301,10 +302,10 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
   }
 }
 
-// Per-(IP, sessionId) token bucket for paste-image. 30 requests/minute.
+// Per-(IP, sessionId) token bucket shared by BOTH workspace-upload routes.
 // Bucket map entries are pruned when they drift > 1h stale to bound memory
 // against a flood of unique IP keys.
-const PASTE_RATE_TOKENS = 30;
+const PASTE_RATE_TOKENS = MAX_UPLOADS_PER_MINUTE;
 const PASTE_RATE_REFILL_PER_MS = PASTE_RATE_TOKENS / 60_000;
 const PASTE_BUCKET_TTL_MS = 60 * 60 * 1000;
 const PASTE_BUCKET_GC_THRESHOLD = 1000;
@@ -332,6 +333,132 @@ export function consumePasteToken(key: string, now: number = Date.now()): boolea
 // Test hook: reset between runs.
 export function _resetPasteRateBuckets(): void {
   pasteRateBuckets.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shared guards for the two workspace-upload routes
+// ═══════════════════════════════════════════════════════════════
+//
+// paste-image and upload-file both take an unvalidated multipart body from an
+// authenticated caller and write it into a session's working directory. They
+// differ only in what they do with the BYTES (images are sniffed, HEIC-converted
+// and renamed; a workspace file is stored verbatim under its own name), so
+// everything in front of the bytes lives here once. A guard that only one of the
+// two remembers to call is a guard that will be missing from the third route
+// somebody adds.
+
+/**
+ * CSRF defense: state-changing routes must come from same origin.
+ * Cookies are SameSite=lax, multipart/form-data is a "simple" CORS request
+ * (no preflight), so a cross-origin <form enctype="multipart/form-data">
+ * submit attaches the session cookie unimpeded. Reject unless Origin/Referer
+ * matches req.host. Non-browser clients (no Origin AND no Referer) must
+ * supply X-Codeman-CSRF — a header browsers cannot add cross-origin without
+ * a preflight, which our CORS config does not allow from other origins.
+ */
+function isSameOriginUpload(req: FastifyRequest): boolean {
+  const reqHost = req.headers.host;
+  const origin = req.headers.origin;
+  const referer = req.headers.referer;
+  if (origin) {
+    try {
+      return new URL(origin).host === reqHost;
+    } catch {
+      return false; /* invalid Origin → not ok */
+    }
+  }
+  if (referer) {
+    try {
+      return new URL(referer).host === reqHost;
+    } catch {
+      return false; /* invalid Referer → not ok */
+    }
+  }
+  return !!req.headers['x-codeman-csrf'];
+}
+
+/**
+ * CSRF + rate limit, in that order, for an upload into `sessionId`. Returns an
+ * error envelope with the status already set on `reply` when the request must be
+ * refused, or `null` when it may proceed.
+ *
+ * The rate limit is per (IP, sessionId) and SHARED between both upload routes on
+ * purpose: it defends against disk-fill DoS, and a budget an attacker can spend
+ * twice by alternating endpoints is not a budget.
+ */
+function guardUploadRequest(req: FastifyRequest, reply: FastifyReply, sessionId: string): ApiResponse<never> | null {
+  if (!isSameOriginUpload(req)) {
+    reply.code(403);
+    return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'CSRF check failed');
+  }
+  if (!consumePasteToken(`${req.ip}:${sessionId}`)) {
+    reply.code(429);
+    reply.header('Retry-After', '60');
+    return createErrorResponse(
+      ApiErrorCode.INVALID_INPUT,
+      `Rate limit exceeded (${MAX_UPLOADS_PER_MINUTE} uploads/min per session)`
+    );
+  }
+  return null;
+}
+
+/**
+ * Refuse an upload whose destination is not a directory on THIS machine.
+ * Returns a client-visible reason, or `null` when the workspace is writable here.
+ *
+ * A remote (SSH) session's `workingDir` is either the attach pseudo-path
+ * `user@host:name` or the case's `remotePath` — in both shapes a path that only
+ * exists on the other host. Writing it with local `fs` does not fail loudly: the
+ * pseudo-path is RELATIVE, so `join()` lands it under the server's own cwd and we
+ * would cheerfully report success for a file the agent on the far side can never
+ * open. Docker sessions need no such guard — `workingDir` is the HOST side of the
+ * case's bind mount (`DockerCase.hostWorkspacePath`), so a host-side write shows
+ * up inside the container at `containerWorkdir`. Multi-user is likewise fine: it
+ * scopes which workspaces a user may reach, not where they live.
+ */
+function workspaceNotOnThisHost(session: { remote?: unknown; workingDir: string }): string | null {
+  if (session.remote) {
+    return 'Uploads are not supported for remote (SSH) sessions — the workspace is on another host';
+  }
+  return null;
+}
+
+/**
+ * Create-or-verify `{workingDir}/{dirName}` so that it is a REAL directory we own.
+ *
+ * Refuse symlinks at the directory — an agent or a postinstall script could plant
+ * `.claude-files -> ~/.ssh/` and redirect every future write outside workingDir.
+ * We lstat (not stat) so we see the symlink itself, and mkdir without `recursive`
+ * so the leaf creation does not follow a symlink either. The caller pairs this
+ * with O_EXCL|O_NOFOLLOW on the file open, which makes the write itself
+ * symlink-safe.
+ */
+async function ensureWorkspaceUploadDir(
+  workingDir: string,
+  dirName: string
+): Promise<{ dir: string } | { error: string }> {
+  const dir = join(workingDir, dirName);
+  const notADir = { error: `${dirName} is not a regular directory` };
+  try {
+    const dirStat = await fs.lstat(dir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return notADir;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    // Non-recursive mkdir: does not follow symlinks for the leaf.
+    // session.workingDir is guaranteed to exist (live session).
+    try {
+      await fs.mkdir(dir);
+    } catch (mkErr: unknown) {
+      // Concurrent uploads (a batch of photos) race to create the directory —
+      // the losers get EEXIST. Treat an already-present REAL directory as
+      // success, but re-verify it isn't a symlink a racing actor planted
+      // (preserve the symlink-safety guarantee above).
+      if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr;
+      const raceStat = await fs.lstat(dir);
+      if (raceStat.isSymbolicLink() || !raceStat.isDirectory()) return notADir;
+    }
+  }
+  return { dir };
 }
 
 /**
@@ -4540,50 +4667,23 @@ export function registerSessionRoutes(
 
   const ALLOWED_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif']);
   // The per-file size cap (MAX_PASTE_IMAGE_BYTES) is enforced by @fastify/multipart (registered in server.ts).
+  /** Images (sniffed, HEIC-converted, machine-named) — unchanged, and NOT where other files go. */
+  const IMAGE_UPLOAD_DIR = '.claude-images';
 
   app.post('/api/sessions/:id/paste-image', async (req, reply) => {
-    // CSRF defense: state-changing routes must come from same origin.
-    // Cookies are SameSite=lax, multipart/form-data is a "simple" CORS request
-    // (no preflight), so a cross-origin <form enctype="multipart/form-data">
-    // submit attaches the session cookie unimpeded. Reject unless Origin/Referer
-    // matches req.host. Non-browser clients (no Origin AND no Referer) must
-    // supply X-Codeman-CSRF — a header browsers cannot add cross-origin without
-    // a preflight, which our CORS config does not allow from other origins.
-    const reqHost = req.headers.host;
-    const origin = req.headers.origin;
-    const referer = req.headers.referer;
-    let csrfOk = false;
-    if (origin) {
-      try {
-        csrfOk = new URL(origin).host === reqHost;
-      } catch {
-        /* invalid Origin → not ok */
-      }
-    } else if (referer) {
-      try {
-        csrfOk = new URL(referer).host === reqHost;
-      } catch {
-        /* invalid Referer → not ok */
-      }
-    } else {
-      csrfOk = !!req.headers['x-codeman-csrf'];
-    }
-    if (!csrfOk) {
-      reply.code(403);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'CSRF check failed');
-    }
-
     const { id } = req.params as { id: string };
 
-    // Rate limit per (IP, sessionId): 30/min. Defends against disk-fill DoS
-    // — even an authenticated attacker can otherwise loop large image POSTs.
-    if (!consumePasteToken(`${req.ip}:${id}`)) {
-      reply.code(429);
-      reply.header('Retry-After', '60');
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Rate limit exceeded (30 uploads/min per session)');
-    }
+    // CSRF + the shared 30/min disk-fill budget (see guardUploadRequest).
+    const refused = guardUploadRequest(req, reply, id);
+    if (refused) return refused;
 
     const session = findSessionOrFail(ctx, id, req);
+
+    const offHost = workspaceNotOnThisHost(session);
+    if (offHost) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, offHost);
+    }
 
     if (!req.isMultipart()) {
       reply.code(400);
@@ -4681,38 +4781,13 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Image bytes do not match declared type ${ext}`);
     }
 
-    // Save to {workingDir}/.claude-images/
-    // Refuse symlinks at imageDir — an agent or postinstall script could plant
-    // `.claude-images -> ~/.ssh/` and redirect future writes outside workingDir.
-    // We lstat (not stat) so we see the symlink itself. Use mkdir without
-    // `recursive` so the leaf creation does not follow a symlink either, and
-    // O_EXCL|O_NOFOLLOW on the file open so the write itself is symlink-safe.
-    const imageDir = join(session.workingDir, '.claude-images');
-    try {
-      const dirStat = await fs.lstat(imageDir);
-      if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
-        reply.code(403);
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, '.claude-images is not a regular directory');
-      }
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      // Non-recursive mkdir: does not follow symlinks for the leaf.
-      // session.workingDir is guaranteed to exist (live session).
-      try {
-        await fs.mkdir(imageDir);
-      } catch (mkErr: unknown) {
-        // Concurrent uploads (a batch of photos) race to create .claude-images —
-        // the losers get EEXIST. Treat an already-present REAL directory as
-        // success, but re-verify it isn't a symlink a racing actor planted
-        // (preserve the symlink-safety guarantee above).
-        if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr;
-        const raceStat = await fs.lstat(imageDir);
-        if (raceStat.isSymbolicLink() || !raceStat.isDirectory()) {
-          reply.code(403);
-          return createErrorResponse(ApiErrorCode.INVALID_INPUT, '.claude-images is not a regular directory');
-        }
-      }
+    // Save to {workingDir}/.claude-images/ (symlink-safe — see the helper).
+    const dirResult = await ensureWorkspaceUploadDir(session.workingDir, IMAGE_UPLOAD_DIR);
+    if ('error' in dirResult) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, dirResult.error);
     }
+    const imageDir = dirResult.dir;
     // Date.now() collides on same-ms uploads from two tabs (last-write wins
     // silently). Append 8 hex chars so concurrent pastes get distinct names.
     const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${ext}`;
@@ -4725,6 +4800,149 @@ export function registerSessionRoutes(
     );
     try {
       await fh.writeFile(imageBytes);
+    } finally {
+      await fh.close();
+    }
+
+    return { path: filepath, filename };
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Upload File (drag-drop / picker — anything that is not an image)
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Non-images (pdf, csv, zip, log, …) — a SIBLING of .claude-images, not the
+   * same directory. The two hold different things: `.claude-images` is a cache of
+   * machine-named paste artifacts that a GC sweeps after 7 days
+   * (paste-image-gc.ts), while these keep the user's own filename and are the
+   * input they are asking the agent to work on. Mixing them would put a dropped
+   * contract on a deletion timer, and the GC only touches `paste-*` names, so the
+   * separation is what keeps that honest rather than accidental.
+   */
+  const FILE_UPLOAD_DIR = '.claude-files';
+  /** Collision suffixes tried (`-1` … `-200`) before falling back to random bytes. */
+  const MAX_COLLISION_SUFFIXES = 200;
+  /** Random-suffix rounds after the counted ones — a 2^32 space, so one is already plenty. */
+  const MAX_RANDOM_NAME_ROUNDS = 8;
+
+  app.post('/api/sessions/:id/upload-file', async (req, reply) => {
+    const { id } = req.params as { id: string };
+
+    // Same CSRF gate and the same 30/min bucket as paste-image, by construction.
+    const refused = guardUploadRequest(req, reply, id);
+    if (refused) return refused;
+
+    const session = findSessionOrFail(ctx, id, req);
+
+    const offHost = workspaceNotOnThisHost(session);
+    if (offHost) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, offHost);
+    }
+
+    if (!req.isMultipart()) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
+    }
+
+    // Per-request limits rather than the server-wide registration: this route's
+    // cap is HALF the image one, and busboy aborts the stream at the limit, so an
+    // oversized body is never buffered just to be measured and thrown away.
+    let part: import('@fastify/multipart').MultipartFile | undefined;
+    const maxMb = Math.round(MAX_UPLOAD_FILE_BYTES / (1024 * 1024));
+    try {
+      part = await req.file({ limits: { fileSize: MAX_UPLOAD_FILE_BYTES, files: 1, fields: 4 } });
+    } catch (err: unknown) {
+      reply.code(413);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
+    }
+    if (!part) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No file uploaded');
+    }
+    if (part.fieldname !== 'file') {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unexpected field "${part.fieldname}", expected "file"`);
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await part.toBuffer();
+    } catch (err: unknown) {
+      reply.code(413);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
+    }
+    if (bytes.length === 0) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
+    }
+
+    // NO content sniffing. paste-image checks magic bytes because it re-serves
+    // those bytes with an image/* MIME and a polyglot would be served back as
+    // one; nothing serves these, they are stored for an agent to read. Deciding
+    // what a .zip "really is" would only add a guess that is wrong on the honest
+    // files (a .csv that starts with a BOM, a .log that is gzip) while stopping
+    // no attacker, who controls the extension anyway. What matters is that the
+    // file cannot RUN: mode 0644, never the executable bit.
+    const dirResult = await ensureWorkspaceUploadDir(session.workingDir, FILE_UPLOAD_DIR);
+    if ('error' in dirResult) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, dirResult.error);
+    }
+    const fileDir = dirResult.dir;
+
+    const { base, ext } = sanitizeUploadFilename(part.filename);
+
+    // Never overwrite: `report.pdf`, `report-1.pdf`, `report-2.pdf`, … Each
+    // candidate is attempted with O_EXCL, so the loop is the collision check —
+    // two concurrent uploads of the same name cannot both win a round, and there
+    // is no stat-then-open window for a third party to slip into.
+    let filename = '';
+    let filepath = '';
+    let fh: import('node:fs/promises').FileHandle | undefined;
+    const lastAttempt = MAX_COLLISION_SUFFIXES + MAX_RANDOM_NAME_ROUNDS;
+    for (let attempt = 0; attempt <= lastAttempt && !fh; attempt++) {
+      // Past the suffix budget, fall back to random bytes like paste-image does,
+      // so a directory already holding 200 `report-N.pdf` cannot make the next
+      // upload fail (nor make us walk the whole range on every later upload).
+      const suffix =
+        attempt === 0 ? '' : attempt <= MAX_COLLISION_SUFFIXES ? `-${attempt}` : `-${randomBytes(4).toString('hex')}`;
+      filename = `${base}${suffix}${ext}`;
+      filepath = join(fileDir, filename);
+
+      // Belt and braces over the sanitiser: the stored name must resolve to a
+      // direct child of the target directory. sanitizeUploadFilename already
+      // strips every separator, so this can only fire if that function regresses
+      // — which is exactly when a traversal check has to still be there.
+      if (dirname(resolve(filepath)) !== resolve(fileDir)) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid filename');
+      }
+
+      try {
+        // O_EXCL: refuse to overwrite (this IS the collision check).
+        // O_NOFOLLOW: refuse if filepath is a symlink someone planted.
+        // 0o644: readable by the agent, never executable.
+        fh = await fs.open(
+          filepath,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+          0o644
+        );
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code;
+        // EEXIST → taken, try the next suffix. ELOOP (O_NOFOLLOW hit a symlink)
+        // is also "this name is taken", by something we must not write through.
+        if (code !== 'EEXIST' && code !== 'ELOOP') throw err;
+      }
+    }
+    if (!fh) {
+      reply.code(409);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Could not find a free name for "${base}${ext}"`);
+    }
+
+    try {
+      await fh.writeFile(bytes);
     } finally {
       await fh.close();
     }
