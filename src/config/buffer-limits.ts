@@ -114,6 +114,47 @@ export const FILE_PEEK_BYTES = 8 * 1024 - 1; // 8KB (inclusive end offset)
 export const MAX_PASTE_IMAGE_BYTES = parseInt(process.env.CODEMAN_MAX_PASTE_IMAGE_BYTES || '') || 50 * 1024 * 1024; // 50MB
 
 // ============================================================================
+// Workspace File Upload Limits
+// ============================================================================
+
+/**
+ * Maximum size (bytes) of a single non-image file uploaded via POST
+ * /api/sessions/:id/upload-file (drag-drop onto the terminal, the toolbar
+ * paperclip, the mobile paste dialog). One file per request, exactly like
+ * paste-image, so this caps each file and not the batch.
+ *
+ * HALF the paste-image cap on purpose. 50MB exists there because a
+ * full-resolution phone photo has a floor the client cannot compress away, and
+ * the client downscales toward that number. A workspace file has no such floor:
+ * the point is to hand the agent something it can read — a pdf, a csv, a log, a
+ * zip — and anything past 25MB is read from disk in chunks anyway, not pasted
+ * into a prompt. So this is "accept no more than the feature needs", not a DoS
+ * bound; the disk-fill bound is the 30 uploads/min rate limit both routes draw
+ * from. Enforced by @fastify/multipart as a per-request `limits.fileSize`
+ * (session-routes.ts), so an oversized body is cut off mid-stream rather than
+ * buffered first and measured afterwards.
+ * Override: CODEMAN_MAX_UPLOAD_FILE_BYTES (bytes)
+ */
+export const MAX_UPLOAD_FILE_BYTES = parseInt(process.env.CODEMAN_MAX_UPLOAD_FILE_BYTES || '') || 25 * 1024 * 1024; // 25MB
+
+/**
+ * Maximum files the CLIENT sends per drop / pick. Mirrors `_maxBatchImages` in
+ * image-input.js so "drop a folder" behaves the same whichever kind of file it
+ * holds, and stays under the server's 30 uploads/min so one drop cannot rate-limit
+ * the next one. The SERVER-side count bound is that rate limiter — a batch is N
+ * separate requests, so there is no batch for the server to count.
+ */
+export const MAX_UPLOAD_BATCH_FILES = 20;
+
+/**
+ * Maximum length (characters) of a stored upload filename, extension included.
+ * Well under the 255-byte NAME_MAX of ext4/APFS even after the `-12` collision
+ * suffix and a multi-byte UTF-8 name, so a long name is truncated by us with the
+ * extension preserved instead of being rejected by the filesystem with ENAMETOOLONG.
+ */
+export const MAX_UPLOAD_FILENAME_LENGTH = 100;
+
+// ============================================================================
 // File Download Limits
 // ============================================================================
 

@@ -802,14 +802,16 @@ export class WebServer extends EventEmitter {
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
     await this.app.register(fastifyWebsocket);
 
-    // Multipart parsing (used by paste-image). Replaces a hand-rolled
-    // boundary scanner that had several edge-case bugs: literal boundary
-    // anywhere in body was a match, LF-only clients silently corrupted the
-    // last byte (hard-coded \r\n offsets), and there was no part-count cap.
+    // Multipart parsing (used by paste-image and upload-file). Replaces a
+    // hand-rolled boundary scanner that had several edge-case bugs: literal
+    // boundary anywhere in body was a match, LF-only clients silently corrupted
+    // the last byte (hard-coded \r\n offsets), and there was no part-count cap.
+    // These are the DEFAULTS; upload-file narrows fileSize per request to its own
+    // (smaller) MAX_UPLOAD_FILE_BYTES, which busboy applies mid-stream.
     await this.app.register(fastifyMultipart, {
       limits: {
         fileSize: MAX_PASTE_IMAGE_BYTES, // per file (default 50MB) — large phone photos / screenshots
-        files: 1, // paste-image sends one file per request (clients batch up to 20 requests)
+        files: 1, // both upload routes send one file per request (clients batch up to 20 requests)
         fields: 4, // small headroom for accompanying form fields
       },
     });
