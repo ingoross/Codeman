@@ -1,11 +1,14 @@
 /**
- * Image Input Mixin - Clipboard paste and drag-and-drop image support
+ * Image Input Mixin - Clipboard paste and drag-and-drop file support
  *
  * For paste: intercepts Ctrl+V at the xterm keyboard level, creates a temporary
  * hidden contenteditable div ("paste trap"), lets the browser's native paste fill
  * it, then checks for image data. This works on HTTP (no secure context needed).
  *
- * For drag-and-drop: listens on the terminal container for file drops.
+ * For drag-and-drop: listens on the terminal container for file drops. A drop may
+ * hold anything — the batch is split by MIME and each half goes to its own
+ * endpoint (images to /paste-image, everything else to /upload-file), then ALL
+ * saved paths are inserted into the terminal in one shot, in the order dropped.
  *
  * @dependency app.js (uses global `app` for sendInput, activeSessionId, showToast)
  * @dependency panels-ui.js (provides showToast)
@@ -38,13 +41,40 @@ Object.assign(CodemanApp.prototype, {
       if (!this.activeSessionId) return;
       if (!e.dataTransfer || !e.dataTransfer.files.length) return;
 
-      const imageFiles = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'));
-      if (imageFiles.length === 0) {
-        this.showToast('Only image files are supported', 'error');
-        return;
-      }
-      this._uploadAndInsertImages(imageFiles);
+      // Every type is accepted now — non-images land in .claude-files instead of
+      // being refused. A dropped FOLDER arrives as a zero-byte entry with no
+      // type, which the server rejects as an empty file, so it is filtered here
+      // to keep the message honest (browsers cannot upload a directory from a
+      // plain drop).
+      this._uploadAndInsertAttachments(e.dataTransfer.files);
     });
+  },
+
+  /**
+   * Open the native file picker and attach whatever is chosen. Bound to the
+   * toolbar paperclip (index.html) and reachable from the mobile paste dialog.
+   * The input is created per call and dropped afterwards, so a cancelled pick
+   * leaves nothing behind and picking the same file twice still fires `change`.
+   */
+  pickWorkspaceFiles() {
+    if (!this.activeSessionId) {
+      this.showToast('Open a session first', 'error');
+      return;
+    }
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0';
+    document.body.appendChild(input);
+    input.addEventListener('change', () => {
+      const files = input.files;
+      input.remove();
+      this._uploadAndInsertAttachments(files);
+    });
+    // Safari/iOS never fires `change` on cancel and has no `cancel` event on
+    // older versions, so the node is also swept on the next focus return.
+    window.addEventListener('focus', () => setTimeout(() => input.remove(), 1000), { once: true });
+    input.click();
   },
 
   // Called from customKeyEventHandler in terminal-ui.js on Ctrl+V keydown.
@@ -115,35 +145,59 @@ Object.assign(CodemanApp.prototype, {
     document.execCommand('paste');
   },
 
-  // Max images accepted in one batch (paste / drop / mobile picker). Each is
-  // uploaded as its own request, so 20 stays under the server's 30 uploads/min
-  // rate limit while covering "select a bunch of photos at once".
-  _maxBatchImages: 20,
+  // Max files accepted in one batch (paste / drop / picker). Each is uploaded as
+  // its own request, so 20 stays under the server's 30 uploads/min rate limit
+  // while covering "select a bunch of things at once". Mirrored server-side as
+  // MAX_UPLOAD_BATCH_FILES (config/buffer-limits.ts).
+  _maxBatchUploads: 20,
   // How many uploads to run concurrently. Small enough that decoding several
   // large images through <canvas> at once won't OOM a phone, large enough that
   // 20 photos don't crawl through serially.
   _uploadConcurrency: 3,
 
+  /**
+   * Image-only entry point, kept for the callers that can only ever produce
+   * images: the Ctrl+V paste trap and the mobile image picker (accept=image/*).
+   */
   async _uploadAndInsertImages(fileList) {
+    return this._uploadAndInsertAttachments(fileList);
+  },
+
+  /**
+   * Upload a mixed batch and insert every saved path into the terminal in one
+   * shot, in the order the files arrived. Each file is routed by its MIME:
+   * images keep the existing normalize-then-/paste-image path, everything else
+   * is sent verbatim to /upload-file and lands in .claude-files.
+   */
+  async _uploadAndInsertAttachments(fileList) {
     const sessionId = this.activeSessionId;
     if (!sessionId) return;
 
-    let files = Array.from(fileList || []);
-    if (files.length === 0) return;
+    // A dropped directory shows up as a 0-byte entry with no type — a browser
+    // cannot upload one from a plain drop. The server would answer "Empty file",
+    // which is true but sends the user looking for the wrong problem.
+    const all = Array.from(fileList || []);
+    let files = all.filter((f) => f.size > 0);
+    const skipped = all.length - files.length;
+    if (files.length === 0) {
+      if (skipped > 0) this.showToast('Nothing to upload — folders and empty files are skipped', 'error');
+      return;
+    }
 
     // Cap the batch and tell the user what got dropped (no silent truncation).
     let capped = false;
-    if (files.length > this._maxBatchImages) {
-      files = files.slice(0, this._maxBatchImages);
+    if (files.length > this._maxBatchUploads) {
+      files = files.slice(0, this._maxBatchUploads);
       capped = true;
     }
 
     const total = files.length;
     let done = 0;
     let failed = 0;
+    let lastError = '';
     const results = new Array(total); // preserve selection order for insertion
     const progress = () =>
-      this.showToast(`Uploading ${Math.min(done + 1, total)}/${total} image${total > 1 ? 's' : ''}…`, 'info');
+      this.showToast(`Uploading ${Math.min(done + 1, total)}/${total} file${total > 1 ? 's' : ''}…`, 'info');
     progress();
 
     // Bounded-concurrency worker pool over the file list.
@@ -153,18 +207,25 @@ Object.assign(CodemanApp.prototype, {
         const i = next++;
         if (i >= total) return;
         try {
-          // Re-encode to a standard JPEG/PNG (and downscale very large images)
-          // before upload. Galleries on some phones (notably Android/MIUI) hand
-          // back a WebP/HEIF whose filename and MIME claim "image/jpeg", which
-          // passes the server's extension allowlist but fails its magic-byte
-          // check. Decoding through the browser and re-encoding guarantees the
-          // bytes match the extension we send — and shrinks huge photos so they
-          // fit the upload limit and iOS's <canvas> area cap.
-          const normalized = await this._normalizeImageForUpload(files[i]);
-          results[i] = await this._uploadPasteImage(sessionId, normalized);
+          if (files[i].type.startsWith('image/')) {
+            // Re-encode to a standard JPEG/PNG (and downscale very large images)
+            // before upload. Galleries on some phones (notably Android/MIUI) hand
+            // back a WebP/HEIF whose filename and MIME claim "image/jpeg", which
+            // passes the server's extension allowlist but fails its magic-byte
+            // check. Decoding through the browser and re-encoding guarantees the
+            // bytes match the extension we send — and shrinks huge photos so they
+            // fit the upload limit and iOS's <canvas> area cap.
+            const normalized = await this._normalizeImageForUpload(files[i]);
+            results[i] = await this._uploadPasteImage(sessionId, normalized);
+          } else {
+            // NOT normalized and NOT renamed: the bytes are what the user means
+            // to hand the agent, and the filename is how they will refer to it.
+            results[i] = await this._uploadWorkspaceFile(sessionId, files[i]);
+          }
         } catch (err) {
           failed++;
-          console.warn('Image upload failed:', err);
+          lastError = (err && err.message) || '';
+          console.warn('Upload failed:', err);
           results[i] = null;
         } finally {
           done++;
@@ -180,23 +241,34 @@ Object.assign(CodemanApp.prototype, {
       await this.sendInput(paths.join(' '));
     }
 
-    // Final status: successes, plus any failures / cap so nothing is silent.
+    // Final status: successes, plus any failures / cap so nothing is silent. The
+    // server's reason (too large, rate limited, remote session) is surfaced
+    // rather than a bare count — those are all actionable, and a silent "1
+    // failed" sends the user to the browser console to find out why.
     const parts = [];
-    if (paths.length > 0) parts.push(`${paths.length} image${paths.length > 1 ? 's' : ''} ready`);
-    if (failed > 0) parts.push(`${failed} failed`);
-    if (capped) parts.push(`max ${this._maxBatchImages} per batch`);
-    const tone = paths.length > 0 ? (failed > 0 || capped ? 'info' : 'success') : 'error';
-    this.showToast(parts.join(' · ') || 'No images uploaded', tone);
+    if (paths.length > 0) parts.push(`${paths.length} file${paths.length > 1 ? 's' : ''} ready`);
+    if (failed > 0) parts.push(lastError ? `${failed} failed: ${lastError}` : `${failed} failed`);
+    if (skipped > 0) parts.push(`${skipped} skipped (folder or empty)`);
+    if (capped) parts.push(`max ${this._maxBatchUploads} per batch`);
+    const tone = paths.length > 0 ? (failed > 0 || capped || skipped > 0 ? 'info' : 'success') : 'error';
+    this.showToast(parts.join(' · ') || 'Nothing uploaded', tone);
   },
 
   async _uploadPasteImage(sessionId, file) {
-    const form = new FormData();
-    form.append('image', file);
+    return this._postUpload('/api/sessions/' + sessionId + '/paste-image', 'image', file);
+  },
 
-    const resp = await fetch('/api/sessions/' + sessionId + '/paste-image', {
-      method: 'POST',
-      body: form,
-    });
+  async _uploadWorkspaceFile(sessionId, file) {
+    return this._postUpload('/api/sessions/' + sessionId + '/upload-file', 'file', file);
+  },
+
+  // Both upload endpoints speak the same multipart + envelope contract and apply
+  // the same CSRF and rate-limit guards; only the path and the field name differ.
+  async _postUpload(url, fieldName, file) {
+    const form = new FormData();
+    form.append(fieldName, file);
+
+    const resp = await fetch(url, { method: 'POST', body: form });
 
     if (!resp.ok) {
       const data = await resp.json().catch(() => ({}));

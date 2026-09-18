@@ -787,6 +787,15 @@
       </div>
 
       <div class="toolbar-center">
+        <!-- Attach a file: the visible half of drag-and-drop, which is otherwise
+             undiscoverable and unreachable on a machine without a file manager
+             open. Same picker as the drop handler, same insert-the-path result. -->
+        <button class="btn-toolbar btn-sm btn-attach" id="attachFileBtn" onclick="app.pickWorkspaceFiles()"
+                title="Attach a file to this session" aria-label="Attach a file to this session">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+          </svg>
+        </button>
         <button class="btn-toolbar btn-sm btn-voice" id="voiceInputBtn" onclick="VoiceInput.toggle()"
                 title="Voice input (Ctrl+Shift+V)" aria-label="Start voice input" aria-pressed="false">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

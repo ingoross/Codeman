@@ -9,8 +9,8 @@
  *   layouts but are revealed only on Codex sessions (`codex-enabled` marker class on the
  *   bar, synced on every session switch), since they are Codex bindings. Tab flushes any locally-buffered
  *   prompt text to the PTY before sending \t, so completion applies to what was typed.
- *   The paste button opens a dialog that handles both text paste and image attach
- *   (native picker + best-effort image paste, routed through app._uploadAndInsertImages).
+ *   The paste button opens a dialog that handles text paste plus image AND file attach
+ *   (native pickers + best-effort image paste, routed through app._uploadAndInsertAttachments).
  *   Destructive actions (/clear, /compact, extended bar only) require double-tap confirmation (2s amber state).
  *   Commands are sent as text + Enter separately for Ink compatibility.
  *   Only initializes on touch devices (MobileDetection.isTouchDevice guard).
@@ -1142,16 +1142,21 @@ const KeyboardAccessoryBar = {
   },
 
   /** Show a paste overlay for iOS compatibility.
-   *  Handles three input paths from one dialog:
+   *  Handles four input paths from one dialog:
    *   - Text: long-press the textarea → Paste → Send (unchanged).
-   *   - Image (picker): the "Image" button opens a native file picker
-   *     (accept=image/* → camera / photo library / files), the most reliable
-   *     way to attach a photo on mobile.
+   *   - Image (picker): the "Image" button opens a native picker restricted to
+   *     accept=image/*, which is what makes iOS and Android offer the CAMERA and
+   *     the photo library rather than only the file browser — the most reliable
+   *     way to attach a photo on mobile, so it keeps its own button.
+   *   - File (picker): the "File" button opens the same picker unrestricted, for
+   *     a pdf / csv / zip / log out of Files or Drive. This is the phone's half
+   *     of drag-and-drop, which a touch device has no way to perform.
    *   - Image (paste): if the browser exposes image blobs on the textarea's
    *     paste event, we intercept them and upload directly. Support is spotty
    *     on mobile, so it is a best-effort enhancement layered on the picker.
-   *  All image paths reuse app._uploadAndInsertImages() (image-input.js), which
-   *  uploads to /api/sessions/:id/paste-image and inserts the saved path. */
+   *  Every attachment path reuses app._uploadAndInsertAttachments()
+   *  (image-input.js), which routes each file to /paste-image or /upload-file by
+   *  its MIME and inserts the saved paths. */
   pasteFromClipboard() {
     if (typeof app === 'undefined' || !app.activeSessionId) return;
 
@@ -1160,18 +1165,21 @@ const KeyboardAccessoryBar = {
     overlay.className = 'paste-overlay';
     overlay.innerHTML = `
       <div class="paste-dialog">
-        <textarea class="paste-textarea" placeholder="Long-press to paste text — or tap 🖼 to attach an image"></textarea>
+        <textarea class="paste-textarea" placeholder="Long-press to paste text — or tap 🖼 / 📎 to attach"></textarea>
         <div class="paste-actions">
           <button class="paste-image">🖼 Image</button>
+          <button class="paste-file">📎 File</button>
           <button class="paste-cancel">Cancel</button>
           <button class="paste-send">Send</button>
         </div>
         <input type="file" class="paste-file-input" accept="image/*" multiple hidden>
+        <input type="file" class="paste-any-input" multiple hidden>
       </div>
     `;
 
     const textarea = overlay.querySelector('.paste-textarea');
     const fileInput = overlay.querySelector('.paste-file-input');
+    const anyInput = overlay.querySelector('.paste-any-input');
 
     const close = () => overlay.remove();
 
@@ -1184,19 +1192,24 @@ const KeyboardAccessoryBar = {
       }
     };
 
-    // Filter to images, close the dialog, and hand off to the shared
-    // upload+insert pipeline. Returns true if any image was handled.
-    const handleImages = (files) => {
-      const images = Array.from(files || []).filter((f) => f.type.startsWith('image/'));
-      if (images.length === 0) return false;
+    // Close the dialog and hand off to the shared upload+insert pipeline, which
+    // routes each file to /paste-image or /upload-file by its MIME. Returns true
+    // if anything was handed off.
+    const handleAttachments = (files) => {
+      const picked = Array.from(files || []);
+      if (picked.length === 0) return false;
       close();
-      if (typeof app._uploadAndInsertImages === 'function') app._uploadAndInsertImages(images);
+      if (typeof app._uploadAndInsertAttachments === 'function') app._uploadAndInsertAttachments(picked);
       return true;
     };
 
     // Image picker (camera / photo library) — the reliable mobile path.
     overlay.querySelector('.paste-image').addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', () => handleImages(fileInput.files));
+    fileInput.addEventListener('change', () => handleAttachments(fileInput.files));
+
+    // File picker (Files / Drive / anything) — the phone's drag-and-drop.
+    overlay.querySelector('.paste-file').addEventListener('click', () => anyInput.click());
+    anyInput.addEventListener('change', () => handleAttachments(anyInput.files));
 
     // Best-effort: capture images pasted straight into the textarea.
     textarea.addEventListener('paste', (e) => {
@@ -1211,7 +1224,7 @@ const KeyboardAccessoryBar = {
       }
       if (imageFiles.length > 0) {
         e.preventDefault();
-        handleImages(imageFiles);
+        handleAttachments(imageFiles);
       }
     });
 

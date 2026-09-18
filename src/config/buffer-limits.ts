@@ -138,7 +138,7 @@ export const MAX_PASTE_IMAGE_BYTES = parseInt(process.env.CODEMAN_MAX_PASTE_IMAG
 export const MAX_UPLOAD_FILE_BYTES = parseInt(process.env.CODEMAN_MAX_UPLOAD_FILE_BYTES || '') || 25 * 1024 * 1024; // 25MB
 
 /**
- * Maximum files the CLIENT sends per drop / pick. Mirrors `_maxBatchImages` in
+ * Maximum files the CLIENT sends per drop / pick. Mirrors `_maxBatchUploads` in
  * image-input.js so "drop a folder" behaves the same whichever kind of file it
  * holds, and stays under the server's 30 uploads/min so one drop cannot rate-limit
  * the next one. The SERVER-side count bound is that rate limiter — a batch is N
