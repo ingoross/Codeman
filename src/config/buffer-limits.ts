@@ -138,13 +138,19 @@ export const MAX_PASTE_IMAGE_BYTES = parseInt(process.env.CODEMAN_MAX_PASTE_IMAG
 export const MAX_UPLOAD_FILE_BYTES = parseInt(process.env.CODEMAN_MAX_UPLOAD_FILE_BYTES || '') || 25 * 1024 * 1024; // 25MB
 
 /**
- * Maximum files the CLIENT sends per drop / pick. Mirrors `_maxBatchUploads` in
- * image-input.js so "drop a folder" behaves the same whichever kind of file it
- * holds, and stays under the server's 30 uploads/min so one drop cannot rate-limit
- * the next one. The SERVER-side count bound is that rate limiter — a batch is N
- * separate requests, so there is no batch for the server to count.
+ * Maximum uploads accepted per (IP, session) per minute, across BOTH upload
+ * routes together.
+ *
+ * This is the count limit. Neither route takes a batch — a drop of 20 files is
+ * 20 separate requests — so there is no batch for the server to count, and the
+ * bound that actually stops an authenticated caller from filling the disk is
+ * this token bucket. Shared rather than per-route on purpose: a budget that can
+ * be spent twice by alternating endpoints is not a budget. The clients cap a
+ * drop/pick at 20 (`_maxBatchUploads` in image-input.js) so one batch cannot
+ * rate-limit the next.
+ * Override: CODEMAN_MAX_UPLOADS_PER_MINUTE (count)
  */
-export const MAX_UPLOAD_BATCH_FILES = 20;
+export const MAX_UPLOADS_PER_MINUTE = parseInt(process.env.CODEMAN_MAX_UPLOADS_PER_MINUTE || '') || 30;
 
 /**
  * Maximum length (characters) of a stored upload filename, extension included.

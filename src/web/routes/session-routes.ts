@@ -127,7 +127,7 @@ import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayout
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
-import { MAX_PASTE_IMAGE_BYTES, MAX_UPLOAD_FILE_BYTES } from '../../config/buffer-limits.js';
+import { MAX_PASTE_IMAGE_BYTES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOADS_PER_MINUTE } from '../../config/buffer-limits.js';
 import { sanitizeUploadFilename } from '../upload-filename.js';
 import { dataPath, getDataDir } from '../../config/instance.js';
 import {
@@ -302,10 +302,10 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
   }
 }
 
-// Per-(IP, sessionId) token bucket for paste-image. 30 requests/minute.
+// Per-(IP, sessionId) token bucket shared by BOTH workspace-upload routes.
 // Bucket map entries are pruned when they drift > 1h stale to bound memory
 // against a flood of unique IP keys.
-const PASTE_RATE_TOKENS = 30;
+const PASTE_RATE_TOKENS = MAX_UPLOADS_PER_MINUTE;
 const PASTE_RATE_REFILL_PER_MS = PASTE_RATE_TOKENS / 60_000;
 const PASTE_BUCKET_TTL_MS = 60 * 60 * 1000;
 const PASTE_BUCKET_GC_THRESHOLD = 1000;
@@ -394,7 +394,10 @@ function guardUploadRequest(req: FastifyRequest, reply: FastifyReply, sessionId:
   if (!consumePasteToken(`${req.ip}:${sessionId}`)) {
     reply.code(429);
     reply.header('Retry-After', '60');
-    return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Rate limit exceeded (30 uploads/min per session)');
+    return createErrorResponse(
+      ApiErrorCode.INVALID_INPUT,
+      `Rate limit exceeded (${MAX_UPLOADS_PER_MINUTE} uploads/min per session)`
+    );
   }
   return null;
 }
