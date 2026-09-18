@@ -117,6 +117,19 @@ describe('Auth Security', () => {
       });
       expect(res.status).toBe(401);
     });
+
+    // Both workspace-upload routes WRITE to disk, so "is it behind auth" is not a
+    // question to answer by reading the middleware. There is no per-route
+    // allowlist to register in — the hook covers everything under /api/ — which is
+    // exactly why the assertion belongs here rather than in a list that can be
+    // added to without being checked. 401 must land BEFORE the CSRF and rate-limit
+    // guards, so an anonymous caller cannot even spend the session's token budget.
+    it.each(['paste-image', 'upload-file'])('should reject an unauthenticated %s upload', async (route) => {
+      const form = new FormData();
+      form.append(route === 'paste-image' ? 'image' : 'file', new Blob([new Uint8Array([1, 2, 3])]), 'x.bin');
+      const res = await fetch(`${baseUrl}/api/sessions/any-session/${route}`, { method: 'POST', body: form });
+      expect(res.status).toBe(401);
+    });
   });
 
   describe('Session Cookies', () => {
